@@ -104,6 +104,11 @@ static void emit_ld_map_fd(struct bpf_builder *builder, int dst_reg, int map_fd)
     emit(builder, (struct bpf_insn){.code = 0, .imm = 0});
 }
 
+static void emit_ctx_st32(struct bpf_builder *builder, int offset, int imm) {
+    emit(builder, BPF_MOV64_IMM(BPF_REG_0, imm));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_0, offset));
+}
+
 static size_t emit_exit(struct bpf_builder *builder, int result) {
     size_t label = builder->count;
     emit(builder, BPF_MOV64_IMM(BPF_REG_0, result));
@@ -842,7 +847,7 @@ static void emit_token_update_and_rewrite(
     drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
 
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_9, offsetof(struct bpf_sock_addr, user_ip4)));
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port)));
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port));
 }
 
 static void emit_token_update_and_rewrite_v6(
@@ -911,11 +916,11 @@ static void emit_token_update_and_rewrite_v6(
     emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
     drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
 
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6), prefix0));
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 4, prefix1));
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6), prefix0);
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 4, prefix1);
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_8, offsetof(struct bpf_sock_addr, user_ip6) + 8));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_9, offsetof(struct bpf_sock_addr, user_ip6) + 12));
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port)));
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port));
 }
 
 static void emit_ipv4_mapped_token_update_and_rewrite(
@@ -970,11 +975,11 @@ static void emit_ipv4_mapped_token_update_and_rewrite(
     emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
     drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
 
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6), 0));
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 4, 0));
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8, 0xffff0000U));
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6), 0);
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 4, 0);
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 8, 0xffff0000U);
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_9, offsetof(struct bpf_sock_addr, user_ip6) + 12));
-    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port)));
+    emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port));
 }
 
 static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
@@ -1594,9 +1599,9 @@ static int build_udp6_recvmsg_prog(
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_0, offsetof(struct bpf2socks_original_dst, addr)));
     emit(&b, BPF_LDX_MEM(BPF_H, BPF_REG_8, BPF_REG_0, offsetof(struct bpf2socks_original_dst, port)));
     emit(&b, BPF_ENDIAN_OP(BPF_REG_8, 16));
-    emit(&b, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6), 0));
-    emit(&b, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 4, 0));
-    emit(&b, BPF_ST_MEM(BPF_W, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8, 0xffff0000U));
+    emit_ctx_st32(&b, offsetof(struct bpf_sock_addr, user_ip6), 0);
+    emit_ctx_st32(&b, offsetof(struct bpf_sock_addr, user_ip6) + 4, 0);
+    emit_ctx_st32(&b, offsetof(struct bpf_sock_addr, user_ip6) + 8, 0xffff0000U);
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_7, offsetof(struct bpf_sock_addr, user_ip6) + 12));
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_8, offsetof(struct bpf_sock_addr, user_port)));
     size_t v4mapped_allow = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
