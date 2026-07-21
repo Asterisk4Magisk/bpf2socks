@@ -18,6 +18,13 @@
 
 #define BPF2SOCKS_SOCKS5_UDP_HEADER_CAP 22U
 
+static size_t socks5_write_addr(uint8_t *out, const struct bpf2socks_sockaddr *addr);
+static int replace_unspecified_relay_addr(
+    const struct sockaddr *socks_addr,
+    socklen_t socks_addr_len,
+    struct sockaddr_storage *relay_addr,
+    socklen_t *relay_addr_len);
+
 static int write_full(int fd, const void *buf, size_t len) {
     const uint8_t *ptr = buf;
     while (len > 0U) {
@@ -97,12 +104,144 @@ static int connect_tcp_addr(const struct sockaddr *addr, socklen_t addr_len) {
     return -1;
 }
 
+int bpf2socks_socks5_connect_nonblock(
+    const struct sockaddr *addr,
+    socklen_t addr_len) {
+    if (addr == NULL || addr_len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    int fd = socket(addr->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    bpf2socks_bridge_tune_tcp_advanced(fd, true);
+    if (connect(fd, addr, addr_len) == 0) return fd;
+    if (errno == EINPROGRESS) return fd;
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return -1;
+}
+
+size_t bpf2socks_socks5_build_hello(uint8_t *out, size_t out_cap) {
+    if (out == NULL || out_cap < 3U) return 0U;
+    out[0] = 0x05;
+    out[1] = 0x01;
+    out[2] = 0x00;
+    return 3U;
+}
+
+int bpf2socks_socks5_parse_hello_reply(const uint8_t *reply, size_t len) {
+    if (reply == NULL || len < 2U) {
+        errno = EAGAIN;
+        return 1;
+    }
+    if (reply[0] != 0x05 || reply[1] != 0x00) return -1;
+    return 0;
+}
+
+size_t bpf2socks_socks5_build_udp_associate_request(uint8_t *out, size_t out_cap) {
+    if (out == NULL || out_cap < (4U + 16U + 2U)) return 0U;
+    struct bpf2socks_sockaddr any_addr;
+    memset(&any_addr, 0, sizeof(any_addr));
+    any_addr.family = AF_INET;
+    any_addr.port = 0;
+    size_t len = 0;
+    out[len++] = 0x05;
+    out[len++] = 0x03;
+    out[len++] = 0x00;
+    len += socks5_write_addr(out + len, &any_addr);
+    return len;
+}
+
+int bpf2socks_socks5_parse_bound_addr(
+    const uint8_t *buf, size_t len, size_t *consumed,
+    struct sockaddr_storage *bound, socklen_t *bound_len) {
+    if (buf == NULL || consumed == NULL || bound == NULL || bound_len == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *consumed = 0U;
+    if (len < 4U) {
+        errno = EAGAIN;
+        return 1;
+    }
+    if (buf[0] != 0x05 || buf[1] != 0x00) return -1;
+    memset(bound, 0, sizeof(*bound));
+    if (buf[3] == 0x01) {
+        if (len < 4U + 4U + 2U) {
+            errno = EAGAIN;
+            return 1;
+        }
+        struct sockaddr_in *addr = (struct sockaddr_in *)bound;
+        addr->sin_family = AF_INET;
+        memcpy(&addr->sin_addr, buf + 4U, 4);
+        memcpy(&addr->sin_port, buf + 8U, 2);
+        *bound_len = sizeof(*addr);
+        *consumed = 4U + 4U + 2U;
+        return 0;
+    }
+    if (buf[3] == 0x04) {
+        if (len < 4U + 16U + 2U) {
+            errno = EAGAIN;
+            return 1;
+        }
+        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)bound;
+        addr->sin6_family = AF_INET6;
+        memcpy(&addr->sin6_addr, buf + 4U, 16);
+        memcpy(&addr->sin6_port, buf + 20U, 2);
+        *bound_len = sizeof(*addr);
+        *consumed = 4U + 16U + 2U;
+        return 0;
+    }
+    if (buf[3] == 0x03) {
+        if (len < 4U + 1U) {
+            errno = EAGAIN;
+            return 1;
+        }
+        uint8_t n = buf[4U];
+        if (n == 0U) return -1;
+        if (len < 4U + 1U + (size_t)n + 2U) {
+            errno = EAGAIN;
+            return 1;
+        }
+        char host[256];
+        memcpy(host, buf + 5U, n);
+        host[n] = '\0';
+        char port_buf[8];
+        uint16_t reply_port = ((uint16_t)buf[5U + n] << 8) | buf[6U + n];
+        snprintf(port_buf, sizeof(port_buf), "%u", reply_port);
+        struct addrinfo hints;
+        struct addrinfo *result = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_family = AF_UNSPEC;
+        if (getaddrinfo(host, port_buf, &hints, &result) != 0 || result == NULL) return -1;
+        if ((size_t)result->ai_addrlen > sizeof(*bound)) {
+            freeaddrinfo(result);
+            return -1;
+        }
+        memcpy(bound, result->ai_addr, result->ai_addrlen);
+        *bound_len = (socklen_t)result->ai_addrlen;
+        freeaddrinfo(result);
+        *consumed = 4U + 1U + (size_t)n + 2U;
+        return 0;
+    }
+    return -1;
+}
+
+int bpf2socks_socks5_replace_unspecified_relay(
+    const struct sockaddr *socks_addr, socklen_t socks_addr_len,
+    struct sockaddr_storage *relay_addr, socklen_t *relay_addr_len) {
+    return replace_unspecified_relay_addr(socks_addr, socks_addr_len, relay_addr, relay_addr_len);
+}
+
 static int socks5_handshake(int fd) {
     uint8_t hello[] = {0x05, 0x01, 0x00};
     uint8_t hello_reply[2];
     if (write_full(fd, hello, sizeof(hello)) < 0 || read_full(fd, hello_reply, sizeof(hello_reply)) < 0) return -1;
-    return hello_reply[0] == 0x05 && hello_reply[1] == 0x00 ? 0 : -1;
+    return bpf2socks_socks5_parse_hello_reply(hello_reply, sizeof(hello_reply));
 }
+
 
 static size_t socks5_write_addr(uint8_t *out, const struct bpf2socks_sockaddr *addr) {
     size_t len = 0;
