@@ -104,7 +104,7 @@ static void emit_ld_map_fd(struct bpf_builder *builder, int dst_reg, int map_fd)
     emit(builder, (struct bpf_insn){.code = 0, .imm = 0});
 }
 
-static void emit_ctx_st32(struct bpf_builder *builder, int offset, int imm) {
+static void emit_ctx_st32(struct bpf_builder *builder, int offset, uint32_t imm) {
     emit(builder, BPF_MOV64_IMM(BPF_REG_0, imm));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_0, offset));
 }
