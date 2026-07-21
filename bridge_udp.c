@@ -1014,6 +1014,25 @@ static int set_session_downlink_pause(
 }
 
 static void resume_budget_paused_sessions(struct udp_state *state) {
+    // Resume DNS channels first — they are not tracked by the session waiter
+    // tracker, so the early return below would skip them if no client session
+    // is waiting at the same time.
+    if (state != NULL && state->pending_budget != NULL) {
+        const size_t slot_bytes = max_downlink_packet_allocation();
+        const size_t cap_bytes = state->pending_budget->cap_bytes;
+        const size_t used_bytes = bpf2socks_pending_budget_used(state->pending_budget);
+        if (cap_bytes >= slot_bytes && used_bytes <= cap_bytes - slot_bytes) {
+            for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
+                struct dns_channel *channel = &state->dns_channels[i];
+                if (!channel->relay_paused || channel->udp_fd < 0) continue;
+                if (mod_udp_epoll_fd_events(
+                        state, channel->udp_fd, &channel->relay_ref, EPOLLIN) < 0) {
+                    continue;
+                }
+                channel->relay_paused = false;
+            }
+        }
+    }
     if (state == NULL || state->pending_budget == NULL ||
         !bpf2socks_udp_downlink_waiter_tracker_has_waiters(&state->downlink_budget_waiters)) {
         return;
@@ -1033,15 +1052,6 @@ static void resume_budget_paused_sessions(struct udp_state *state) {
                 &state->downlink_budget_waiters,
                 &session->downlink_waiting_budget);
         }
-    }
-    for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
-        struct dns_channel *channel = &state->dns_channels[i];
-        if (!channel->relay_paused || channel->udp_fd < 0) continue;
-        if (mod_udp_epoll_fd_events(
-                state, channel->udp_fd, &channel->relay_ref, EPOLLIN) < 0) {
-            continue;
-        }
-        channel->relay_paused = false;
     }
 }
 
@@ -2245,12 +2255,13 @@ static int advance_dns_channel(
     uint64_t now_ms);
 static void udp_dns_control_event(
     struct udp_state *state,
+    struct bpf2socks_bridge_worker *worker,
     struct dns_channel *channel,
     uint32_t events,
     uint64_t now_ms) {
     if (channel == NULL || channel->tcp_fd < 0) return;
     if (channel->stage != DNS_CHANNEL_IDLE && channel->stage != DNS_CHANNEL_READY) {
-        if (advance_dns_channel(state, NULL, channel, events, now_ms) < 0) {
+        if (advance_dns_channel(state, worker, channel, events, now_ms) < 0) {
             close_dns_channel(state, channel, now_ms);
         }
         return;
@@ -2463,22 +2474,36 @@ static int advance_dns_channel(
                 if (result < 0) return -1;
                 if (result == 0) return 0;
             }
+            // Inspect ATYP (buf[3]) to compute exact total reply length,
+            // then read exactly that many bytes.
+            size_t total_expected = 4U;
+            uint8_t atyp = channel->read_buf[3U];
+            if (atyp == 0x01U) {
+                total_expected = 4U + 4U + 2U;
+            } else if (atyp == 0x04U) {
+                total_expected = 4U + 16U + 2U;
+            } else if (atyp == 0x03U) {
+                if (channel->read_len < 5U) {
+                    result = dns_channel_do_read(channel, 5U);
+                    if (result < 0) return -1;
+                    if (result == 0) return 0;
+                }
+                uint8_t dom_len = channel->read_buf[4U];
+                total_expected = 4U + 1U + (size_t)dom_len + 2U;
+            } else {
+                return -1;
+            }
+            if (channel->read_len < total_expected) {
+                result = dns_channel_do_read(channel, total_expected);
+                if (result < 0) return -1;
+                if (result == 0) return 0;
+            }
             {
                 size_t consumed = 0U;
                 int parse_result = bpf2socks_socks5_parse_bound_addr(
                     channel->read_buf, channel->read_len, &consumed,
                     &channel->relay_addr, &channel->relay_addr_len);
-                if (parse_result < 0) return -1;
-                if (parse_result == 1) {
-                    int more = dns_channel_do_read(channel, 4U + 255U + 2U);
-                    if (more < 0) return -1;
-                    if (more == 0) return 0;
-                    parse_result = bpf2socks_socks5_parse_bound_addr(
-                        channel->read_buf, channel->read_len, &consumed,
-                        &channel->relay_addr, &channel->relay_addr_len);
-                    if (parse_result < 0) return -1;
-                    if (parse_result == 1) return 0;
-                }
+                if (parse_result != 0) return -1;
             }
             if (bpf2socks_socks5_replace_unspecified_relay(
                     (const struct sockaddr *)&worker->socks_addr,
@@ -3472,8 +3497,8 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
                 }
             } else if (ref->kind == UDP_FD_DNS_CONTROL &&
                 ref->dns_channel_index < BPF2SOCKS_DNS_CHANNELS_PER_WORKER) {
-                struct dns_channel *channel = &state.dns_channels[ref->dns_channel_index];
-                udp_dns_control_event(&state, channel, events, monotonic_ms());
+               struct dns_channel *channel = &state.dns_channels[ref->dns_channel_index];
+                udp_dns_control_event(&state, worker, channel, events, monotonic_ms());
             } else if (ref->kind == UDP_FD_DNS_RELAY &&
                 ref->dns_channel_index < BPF2SOCKS_DNS_CHANNELS_PER_WORKER) {
                 struct dns_channel *channel = &state.dns_channels[ref->dns_channel_index];
