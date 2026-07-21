@@ -117,7 +117,7 @@ struct dns_channel {
     uint8_t write_buf[4 + 16 + 2];
     size_t write_len;
     size_t write_offset;
-    uint8_t read_buf[4 + 255 + 2];
+    uint8_t read_buf[4 + 1 + 255 + 2];
     size_t read_len;
     bool relay_paused;
     struct sockaddr_storage relay_addr;
@@ -2271,35 +2271,6 @@ static void udp_dns_control_event(
     }
 }
 
-static int register_dns_channel_epoll(struct udp_state *state, struct dns_channel *channel) {
-    if (state == NULL || channel == NULL || channel->tcp_fd < 0 || channel->udp_fd < 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    channel->control_ref.kind = UDP_FD_DNS_CONTROL;
-    channel->control_ref.fd = channel->tcp_fd;
-    channel->control_ref.session = NULL;
-    channel->control_ref.dns_channel_index = channel->index;
-    channel->relay_ref.kind = UDP_FD_DNS_RELAY;
-    channel->relay_ref.fd = channel->udp_fd;
-    channel->relay_ref.session = NULL;
-    channel->relay_ref.dns_channel_index = channel->index;
-    if (add_udp_epoll_fd_events(
-            state,
-            channel->tcp_fd,
-            &channel->control_ref,
-            EPOLLIN | EPOLLRDHUP) < 0) {
-        return -1;
-    }
-    if (add_udp_epoll_fd(state, channel->udp_fd, &channel->relay_ref) < 0) {
-        int saved = errno;
-        remove_udp_epoll_fd(state, channel->tcp_fd);
-        errno = saved;
-        return -1;
-    }
-    return 0;
-}
-
 static int open_dns_channel(
     struct udp_state *state,
     struct bpf2socks_bridge_worker *worker,
@@ -2476,27 +2447,30 @@ static int advance_dns_channel(
             }
             // Inspect ATYP (buf[3]) to compute exact total reply length,
             // then read exactly that many bytes.
-            size_t total_expected = 4U;
-            uint8_t atyp = channel->read_buf[3U];
-            if (atyp == 0x01U) {
-                total_expected = 4U + 4U + 2U;
-            } else if (atyp == 0x04U) {
-                total_expected = 4U + 16U + 2U;
-            } else if (atyp == 0x03U) {
-                if (channel->read_len < 5U) {
-                    result = dns_channel_do_read(channel, 5U);
-                    if (result < 0) return -1;
-                    if (result == 0) return 0;
+            {
+                size_t total_expected = 4U;
+                uint8_t atyp = channel->read_buf[3U];
+                if (atyp == 0x01U) {
+                    total_expected = 4U + 4U + 2U;
+                } else if (atyp == 0x04U) {
+                    total_expected = 4U + 16U + 2U;
+                } else if (atyp == 0x03U) {
+                    if (channel->read_len < 5U) {
+                        int r = dns_channel_do_read(channel, 5U);
+                        if (r < 0) return -1;
+                        if (r == 0) return 0;
+                    }
+                    uint8_t dom_len = channel->read_buf[4U];
+                    total_expected = 4U + 1U + (size_t)dom_len + 2U;
+                } else {
+                    return -1;
                 }
-                uint8_t dom_len = channel->read_buf[4U];
-                total_expected = 4U + 1U + (size_t)dom_len + 2U;
-            } else {
-                return -1;
-            }
-            if (channel->read_len < total_expected) {
-                result = dns_channel_do_read(channel, total_expected);
-                if (result < 0) return -1;
-                if (result == 0) return 0;
+                if (total_expected > sizeof(channel->read_buf)) return -1;
+                if (channel->read_len < total_expected) {
+                    int r = dns_channel_do_read(channel, total_expected);
+                    if (r < 0) return -1;
+                    if (r == 0) return 0;
+                }
             }
             {
                 size_t consumed = 0U;
@@ -2547,7 +2521,6 @@ static int advance_dns_channel(
 
 static void expire_dns_channel_handshake(
     struct udp_state *state,
-    struct bpf2socks_bridge_worker *worker,
     uint64_t now_ms) {
     for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
         struct dns_channel *channel = &state->dns_channels[i];
@@ -2972,10 +2945,10 @@ static void handle_udp_client_packets(
                         &dns_channel_indices[dns_count],
                         &dns_messages[dns_count]) == 0) {
                     ++dns_count;
-                } else {
-                    ++worker->stats.udp_send_errors;
+                    continue;
                 }
-                continue;
+                // DNS channel not ready (handshaking); fall through to
+                // regular UDP session path instead of dropping the query.
             }
         }
 
@@ -3449,7 +3422,7 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
             evict_idle_bindings(&state, worker->config, worker);
             expire_sessions(&state, worker->config);
             expire_dns_transactions(&state, worker, monotonic_ms());
-            expire_dns_channel_handshake(&state, worker, monotonic_ms());
+            expire_dns_channel_handshake(&state, monotonic_ms());
             resume_budget_paused_sessions(&state);
             publish_udp_stats_if_due(worker, monotonic_ms(), &next_stats_publish_ms, false);
             continue;
@@ -3517,7 +3490,7 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
         evict_idle_bindings(&state, worker->config, worker);
         expire_sessions(&state, worker->config);
         expire_dns_transactions(&state, worker, monotonic_ms());
-        expire_dns_channel_handshake(&state, worker, monotonic_ms());
+        expire_dns_channel_handshake(&state, monotonic_ms());
         free_retired_downlink_channels(&state);
         publish_udp_stats_if_due(worker, monotonic_ms(), &next_stats_publish_ms, false);
     }
