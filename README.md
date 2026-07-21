@@ -2,7 +2,48 @@
 
 `bpf2socks` is a root Android/Linux traffic bridge. It uses cgroup and socket eBPF programs to retain original destinations, then forwards TCP and UDP through a SOCKS5 upstream. It supports UID policy, private/direct CIDR policy, interface policy, DNS transaction tracking, connected UDP, full-cone UDP reply bindings, worker sharding, and runtime statistics.
 
-The source root is build-system agnostic. A parent Android project compiles all top-level `.c` files together as a PIE executable, commonly packaged as `libbpf2socks.so`.
+The source root includes a standalone GNU Make build for Linux and Android. A parent Android project may still compile all top-level `.c` files together as a PIE executable, commonly packaged as `libbpf2socks.so`.
+
+## Standalone build
+
+GNU Make and a C compiler are required. Run all commands from the repository root.
+
+### Linux
+
+```sh
+make
+# Equivalent explicit target:
+make linux
+```
+
+The output is `build/linux/bpf2socks`. Override standard Make variables such as `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, and `LDLIBS` when needed.
+
+### Android
+
+Install the Android NDK, then expose it through `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_SDK_ROOT`, or `ANDROID_HOME`.
+
+```sh
+# Build arm64-v8a, armeabi-v7a, x86, and x86_64:
+make android
+
+# Build one ABI:
+make android ABI=arm64-v8a
+
+# Override the default API level 24:
+make android ABI=arm64-v8a ANDROID_API=26
+```
+
+Android outputs are written to `build/android/<abi>/libbpf2socks.so`. They are PIE executables despite the `.so` packaging suffix. Android-specific flag overrides are available through `ANDROID_CPPFLAGS`, `ANDROID_CFLAGS`, `ANDROID_LDFLAGS`, and `ANDROID_LDLIBS`.
+
+Linux, macOS, and Windows NDK hosts are supported. On Windows, run GNU Make from an environment with a POSIX shell, such as MSYS2 or Git Bash, and use forward-slash paths when setting an NDK directory explicitly.
+
+### Clean
+
+```sh
+make clean
+```
+
+This removes only the repository-local `build/` directory.
 
 ## Command line
 
