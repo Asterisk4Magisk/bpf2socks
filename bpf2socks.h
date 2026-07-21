@@ -315,6 +315,26 @@ int bpf2socks_socks5_udp_associate_addr(
     int *udp_fd,
     struct sockaddr_storage *relay_addr,
     socklen_t *relay_addr_len);
+
+// Non-blocking SOCKS5 helpers for DNS channel state machine.
+// Returns fd with non-blocking connect; errno=EINPROGRESS means pending.
+int bpf2socks_socks5_connect_nonblock(
+    const struct sockaddr *addr,
+    socklen_t addr_len);
+// Build SOCKS5 hello/greeting (3 bytes). Returns length written.
+size_t bpf2socks_socks5_build_hello(uint8_t *out, size_t out_cap);
+// Validate 2-byte hello reply. 0=ok, -1=fail.
+int bpf2socks_socks5_parse_hello_reply(const uint8_t *reply, size_t len);
+// Build SOCKS5 UDP ASSOCIATE request. Returns total length written.
+size_t bpf2socks_socks5_build_udp_associate_request(uint8_t *out, size_t out_cap);
+// Parse SOCKS5 bound address reply (4+addr+port). 0=ok, -1=fail, 1=need more data.
+int bpf2socks_socks5_parse_bound_addr(
+    const uint8_t *buf, size_t len, size_t *consumed,
+    struct sockaddr_storage *bound, socklen_t *bound_len);
+// Replace unspecified relay addr with socks addr if needed. 0=ok, -1=fail.
+int bpf2socks_socks5_replace_unspecified_relay(
+    const struct sockaddr *socks_addr, socklen_t socks_addr_len,
+    struct sockaddr_storage *relay_addr, socklen_t *relay_addr_len);
 int bpf2socks_socks5_udp_send(
     int udp_fd,
     const struct sockaddr *relay_addr,
