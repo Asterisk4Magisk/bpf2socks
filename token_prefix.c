@@ -44,7 +44,7 @@ int bpf2socks_parse_token_ipv4_prefix(
         return -1;
     }
     const char *slash = strchr(text, '/');
-    if (slash == NULL || strcmp(slash, "/8") != 0) {
+    if (slash == NULL || strcmp(slash, "/9") != 0) {
         errno = EINVAL;
         return -1;
     }
@@ -58,7 +58,7 @@ int bpf2socks_parse_token_ipv4_prefix(
     address[address_length] = '\0';
     uint8_t parsed[4];
     if (inet_pton(AF_INET, address, parsed) != 1 ||
-        memcmp(parsed, (const uint8_t[]){127U, 0U, 0U, 0U}, sizeof(parsed)) != 0) {
+        memcmp(parsed, (const uint8_t[]){127U, 128U, 0U, 0U}, sizeof(parsed)) != 0) {
         errno = EINVAL;
         return -1;
     }

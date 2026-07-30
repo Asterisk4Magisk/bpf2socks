@@ -357,7 +357,3 @@ size_t bpf2socks_dns_table_expire(
     }
     return expired;
 }
-
-size_t bpf2socks_dns_table_count(const struct bpf2socks_dns_table *table) {
-    return table == NULL ? 0U : table->count;
-}

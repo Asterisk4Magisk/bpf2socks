@@ -88,6 +88,5 @@ size_t bpf2socks_dns_table_expire(
     size_t max_expire,
     bool *stale_channels,
     size_t stale_channel_count);
-size_t bpf2socks_dns_table_count(const struct bpf2socks_dns_table *table);
 
 #endif

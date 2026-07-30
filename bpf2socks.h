@@ -12,6 +12,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include "tc_token.h"
+
 #define BPF2SOCKS_MAX_UIDS 8192U
 #define BPF2SOCKS_MAX_CIDR_MAP_ENTRIES 16384U
 #define BPF2SOCKS_MAX_POLICY_CIDRS 512U
@@ -48,15 +50,11 @@
 #define BPF2SOCKS_MIN_DNS_TRANSACTION_TIMEOUT_MILLISECONDS 1000U
 #define BPF2SOCKS_MAX_DNS_TRANSACTION_TIMEOUT_MILLISECONDS 600000U
 #define BPF2SOCKS_DEFAULT_NOFILE_LIMIT 65535U
-#define BPF2SOCKS_DEFAULT_TOKEN_IPV4_PREFIX "127.0.0.0/8"
-#define BPF2SOCKS_TOKEN_IPV4_PREFIX_BITS 8U
+#define BPF2SOCKS_DEFAULT_TOKEN_IPV4_PREFIX "127.128.0.0/9"
+#define BPF2SOCKS_TOKEN_IPV4_PREFIX_BITS 9U
 #define BPF2SOCKS_DEFAULT_TOKEN_IPV6_PREFIX "fd7a:7374:6572:6973::/64"
 #define BPF2SOCKS_TOKEN_IPV6_PREFIX_BITS 64U
-#define BPF2SOCKS_SK_LOOKUP_KEY(family, protocol, worker) \
-    ((((uint32_t)(worker) & 0xffffU) * 4U) + \
-     ((uint32_t)(family) == AF_INET6 ? 2U : 0U) + \
-     ((uint32_t)(protocol) == BPF2SOCKS_PROTO_UDP ? 1U : 0U))
-#define BPF2SOCKS_SK_LOOKUP_MAX_SOCKS (BPF2SOCKS_MAX_WORKER_COUNT * 4U)
+#define BPF2SOCKS_TC_SCRATCH_SIZE 224U
 
 #ifndef MSG_ZEROCOPY
 #define MSG_ZEROCOPY 0x4000000
@@ -179,7 +177,11 @@ struct bpf2socks_runtime_config {
     uint32_t max_udp_pending_bytes;
     uint32_t dns_transaction_timeout_milliseconds;
     int token_map_fd;
-    int sk_lookup_sock_map_fd;
+    int reuseport_tcp4_map_fd;
+    int reuseport_udp4_map_fd;
+    int reuseport_tcp6_map_fd;
+    int reuseport_udp6_map_fd;
+    int reuseport_prog_fd;
 };
 
 struct bpf2socks_bridge_stats {
@@ -235,9 +237,17 @@ struct bpf2socks_bpf_runtime {
     int ignored_route_cidr6_map_fd;
     int token_map_fd;
     int udp_peer_map_fd;
-    int sk_lookup_sock_map_fd;
-    int sk_lookup_prog_fd;
-    int sk_lookup_link_fd;
+    int tc_runtime_control_map_fd;
+    int tc_original_to_token_map_fd;
+    int tc_token_to_original_map_fd;
+    int tc_scratch_map_fd;
+    int reuseport_tcp4_map_fd;
+    int reuseport_udp4_map_fd;
+    int reuseport_tcp6_map_fd;
+    int reuseport_udp6_map_fd;
+    int tc_ingress_prog_fd;
+    int tc_egress_prog_fd;
+    int reuseport_prog_fd;
     int connect4_prog_fd;
     int connect6_prog_fd;
     int connect6_v4mapped_prog_fd;
@@ -253,7 +263,6 @@ struct bpf2socks_bpf_runtime {
 int bpf2socks_load_uid_map(int uid_map_fd, const struct bpf2socks_policy_config *policy);
 int bpf2socks_load_direct_cidrs(int map_fd, const char *path, int expected_family);
 int bpf2socks_load_cidr_strings(int map_fd, const char cidrs[][BPF2SOCKS_MAX_CIDR_TEXT_LEN], size_t count, int expected_family);
-int bpf2socks_parse_ipv4_cidr_host(const char *cidr, uint32_t *base, uint32_t *host_bits);
 int bpf2socks_original_from_sockaddr_storage(
     const struct sockaddr_storage *addr,
     const struct bpf2socks_runtime_config *config,
@@ -283,7 +292,6 @@ int bpf2socks_detach_named_progs(int cgroup_fd);
 int bpf2socks_detach_cgroup_path(const char *cgroup_path);
 int bpf2socks_delete_map(int map_fd, const void *key);
 int bpf2socks_pin_fd(int fd, const char *path);
-int bpf2socks_link_create(int prog_fd, int target_fd, enum bpf_attach_type attach_type, uint32_t flags);
 
 int bpf2socks_token_lookup(int map_fd, const struct bpf2socks_token_key *key, struct bpf2socks_original_dst *out);
 int bpf2socks_parse_token_ipv4_prefix(const char *text, uint8_t out[4], uint32_t *prefix_bits);
@@ -377,39 +385,18 @@ int bpf2socks_fit_session_capacity(
 int bpf2socks_nofile_soft_limit(uint64_t *out_limit);
 int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const char *pid_path);
 
-int bpf2socks_sk_lookup_probe(bool enable_ipv6, char *message, size_t message_size);
-int bpf2socks_sk_lookup_start(
-    const struct bpf2socks_policy_config *policy,
+int bpf2socks_reuseport_register_worker_sockets(
     const struct bpf2socks_runtime_config *config,
-    struct bpf2socks_bpf_runtime *runtime);
-int bpf2socks_sk_lookup_register_worker_sockets(
-    int sock_map_fd,
     uint32_t worker_id,
     int tcp4_fd,
     int udp4_fd,
     int tcp6_fd,
     int udp6_fd);
-
-int bpf2socks_prerouting_probe_path(
+int bpf2socks_load_embedded_tc_programs(
     const struct bpf2socks_runtime_config *config,
-    int family,
-    char *out,
-    size_t out_size);
-int bpf2socks_prerouting_path(
-    const struct bpf2socks_runtime_config *config,
-    const char *name,
-    char *out,
-    size_t out_size);
-int bpf2socks_prerouting_policy_probe(
-    const struct bpf2socks_runtime_config *config,
-    bool enable_ipv6,
-    char *message,
-    size_t message_size);
-int bpf2socks_prerouting_policy_prepare(
     const struct bpf2socks_policy_config *policy,
-    const struct bpf2socks_runtime_config *config,
-    int local_address_v4_map_fd,
-    int local_address_v6_map_fd);
+    struct bpf2socks_bpf_runtime *runtime,
+    bool log_error);
 
 int bpf2socks_interface_policy_start(
     const struct bpf2socks_policy_config *policy,

@@ -163,7 +163,11 @@ static void json_string_array(
 static void init_runtime_config_defaults(struct bpf2socks_runtime_config *config) {
     memset(config, 0, sizeof(*config));
     config->token_map_fd = -1;
-    config->sk_lookup_sock_map_fd = -1;
+    config->reuseport_tcp4_map_fd = -1;
+    config->reuseport_udp4_map_fd = -1;
+    config->reuseport_tcp6_map_fd = -1;
+    config->reuseport_udp6_map_fd = -1;
+    config->reuseport_prog_fd = -1;
     (void)bpf2socks_parse_token_ipv4_prefix(
         BPF2SOCKS_DEFAULT_TOKEN_IPV4_PREFIX,
         config->token_ipv4_prefix,
@@ -444,8 +448,8 @@ static void print_probe_json(
             ",\"capabilities\":{\"splice\":true,"
             "\"advancedSockets\":%s,"
             "\"bpf\":%s,"
-            "\"skLookup\":%s,"
-            "\"prerouting\":%s,"
+            "\"reuseport\":%s,"
+            "\"tcRedirect\":%s,"
             "\"hotspotPolicy\":%s}}\n",
             advanced_socket_supported ? "true" : "false",
             bpf_supported ? "true" : "false",
@@ -457,8 +461,8 @@ static void print_probe_json(
             ",\"capabilities\":{\"splice\":false,"
             "\"advancedSockets\":%s,"
             "\"bpf\":%s,"
-            "\"skLookup\":false,"
-            "\"prerouting\":false,"
+            "\"reuseport\":false,"
+            "\"tcRedirect\":false,"
             "\"hotspotPolicy\":%s}}\n",
             advanced_socket_supported ? "true" : "false",
             bpf_supported ? "true" : "false",
@@ -498,21 +502,18 @@ static int probe_with_config(const char *path) {
     return 1;
 }
 
-static void cleanup_prerouting_policy_pin(
+static void cleanup_tc_policy_pin(
     const struct bpf2socks_runtime_config *config,
     const char *name) {
     char path[BPF2SOCKS_MAX_PATH_LEN];
-    if (bpf2socks_prerouting_path(config, name, path, sizeof(path)) == 0) {
-        (void)unlink(path);
-    }
+    int written = snprintf(path, sizeof(path), "%s/%s", config->pinned_object_dir, name);
+    if (written >= 0 && (size_t)written < sizeof(path)) (void)unlink(path);
 }
 
-static void cleanup_prerouting_policy_pins(const struct bpf2socks_runtime_config *config) {
+static void cleanup_tc_policy_pins(const struct bpf2socks_runtime_config *config) {
     if (config == NULL) return;
-    cleanup_prerouting_policy_pin(config, "prerouting_v4");
-    cleanup_prerouting_policy_pin(config, "prerouting_v6");
-    cleanup_prerouting_policy_pin(config, "probe_prerouting_v4");
-    cleanup_prerouting_policy_pin(config, "probe_prerouting_v6");
+    cleanup_tc_policy_pin(config, "tc_ingress");
+    cleanup_tc_policy_pin(config, "tc_egress");
 }
 
 static int current_open_fd_count(uint64_t *out_count) {
@@ -611,28 +612,26 @@ static int start_with_config(const char *path, const char *pid_path) {
     struct bpf2socks_bpf_runtime runtime;
     if (bpf2socks_bpf_start(&config, &policy, &runtime) < 0) {
         int saved_errno = errno;
-        cleanup_prerouting_policy_pins(&config);
+        cleanup_tc_policy_pins(&config);
         errno = saved_errno;
         fprintf(stderr, "failed to start bpf2socks BPF runtime: errno=%d\n", errno);
         return 1;
     }
-    if (bpf2socks_prerouting_policy_prepare(
-            &policy,
-            &config,
-            runtime.local_interface_cidr4_map_fd,
-            runtime.local_interface_cidr6_map_fd) < 0) {
-        int saved_errno = errno;
-        bpf2socks_bpf_stop(&runtime);
-        cleanup_prerouting_policy_pins(&config);
-        errno = saved_errno;
-        fprintf(stderr, "failed to prepare bpf2socks PREROUTING policy: errno=%d\n", errno);
-        return 1;
-    }
-
     install_signal_handlers();
     config.token_map_fd = runtime.token_map_fd;
-    config.sk_lookup_sock_map_fd = runtime.sk_lookup_sock_map_fd;
+    config.reuseport_tcp4_map_fd = runtime.reuseport_tcp4_map_fd;
+    config.reuseport_udp4_map_fd = runtime.reuseport_udp4_map_fd;
+    config.reuseport_tcp6_map_fd = runtime.reuseport_tcp6_map_fd;
+    config.reuseport_udp6_map_fd = runtime.reuseport_udp6_map_fd;
+    config.reuseport_prog_fd = runtime.reuseport_prog_fd;
     int result = bpf2socks_bridge_run(&config, pid_path);
+    uint32_t control_key = 0U;
+    struct bpf2socks_tc_runtime_control control;
+    if (runtime.tc_runtime_control_map_fd >= 0 &&
+        bpf2socks_lookup_map(runtime.tc_runtime_control_map_fd, &control_key, &control) == 0) {
+        control.enabled = 0U;
+        (void)bpf2socks_update_map(runtime.tc_runtime_control_map_fd, &control_key, &control);
+    }
     bpf2socks_bpf_stop(&runtime);
     return result == 0 ? 0 : 1;
 }
@@ -650,7 +649,7 @@ static int stop_with_config(const char *path, const char *pid_path) {
         fclose(file);
     }
     (void)bpf2socks_detach_cgroup_path(config.cgroup_path);
-    cleanup_prerouting_policy_pins(&config);
+    cleanup_tc_policy_pins(&config);
     return 0;
 }
 

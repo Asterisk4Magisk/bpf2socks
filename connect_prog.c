@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "bpf2socks.h"
-#include "connected_udp_redirect.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -147,10 +146,6 @@ static bool bypass_private_cidr4_map_required(const struct bpf2socks_policy_conf
         policy->bypass_private_cidr_v4_count > 0U;
 }
 
-static bool local_interface_cidr4_map_required(const struct bpf2socks_policy_config *policy) {
-    return policy != NULL;
-}
-
 static bool direct_cidr4_map_required(const struct bpf2socks_policy_config *policy) {
     return policy != NULL && policy->bypass_direct_cidrs;
 }
@@ -163,10 +158,6 @@ static bool bypass_private_cidr6_map_required(const struct bpf2socks_policy_conf
     return policy != NULL &&
         policy->enable_ipv6 &&
         policy->bypass_private_cidr_v6_count > 0U;
-}
-
-static bool local_interface_cidr6_map_required(const struct bpf2socks_policy_config *policy) {
-    return policy != NULL;
 }
 
 static bool direct_cidr6_map_required(const struct bpf2socks_policy_config *policy) {
@@ -1330,9 +1321,6 @@ static int build_ipv6_sock_addr_prog(
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8));
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
-        if (!bpf2socks_connected_udp_rewrites_peer_during_connect(AF_INET6)) {
-            bypass_jumps[bypass_jump_count++] = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
-        }
         patch_connected_udp_dns_continue(&b, dns_continue);
         patch_jump(&b, tcp_connect, b.count);
     }
@@ -1678,6 +1666,24 @@ static int load_noop_sock_addr_prog(enum bpf_attach_type attach_type, const char
         false);
 }
 
+static int load_constant_prog(
+    enum bpf_prog_type program_type,
+    enum bpf_attach_type attach_type,
+    int result,
+    const char *name) {
+    struct bpf_insn insns[] = {
+        BPF_MOV64_IMM(BPF_REG_0, result),
+        BPF_EXIT_INSN(),
+    };
+    return bpf2socks_load_prog(
+        insns,
+        ARRAY_SIZE(insns),
+        name,
+        program_type,
+        attach_type,
+        false);
+}
+
 static int open_cgroup_path(const char *path) {
     const char *actual = path != NULL && path[0] != '\0' ? path : BPF2SOCKS_DEFAULT_CGROUP_PATH;
     return open(actual, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1699,7 +1705,7 @@ int bpf2socks_bpf_probe(
         memset(&probe_config, 0, sizeof(probe_config));
         probe_config.listen_port = 65532U;
         probe_config.token_ipv4_prefix_bits = BPF2SOCKS_TOKEN_IPV4_PREFIX_BITS;
-        (void)inet_pton(AF_INET, "127.0.0.0", probe_config.token_ipv4_prefix);
+        (void)inet_pton(AF_INET, "127.128.0.0", probe_config.token_ipv4_prefix);
         probe_config.token_ipv6_prefix_bits = BPF2SOCKS_TOKEN_IPV6_PREFIX_BITS;
         (void)inet_pton(AF_INET6, "fd7a:7374:6572:6973::", probe_config.token_ipv6_prefix);
         config = &probe_config;
@@ -1708,14 +1714,18 @@ int bpf2socks_bpf_probe(
         return -1;
     }
     bool need_uid_map = uid_map_required(policy);
-    bool need_proxy_cidr4_map = proxy_cidr4_map_required(policy);
-    bool need_bypass_private_cidr4_map = bypass_private_cidr4_map_required(policy);
-    bool need_local_interface_cidr4_map = local_interface_cidr4_map_required(policy);
-    bool need_direct_cidr4_map = direct_cidr4_map_required(policy);
-    bool need_proxy_cidr6_map = proxy_cidr6_map_required(policy);
-    bool need_bypass_private_cidr6_map = bypass_private_cidr6_map_required(policy);
-    bool need_local_interface_cidr6_map = local_interface_cidr6_map_required(policy);
-    bool need_direct_cidr6_map = direct_cidr6_map_required(policy);
+    /*
+     * TC programs reference the complete policy ABI. Empty maps preserve the
+     * existing conditional policy behavior while keeping every relocation valid.
+     */
+    bool need_proxy_cidr4_map = true;
+    bool need_bypass_private_cidr4_map = true;
+    bool need_local_interface_cidr4_map = true;
+    bool need_direct_cidr4_map = true;
+    bool need_proxy_cidr6_map = true;
+    bool need_bypass_private_cidr6_map = true;
+    bool need_local_interface_cidr6_map = true;
+    bool need_direct_cidr6_map = true;
     int uid_fd = need_uid_map
         ? bpf2socks_create_map(BPF_MAP_TYPE_HASH, sizeof(uint32_t), sizeof(uint32_t), 16U, 0U)
         : -1;
@@ -1767,6 +1777,8 @@ int bpf2socks_bpf_probe(
     int noop_connect6_fd = -1;
     int noop_udp4_fd = -1;
     int noop_udp6_fd = -1;
+    int tc_probe_fd = -1;
+    int reuseport_probe_fd = -1;
     int result = -1;
 
     if ((need_uid_map && uid_fd < 0) ||
@@ -1992,12 +2004,19 @@ int bpf2socks_bpf_probe(
         }
         (void)bpf2socks_detach_prog(cgroup_fd, udp6_recv_fd, BPF_CGROUP_UDP6_RECVMSG);
     }
-
     if (policy->hotspot_interface_prefix_count > 0U) {
-        if (bpf2socks_prerouting_policy_probe(config, policy->enable_ipv6, message, message_size) < 0) {
-            goto done;
-        }
-        if (bpf2socks_sk_lookup_probe(policy->enable_ipv6, message, message_size) < 0) {
+        tc_probe_fd = load_constant_prog(
+            BPF_PROG_TYPE_SCHED_CLS,
+            (enum bpf_attach_type)0,
+            3,
+            "b2s_ptc");
+        reuseport_probe_fd = load_constant_prog(
+            BPF_PROG_TYPE_SK_REUSEPORT,
+            BPF_SK_REUSEPORT_SELECT,
+            1,
+            "b2s_preuse");
+        if (tc_probe_fd < 0 || reuseport_probe_fd < 0) {
+            snprintf(message, message_size, "TC/reuseport programs cannot be loaded: errno=%d", errno);
             goto done;
         }
     }
@@ -2006,6 +2025,8 @@ int bpf2socks_bpf_probe(
     result = 0;
 
 done:
+    close_fd(&reuseport_probe_fd);
+    close_fd(&tc_probe_fd);
     close_fd(&noop_udp6_fd);
     close_fd(&noop_connect6_fd);
     close_fd(&noop_udp4_fd);
@@ -2048,14 +2069,18 @@ int bpf2socks_bpf_start(
     const char *stage = "init";
     bool interface_policy_enabled = policy->ignored_interface_count > 0U;
     bool need_uid_map = uid_map_required(policy);
-    bool need_proxy_cidr4_map = proxy_cidr4_map_required(policy);
-    bool need_bypass_private_cidr4_map = bypass_private_cidr4_map_required(policy);
-    bool need_local_interface_cidr4_map = local_interface_cidr4_map_required(policy);
-    bool need_direct_cidr4_map = direct_cidr4_map_required(policy);
-    bool need_proxy_cidr6_map = proxy_cidr6_map_required(policy);
-    bool need_bypass_private_cidr6_map = bypass_private_cidr6_map_required(policy);
-    bool need_local_interface_cidr6_map = local_interface_cidr6_map_required(policy);
-    bool need_direct_cidr6_map = direct_cidr6_map_required(policy);
+    /*
+     * TC programs reference the complete policy ABI. Empty maps preserve the
+     * existing conditional policy behavior while keeping every relocation valid.
+     */
+    bool need_proxy_cidr4_map = true;
+    bool need_bypass_private_cidr4_map = true;
+    bool need_local_interface_cidr4_map = true;
+    bool need_direct_cidr4_map = true;
+    bool need_proxy_cidr6_map = true;
+    bool need_bypass_private_cidr6_map = true;
+    bool need_local_interface_cidr6_map = true;
+    bool need_direct_cidr6_map = true;
 
     if (need_uid_map) {
         uint32_t uid_entries = uid_map_max_entries(policy);
@@ -2097,6 +2122,69 @@ int bpf2socks_bpf_start(
     stage = "create udp peer map";
     runtime->udp_peer_map_fd = create_udp_peer_map(BPF2SOCKS_MAX_UDP_PEER_MAP_ENTRIES);
     if (runtime->udp_peer_map_fd < 0) goto fail;
+    stage = "create TC runtime control map";
+    runtime->tc_runtime_control_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_ARRAY,
+        sizeof(uint32_t),
+        sizeof(struct bpf2socks_tc_runtime_control),
+        1U,
+        0U);
+    if (runtime->tc_runtime_control_map_fd < 0) goto fail;
+    stage = "create TC original token map";
+    runtime->tc_original_to_token_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_LRU_HASH,
+        sizeof(struct bpf2socks_tc_original_key),
+        sizeof(struct bpf2socks_tc_token_value),
+        BPF2SOCKS_MAX_TOKEN_MAP_ENTRIES,
+        0U);
+    if (runtime->tc_original_to_token_map_fd < 0) goto fail;
+    stage = "create TC reverse token map";
+    runtime->tc_token_to_original_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_LRU_HASH,
+        sizeof(struct bpf2socks_tc_reverse_key),
+        sizeof(struct bpf2socks_tc_original_value),
+        BPF2SOCKS_MAX_TOKEN_MAP_ENTRIES,
+        0U);
+    if (runtime->tc_token_to_original_map_fd < 0) goto fail;
+    stage = "create TC scratch map";
+    runtime->tc_scratch_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_PERCPU_ARRAY,
+        sizeof(uint32_t),
+        BPF2SOCKS_TC_SCRATCH_ABI_SIZE,
+        1U,
+        0U);
+    if (runtime->tc_scratch_map_fd < 0) goto fail;
+    stage = "create reuseport maps";
+    runtime->reuseport_tcp4_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
+        sizeof(uint32_t),
+        sizeof(uint32_t),
+        BPF2SOCKS_MAX_WORKER_COUNT,
+        0U);
+    runtime->reuseport_udp4_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
+        sizeof(uint32_t),
+        sizeof(uint32_t),
+        BPF2SOCKS_MAX_WORKER_COUNT,
+        0U);
+    runtime->reuseport_tcp6_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
+        sizeof(uint32_t),
+        sizeof(uint32_t),
+        BPF2SOCKS_MAX_WORKER_COUNT,
+        0U);
+    runtime->reuseport_udp6_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
+        sizeof(uint32_t),
+        sizeof(uint32_t),
+        BPF2SOCKS_MAX_WORKER_COUNT,
+        0U);
+    if (runtime->reuseport_tcp4_map_fd < 0 ||
+        runtime->reuseport_udp4_map_fd < 0 ||
+        runtime->reuseport_tcp6_map_fd < 0 ||
+        runtime->reuseport_udp6_map_fd < 0) {
+        goto fail;
+    }
     if (need_proxy_cidr6_map) {
         stage = "create proxy cidr6 map";
         runtime->proxy_cidr6_map_fd = create_lpm6_map(BPF2SOCKS_MAX_CIDR_MAP_ENTRIES);
@@ -2141,7 +2229,7 @@ int bpf2socks_bpf_start(
         stage = "load uid map";
         goto fail;
     }
-    if (need_proxy_cidr4_map &&
+    if (proxy_cidr4_map_required(policy) &&
         bpf2socks_load_cidr_strings(
             runtime->proxy_cidr4_map_fd,
             policy->proxy_private_cidrs_v4,
@@ -2150,29 +2238,50 @@ int bpf2socks_bpf_start(
         stage = "load proxy cidr4 map";
         goto fail;
     }
-    if (need_bypass_private_cidr4_map &&
+    if (bypass_private_cidr4_map_required(policy) &&
         bpf2socks_load_cidr_strings(runtime->bypass_private_cidr4_map_fd, policy->bypass_private_cidrs_v4, policy->bypass_private_cidr_v4_count, AF_INET) < 0) {
         stage = "load bypass private cidr4 map";
         goto fail;
     }
-    if (need_direct_cidr4_map &&
+    if (direct_cidr4_map_required(policy) &&
         bpf2socks_load_direct_cidrs(runtime->direct_cidr4_map_fd, policy->direct_cidr_path_v4, AF_INET) < 0) {
         stage = "load direct cidr4 map";
         goto fail;
     }
-    if (need_proxy_cidr6_map &&
+    if (proxy_cidr6_map_required(policy) &&
         bpf2socks_load_cidr_strings(runtime->proxy_cidr6_map_fd, policy->proxy_private_cidrs_v6, policy->proxy_private_cidr_v6_count, AF_INET6) < 0) {
         stage = "load proxy cidr6 map";
         goto fail;
     }
-    if (need_bypass_private_cidr6_map &&
+    if (bypass_private_cidr6_map_required(policy) &&
         bpf2socks_load_cidr_strings(runtime->bypass_private_cidr6_map_fd, policy->bypass_private_cidrs_v6, policy->bypass_private_cidr_v6_count, AF_INET6) < 0) {
         stage = "load bypass private cidr6 map";
         goto fail;
     }
-    if (need_direct_cidr6_map &&
+    if (direct_cidr6_map_required(policy) &&
         bpf2socks_load_direct_cidrs(runtime->direct_cidr6_map_fd, policy->direct_cidr_path_v6, AF_INET6) < 0) {
         stage = "load direct cidr6 map";
+        goto fail;
+    }
+
+    uint32_t control_key = 0U;
+    struct bpf2socks_tc_runtime_control control;
+    memset(&control, 0, sizeof(control));
+    control.enabled = BPF2SOCKS_TC_RUNTIME_ENABLED;
+    control.generation = 1U;
+    control.bridge_port = config->listen_port;
+    if (policy->enable_ipv6) control.flags |= BPF2SOCKS_TC_RUNTIME_IPV6;
+    if (policy->enable_dns_hijack) control.flags |= BPF2SOCKS_TC_RUNTIME_DNS_HIJACK;
+    if (policy->bypass_direct_cidrs) control.flags |= BPF2SOCKS_TC_RUNTIME_BYPASS_DIRECT;
+    memcpy(control.token_ipv4_prefix, config->token_ipv4_prefix, sizeof(control.token_ipv4_prefix));
+    memcpy(control.token_ipv6_prefix, config->token_ipv6_prefix, sizeof(control.token_ipv6_prefix));
+    control.worker_count = config->worker_count;
+    stage = "initialize TC runtime control";
+    if (bpf2socks_update_map(runtime->tc_runtime_control_map_fd, &control_key, &control) < 0) {
+        goto fail;
+    }
+    stage = "load embedded TC programs";
+    if (bpf2socks_load_embedded_tc_programs(config, policy, runtime, true) < 0) {
         goto fail;
     }
 
@@ -2344,10 +2453,6 @@ int bpf2socks_bpf_start(
         stage = "start interface policy";
         goto fail;
     }
-    if (bpf2socks_sk_lookup_start(policy, config, runtime) < 0) {
-        stage = "start sk_lookup";
-        goto fail;
-    }
     if (bpf2socks_attach_prog(runtime->cgroup_fd, runtime->connect4_prog_fd, BPF_CGROUP_INET4_CONNECT) < 0) {
         stage = "attach connect4";
         goto fail;
@@ -2436,9 +2541,17 @@ void bpf2socks_bpf_stop(struct bpf2socks_bpf_runtime *runtime) {
             (void)bpf2socks_detach_prog(runtime->cgroup_fd, runtime->connect4_prog_fd, BPF_CGROUP_INET4_CONNECT);
         }
     }
-    close_fd(&runtime->sk_lookup_link_fd);
-    close_fd(&runtime->sk_lookup_prog_fd);
-    close_fd(&runtime->sk_lookup_sock_map_fd);
+    close_fd(&runtime->reuseport_prog_fd);
+    close_fd(&runtime->tc_egress_prog_fd);
+    close_fd(&runtime->tc_ingress_prog_fd);
+    close_fd(&runtime->reuseport_udp6_map_fd);
+    close_fd(&runtime->reuseport_tcp6_map_fd);
+    close_fd(&runtime->reuseport_udp4_map_fd);
+    close_fd(&runtime->reuseport_tcp4_map_fd);
+    close_fd(&runtime->tc_scratch_map_fd);
+    close_fd(&runtime->tc_token_to_original_map_fd);
+    close_fd(&runtime->tc_original_to_token_map_fd);
+    close_fd(&runtime->tc_runtime_control_map_fd);
     close_fd(&runtime->udp6_v4mapped_recvmsg_prog_fd);
     close_fd(&runtime->udp6_recvmsg_prog_fd);
     close_fd(&runtime->udp4_recvmsg_prog_fd);

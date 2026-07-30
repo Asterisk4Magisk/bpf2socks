@@ -70,7 +70,7 @@ bpf2socks --stats --pid FILE
   "enableIpv6": true,
   "enableDnsHijack": true,
   "debugStats": false,
-  "tokenIpv4Prefix": "127.0.0.0/8",
+  "tokenIpv4Prefix": "127.128.0.0/9",
   "tokenIpv6Prefix": "fd7a:7374:6572:6973::/64",
   "workerCount": 0,
   "tcpBufferSize": 65536,
@@ -121,7 +121,7 @@ bpf2socks --stats --pid FILE
 | `enableIpv6` | `false`. |
 | `enableDnsHijack` | `false`. |
 | `debugStats` | `false`; also enabled by `BPF2SOCKS_DEBUG_STATS=1` or `true`. |
-| `tokenIpv4Prefix` | `127.0.0.0/8`; must retain the supported `/8` token layout. |
+| `tokenIpv4Prefix` | `127.128.0.0/9`; fixed token pool that avoids the lower half of loopback space. |
 | `tokenIpv6Prefix` | `fd7a:7374:6572:6973::/64`; must retain the supported `/64` token layout. |
 | `workerCount` | `0` selects 4 workers on systems with at least 8 online CPUs, otherwise 2; capped at 8 and by session capacities. |
 | `tcpBufferSize` | 65536 bytes; zero resets to the default. |

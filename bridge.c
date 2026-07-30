@@ -5,7 +5,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -58,13 +57,6 @@ struct bridge_stats_thread_args {
     char stats_path[BPF2SOCKS_MAX_PATH_LEN];
 };
 
-int bpf2socks_bridge_set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
-    return 0;
-}
-
 uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback) {
     uint32_t value = requested == 0U ? fallback : requested;
     if (value < 4096U) value = 4096U;
@@ -106,14 +98,6 @@ static int bind_tcp_listener(const struct bpf2socks_runtime_config *config) {
         BPF2SOCKS_DEFAULT_TCP_BUFFER_SIZE);
     bpf2socks_bridge_tune_socket_buffers(fd, tcp_buffer, tcp_buffer);
     bpf2socks_bridge_enable_tcp_fastopen_listener(fd);
-    if (config->sk_lookup_sock_map_fd >= 0 &&
-        setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &one, sizeof(one)) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -145,14 +129,6 @@ static int bind_tcp6_listener(const struct bpf2socks_runtime_config *config) {
     bpf2socks_bridge_tune_socket_buffers(fd, tcp_buffer, tcp_buffer);
     bpf2socks_bridge_enable_tcp_fastopen_listener(fd);
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
-    if (config->sk_lookup_sock_map_fd >= 0 &&
-        setsockopt(fd, IPPROTO_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
@@ -180,13 +156,6 @@ static int bind_udp_listener(const struct bpf2socks_runtime_config *config) {
     bpf2socks_bridge_tune_socket_buffers(fd, udp_buffer, udp_buffer);
     bpf2socks_bridge_tune_udp_advanced(fd);
     if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-    if (config->sk_lookup_sock_map_fd >= 0 &&
-        setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &one, sizeof(one)) != 0) {
         int saved = errno;
         close(fd);
         errno = saved;
@@ -231,14 +200,6 @@ static int bind_udp6_listener(const struct bpf2socks_runtime_config *config) {
         return -1;
     }
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVORIGDSTADDR, &one, sizeof(one));
-    if (config->sk_lookup_sock_map_fd >= 0 &&
-        setsockopt(fd, IPPROTO_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
@@ -600,14 +561,14 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
             }
         }
 
-        if (bpf2socks_sk_lookup_register_worker_sockets(
-                config->sk_lookup_sock_map_fd,
+        if (bpf2socks_reuseport_register_worker_sockets(
+                config,
                 workers[i].id,
                 workers[i].tcp_listener_fd,
                 workers[i].udp_listener_fd,
                 workers[i].tcp_listener6_fd,
                 workers[i].udp_listener6_fd) < 0) {
-            fprintf(stderr, "failed to register bpf2socks sockets for sk_lookup worker %u: errno=%d\n", i, errno);
+            fprintf(stderr, "failed to register bpf2socks reuseport sockets for worker %u: errno=%d\n", i, errno);
             bpf2socks_stop_requested = 1;
             goto done;
         }

@@ -121,20 +121,6 @@ int bpf2socks_pin_fd(int fd, const char *path) {
     return (int)bpf2socks_bpf_sys(BPF_OBJ_PIN, &attr, sizeof(attr));
 }
 
-int bpf2socks_link_create(int prog_fd, int target_fd, enum bpf_attach_type attach_type, uint32_t flags) {
-    if (prog_fd < 0 || target_fd < 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.link_create.prog_fd = (uint32_t)prog_fd;
-    attr.link_create.target_fd = (uint32_t)target_fd;
-    attr.link_create.attach_type = attach_type;
-    attr.link_create.flags = flags;
-    return (int)bpf2socks_bpf_sys(BPF_LINK_CREATE, &attr, sizeof(attr));
-}
-
 static int load_prog_once(
     const struct bpf_insn *insns,
     size_t insn_count,

@@ -143,7 +143,6 @@ int bpf2socks_pending_budget_reserve(struct bpf2socks_udp_pending_budget *budget
 int bpf2socks_pending_budget_release(struct bpf2socks_udp_pending_budget *budget, size_t bytes);
 size_t bpf2socks_pending_budget_used(const struct bpf2socks_udp_pending_budget *budget);
 size_t bpf2socks_pending_budget_peak(const struct bpf2socks_udp_pending_budget *budget);
-int bpf2socks_bridge_set_nonblocking(int fd);
 uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback);
 void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t send_size);
 void bpf2socks_bridge_record_socket_buffers(int fd);

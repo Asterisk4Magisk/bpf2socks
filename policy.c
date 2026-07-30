@@ -108,26 +108,6 @@ static int update_cidr_map_if_uncovered(int map_fd, const void *key, const uint8
     return bpf2socks_update_map(map_fd, key, value);
 }
 
-int bpf2socks_parse_ipv4_cidr_host(const char *cidr, uint32_t *base, uint32_t *host_bits) {
-    if (cidr == NULL || base == NULL || host_bits == NULL) return -1;
-    char line[256];
-    snprintf(line, sizeof(line), "%s", cidr);
-    char *trimmed = trim_line(line);
-    char *slash = strchr(trimmed, '/');
-    if (slash == NULL) return -1;
-    *slash++ = '\0';
-    char *end = NULL;
-    errno = 0;
-    unsigned long prefix = strtoul(slash, &end, 10);
-    if (errno != 0 || end == slash || *end != '\0' || prefix > 32UL) return -1;
-    struct in_addr addr;
-    if (inet_pton(AF_INET, trimmed, &addr) != 1) return -1;
-    uint32_t mask = prefix == 0UL ? 0U : 0xffffffffU << (32UL - prefix);
-    *base = ntohl(addr.s_addr) & mask;
-    *host_bits = (uint32_t)(32UL - prefix);
-    return 0;
-}
-
 int bpf2socks_load_direct_cidrs(int map_fd, const char *path, int expected_family) {
     if (map_fd < 0 || path == NULL || path[0] == '\0') return -1;
     FILE *file = fopen(path, "r");
