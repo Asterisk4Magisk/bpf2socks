@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "tc_token.h"
+#include "tc_checksum_flags.h"
+#include "tc_packet_layout.h"
 
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
@@ -10,10 +12,6 @@
 #define SEC(name) __attribute__((section(name), used))
 #define INLINE static __attribute__((always_inline))
 #define ARRAY_SIZE(value) (sizeof(value) / sizeof((value)[0]))
-
-#ifndef BPF_F_MARK_MANGLED_0
-#define BPF_F_MARK_MANGLED_0 (1ULL << 5)
-#endif
 
 #define ETH_P_IP 0x0800U
 #define ETH_P_IPV6 0x86ddU
@@ -98,22 +96,6 @@ struct ipv6_header {
 struct transport_ports {
     __be16 source;
     __be16 destination;
-};
-
-struct tcp_header_min {
-    __be16 source;
-    __be16 destination;
-    __be32 sequence;
-    __be32 acknowledgement;
-    __be16 flags;
-    __sum16 checksum;
-};
-
-struct udp_header_min {
-    __be16 source;
-    __be16 destination;
-    __be16 length;
-    __sum16 checksum;
 };
 
 struct bpf2socks_tc_scratch {
@@ -383,12 +365,6 @@ INLINE bool reserve_token(
     return false;
 }
 
-INLINE __u64 l4_flags(__u8 protocol, __u64 size) {
-    __u64 flags = BPF_F_PSEUDO_HDR | size;
-    if (protocol == IPPROTO_UDP_VALUE) flags |= BPF_F_MARK_MANGLED_0;
-    return flags;
-}
-
 INLINE int rewrite_ipv4(
     struct __sk_buff *skb,
     __u32 address_offset,
@@ -399,10 +375,21 @@ INLINE int rewrite_ipv4(
     __be16 old_port,
     __be16 new_port,
     __u8 protocol) {
+    bool is_udp = protocol == IPPROTO_UDP_VALUE;
     __u32 ip_checksum_offset = sizeof(struct ethernet_header) + __builtin_offsetof(struct ipv4_header, checksum);
     if (l3_csum_replace(skb, ip_checksum_offset, old_address, new_address, 4U) != 0 ||
-        l4_csum_replace(skb, checksum_offset, old_address, new_address, l4_flags(protocol, 4U)) != 0 ||
-        l4_csum_replace(skb, checksum_offset, old_port, new_port, l4_flags(protocol, 2U)) != 0) {
+        l4_csum_replace(
+            skb,
+            checksum_offset,
+            old_address,
+            new_address,
+            bpf2socks_l4_address_flags(is_udp, 4U)) != 0 ||
+        l4_csum_replace(
+            skb,
+            checksum_offset,
+            old_port,
+            new_port,
+            bpf2socks_l4_port_flags(is_udp, 2U)) != 0) {
         return TC_ACT_SHOT;
     }
     if (skb_store_bytes(skb, address_offset, &new_address, sizeof(new_address), 0U) != 0 ||
@@ -518,17 +505,28 @@ INLINE int rewrite_ipv6(
     __be16 old_port,
     __be16 new_port,
     __u8 protocol) {
+    bool is_udp = protocol == IPPROTO_UDP_VALUE;
 #pragma clang loop unroll(full)
     for (__u32 offset = 0U; offset < 16U; offset += 4U) {
         __be32 old_word;
         __be32 new_word;
         __builtin_memcpy(&old_word, old_address + offset, 4U);
         __builtin_memcpy(&new_word, new_address + offset, 4U);
-        if (l4_csum_replace(skb, checksum_offset, old_word, new_word, l4_flags(protocol, 4U)) != 0) {
+        if (l4_csum_replace(
+                skb,
+                checksum_offset,
+                old_word,
+                new_word,
+                bpf2socks_l4_address_flags(is_udp, 4U)) != 0) {
             return TC_ACT_SHOT;
         }
     }
-    if (l4_csum_replace(skb, checksum_offset, old_port, new_port, l4_flags(protocol, 2U)) != 0 ||
+    if (l4_csum_replace(
+            skb,
+            checksum_offset,
+            old_port,
+            new_port,
+            bpf2socks_l4_port_flags(is_udp, 2U)) != 0 ||
         skb_store_bytes(skb, address_offset, new_address, 16U, 0U) != 0 ||
         skb_store_bytes(skb, port_offset, &new_port, sizeof(new_port), 0U) != 0) {
         return TC_ACT_SHOT;
