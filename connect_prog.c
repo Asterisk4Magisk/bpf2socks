@@ -611,6 +611,16 @@ static void emit_ipv4_policy_checks_from_regs(
     emit(builder, BPF_ALU64_IMM_OP(BPF_AND, BPF_REG_2, 0xff000000U));
     bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, 0x7f000000U, 0));
 
+    if (local_interface_cidr4_map_fd >= 0) {
+        emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_LPM4_KEY, 32));
+        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_LPM4_KEY + (int)offsetof(struct bpf2socks_lpm4_key, addr)));
+        emit_ld_map_fd(builder, BPF_REG_1, local_interface_cidr4_map_fd);
+        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM4_KEY));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    }
+
     if (proxy_cidr4_map_fd >= 0) {
         emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_LPM4_KEY, 32));
         emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_LPM4_KEY + (int)offsetof(struct bpf2socks_lpm4_key, addr)));
@@ -619,6 +629,16 @@ static void emit_ipv4_policy_checks_from_regs(
         emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM4_KEY));
         emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
         force_proxy_jumps[(*force_proxy_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    }
+
+    if (bypass_private_cidr4_map_fd >= 0) {
+        emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_LPM4_KEY, 32));
+        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_LPM4_KEY + (int)offsetof(struct bpf2socks_lpm4_key, addr)));
+        emit_ld_map_fd(builder, BPF_REG_1, bypass_private_cidr4_map_fd);
+        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM4_KEY));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
     }
 
     if (ignored_ifindex_map_fd >= 0) {
@@ -640,26 +660,6 @@ static void emit_ipv4_policy_checks_from_regs(
         emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_LPM4_KEY, 32));
         emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_LPM4_KEY + (int)offsetof(struct bpf2socks_lpm4_key, addr)));
         emit_ld_map_fd(builder, BPF_REG_1, ignored_route_cidr4_map_fd);
-        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM4_KEY));
-        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
-        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
-    }
-
-    if (bypass_private_cidr4_map_fd >= 0) {
-        emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_LPM4_KEY, 32));
-        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_LPM4_KEY + (int)offsetof(struct bpf2socks_lpm4_key, addr)));
-        emit_ld_map_fd(builder, BPF_REG_1, bypass_private_cidr4_map_fd);
-        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM4_KEY));
-        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
-        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
-    }
-
-    if (local_interface_cidr4_map_fd >= 0) {
-        emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_LPM4_KEY, 32));
-        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_LPM4_KEY + (int)offsetof(struct bpf2socks_lpm4_key, addr)));
-        emit_ld_map_fd(builder, BPF_REG_1, local_interface_cidr4_map_fd);
         emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
         emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM4_KEY));
         emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
@@ -729,12 +729,28 @@ static void emit_ipv6_policy_checks(
         emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_4, STACK_LPM6_KEY + (int)offsetof(struct bpf2socks_lpm6_key, addr) + 12));
     }
 
+    if (local_interface_cidr6_map_fd >= 0) {
+        emit_ld_map_fd(builder, BPF_REG_1, local_interface_cidr6_map_fd);
+        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM6_KEY));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    }
+
     if (proxy_cidr6_map_fd >= 0) {
         emit_ld_map_fd(builder, BPF_REG_1, proxy_cidr6_map_fd);
         emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
         emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM6_KEY));
         emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
         force_proxy_jumps[(*force_proxy_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    }
+
+    if (bypass_private_cidr6_map_fd >= 0) {
+        emit_ld_map_fd(builder, BPF_REG_1, bypass_private_cidr6_map_fd);
+        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM6_KEY));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
     }
 
     if (ignored_ifindex_map_fd >= 0) {
@@ -754,22 +770,6 @@ static void emit_ipv6_policy_checks(
 
     if (ignored_route_cidr6_map_fd >= 0) {
         emit_ld_map_fd(builder, BPF_REG_1, ignored_route_cidr6_map_fd);
-        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM6_KEY));
-        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
-        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
-    }
-
-    if (bypass_private_cidr6_map_fd >= 0) {
-        emit_ld_map_fd(builder, BPF_REG_1, bypass_private_cidr6_map_fd);
-        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM6_KEY));
-        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
-        bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
-    }
-
-    if (local_interface_cidr6_map_fd >= 0) {
-        emit_ld_map_fd(builder, BPF_REG_1, local_interface_cidr6_map_fd);
         emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
         emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_LPM6_KEY));
         emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
@@ -997,6 +997,13 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
     size_t force_proxy_jumps[16];
     size_t force_proxy_jump_count = 0;
 
+    emit_ipv4_dns_force_proxy_policy_from_regs(
+        builder,
+        policy,
+        protocol,
+        protocol_from_context,
+        force_proxy_jumps,
+        &force_proxy_jump_count);
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_SAVED_V4_ADDR));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8, STACK_SAVED_V4_PORT));
     emit_uid_policy(builder, policy, uid_map_fd, bypass_jumps, bypass_jump_count, drop_jumps, drop_jump_count);

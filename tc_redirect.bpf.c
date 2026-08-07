@@ -221,11 +221,9 @@ INLINE bool policy4_proxy(__be32 destination, __u8 protocol, __u16 destination_p
         return true;
     }
     struct bpf2socks_lpm4_key_bpf key = {.prefixlen = 32U, .addr = destination};
+    if (map_lookup(&local_interface_cidr4_map, &key) != 0) return false;
     if (map_lookup(&proxy_cidr4_map, &key) != 0) return true;
-    if (map_lookup(&bypass_private_cidr4_map, &key) != 0 ||
-        map_lookup(&local_interface_cidr4_map, &key) != 0) {
-        return false;
-    }
+    if (map_lookup(&bypass_private_cidr4_map, &key) != 0) return false;
     if ((flags & BPF2SOCKS_TC_RUNTIME_BYPASS_DIRECT) != 0U &&
         map_lookup(&direct_cidr4_map, &key) != 0) {
         return false;
@@ -240,11 +238,9 @@ INLINE bool policy6_proxy(const __u8 destination[16], __u8 protocol, __u16 desti
     }
     struct bpf2socks_lpm6_key_bpf key = {.prefixlen = 128U};
     copy_bytes(key.addr, destination, 16U);
+    if (map_lookup(&local_interface_cidr6_map, &key) != 0) return false;
     if (map_lookup(&proxy_cidr6_map, &key) != 0) return true;
-    if (map_lookup(&bypass_private_cidr6_map, &key) != 0 ||
-        map_lookup(&local_interface_cidr6_map, &key) != 0) {
-        return false;
-    }
+    if (map_lookup(&bypass_private_cidr6_map, &key) != 0) return false;
     if ((flags & BPF2SOCKS_TC_RUNTIME_BYPASS_DIRECT) != 0U &&
         map_lookup(&direct_cidr6_map, &key) != 0) {
         return false;
