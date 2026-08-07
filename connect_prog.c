@@ -997,6 +997,8 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
     size_t force_proxy_jumps[16];
     size_t force_proxy_jump_count = 0;
 
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_SAVED_V4_ADDR));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8, STACK_SAVED_V4_PORT));
     emit_ipv4_dns_force_proxy_policy_from_regs(
         builder,
         policy,
@@ -1004,8 +1006,6 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
         protocol_from_context,
         force_proxy_jumps,
         &force_proxy_jump_count);
-    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_SAVED_V4_ADDR));
-    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8, STACK_SAVED_V4_PORT));
     emit_uid_policy(builder, policy, uid_map_fd, bypass_jumps, bypass_jump_count, drop_jumps, drop_jump_count);
     emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V4_ADDR));
     emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V4_PORT));
