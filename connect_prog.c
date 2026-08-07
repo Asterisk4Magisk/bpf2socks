@@ -2120,7 +2120,7 @@ int bpf2socks_bpf_start(
     }
     if (need_direct_cidr4_map) {
         stage = "create direct cidr4 map";
-        runtime->direct_cidr4_map_fd = create_lpm4_map(BPF2SOCKS_MAX_CIDR_MAP_ENTRIES);
+        runtime->direct_cidr4_map_fd = create_lpm4_map(BPF2SOCKS_MAX_DIRECT_CIDR_MAP_ENTRIES);
         if (runtime->direct_cidr4_map_fd < 0) goto fail;
     }
     stage = "create token map";
@@ -2211,7 +2211,7 @@ int bpf2socks_bpf_start(
     }
     if (need_direct_cidr6_map) {
         stage = "create direct cidr6 map";
-        runtime->direct_cidr6_map_fd = create_lpm6_map(BPF2SOCKS_MAX_CIDR_MAP_ENTRIES);
+        runtime->direct_cidr6_map_fd = create_lpm6_map(BPF2SOCKS_MAX_DIRECT_CIDR_MAP_ENTRIES);
         if (runtime->direct_cidr6_map_fd < 0) goto fail;
     }
     if (interface_policy_enabled) {
