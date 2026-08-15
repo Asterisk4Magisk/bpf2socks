@@ -85,7 +85,7 @@ bpf2socks --stats --pid FILE
   "maxUdpPendingBytes": 67108864,
   "dnsTransactionTimeoutMilliseconds": 60000,
   "hotspotInterfacePrefixes": ["wlan+"],
-  "ignoredInterfaces": ["lo"],
+  "ignoredInterfaces": ["lo", "wlan0", "wlan+"],
   "proxyPrivateCidrsV4": ["10.0.0.0/8"],
   "bypassPrivateCidrsV4": ["192.168.0.0/16"],
   "proxyPrivateCidrsV6": ["fd00::/8"],
@@ -147,7 +147,7 @@ bpf2socks --stats --pid FILE
 | `policy.directCidrPathV4` | IPv4 CIDR file used when direct bypass is enabled. |
 | `policy.directCidrPathV6` | IPv6 CIDR file used when direct bypass and IPv6 are enabled. |
 | `hotspotInterfacePrefixes` | Hotspot interface selectors, up to 64 entries. |
-| `ignoredInterfaces` | Interfaces excluded from interception, up to 64 entries. |
+| `ignoredInterfaces` | Exact interface names (for example, `wlan0`) or case-sensitive prefix selectors ending in `+` (for example, `wlan+`), up to 64 entries. Each selector is 1–15 total ASCII characters: letters, digits, `_`, `.`, and `-`, with `+` allowed only as the final character after a non-empty prefix. |
 | `proxyPrivateCidrsV4` / `proxyPrivateCidrsV6` | Private CIDRs explicitly proxied, up to 512 per family. |
 | `bypassPrivateCidrsV4` / `bypassPrivateCidrsV6` | Private CIDRs explicitly bypassed, up to 512 per family. |
 

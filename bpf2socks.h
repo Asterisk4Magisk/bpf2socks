@@ -399,6 +399,9 @@ int bpf2socks_load_embedded_tc_programs(
     struct bpf2socks_bpf_runtime *runtime,
     bool log_error);
 
+bool bpf2socks_interface_selector_valid(const char *selector);
+bool bpf2socks_interface_matches_selector(const char *name, const char *selector);
+
 int bpf2socks_interface_policy_start(
     const struct bpf2socks_policy_config *policy,
     struct bpf2socks_bpf_runtime *runtime);

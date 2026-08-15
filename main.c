@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "bpf2socks.h"
+#include "json_util.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -40,124 +41,9 @@ static void install_signal_handlers(void) {
     (void)sigaction(SIGPIPE, &action, NULL);
 }
 
-static char *read_file(const char *path) {
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) return NULL;
-    if (fseek(file, 0, SEEK_END) != 0) {
-        fclose(file);
-        return NULL;
-    }
-    long length = ftell(file);
-    if (length < 0) {
-        fclose(file);
-        return NULL;
-    }
-    rewind(file);
-    char *data = calloc((size_t)length + 1U, 1U);
-    if (data == NULL) {
-        fclose(file);
-        return NULL;
-    }
-    if (length > 0 && fread(data, 1U, (size_t)length, file) != (size_t)length) {
-        free(data);
-        fclose(file);
-        return NULL;
-    }
-    fclose(file);
-    return data;
-}
-
-static const char *json_value_pos(const char *json, const char *key) {
-    char needle[96];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *pos = strstr(json, needle);
-    if (pos == NULL) return NULL;
-    pos = strchr(pos, ':');
-    if (pos == NULL) return NULL;
-    return pos + 1;
-}
-
-static uint32_t json_uint(const char *json, const char *key, uint32_t fallback) {
-    const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return fallback;
-    return (uint32_t)strtoul(pos, NULL, 10);
-}
-
-static bool json_bool(const char *json, const char *key, bool fallback) {
-    const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return fallback;
-    while (*pos == ' ' || *pos == '\n' || *pos == '\t' || *pos == '\r') ++pos;
-    if (strncmp(pos, "true", 4) == 0) return true;
-    if (strncmp(pos, "false", 5) == 0) return false;
-    return fallback;
-}
-
 static bool env_bool_enabled(const char *key) {
     const char *value = getenv(key);
     return value != NULL && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0);
-}
-
-static bool json_string(const char *json, const char *key, char *out, size_t out_size) {
-    const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return false;
-    pos = strchr(pos, '"');
-    if (pos == NULL) return false;
-    ++pos;
-    const char *end = strchr(pos, '"');
-    if (end == NULL) return false;
-    size_t length = (size_t)(end - pos);
-    if (length >= out_size) length = out_size - 1U;
-    memcpy(out, pos, length);
-    out[length] = '\0';
-    return true;
-}
-
-static void json_uint_array(const char *json, const char *key, uint32_t *out, size_t *count, size_t max_count) {
-    *count = 0;
-    const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return;
-    pos = strchr(pos, '[');
-    if (pos == NULL) return;
-    ++pos;
-    while (*pos != '\0' && *pos != ']' && *count < max_count) {
-        while (*pos == ' ' || *pos == '\n' || *pos == '\t' || *pos == '\r' || *pos == ',') ++pos;
-        if (*pos == ']') break;
-        char *end = NULL;
-        unsigned long value = strtoul(pos, &end, 10);
-        if (end == pos) break;
-        out[(*count)++] = (uint32_t)value;
-        pos = end;
-    }
-}
-
-static void json_string_array(
-    const char *json,
-    const char *key,
-    char *out,
-    size_t row_size,
-    size_t *count,
-    size_t max_count) {
-    *count = 0;
-    const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return;
-    pos = strchr(pos, '[');
-    if (pos == NULL) return;
-    ++pos;
-    while (*pos != '\0' && *pos != ']' && *count < max_count) {
-        while (*pos == ' ' || *pos == '\n' || *pos == '\t' || *pos == '\r' || *pos == ',') ++pos;
-        if (*pos == ']') break;
-        if (*pos != '"') break;
-        ++pos;
-        const char *end = strchr(pos, '"');
-        if (end == NULL) break;
-        size_t length = (size_t)(end - pos);
-        if (length >= row_size) length = row_size - 1U;
-        char *slot = out + (*count * row_size);
-        memcpy(slot, pos, length);
-        slot[length] = '\0';
-        ++(*count);
-        pos = end + 1;
-    }
 }
 
 static void init_runtime_config_defaults(struct bpf2socks_runtime_config *config) {
@@ -269,26 +155,27 @@ static int load_runtime_config(
     struct bpf2socks_policy_config *policy) {
     init_runtime_config_defaults(config);
     init_policy_config_defaults(policy);
-    char *json = read_file(path);
+    char *json = bpf2socks_json_read_file(path);
     if (json == NULL) {
         fprintf(stderr, "failed to read config: %s\n", path);
         return -1;
     }
 
     bool ok = true;
-    ok = json_string(json, "socksHost", config->socks_host, sizeof(config->socks_host)) && ok;
-    config->socks_port = (uint16_t)json_uint(json, "socksPort", 0U);
-    ok = json_string(json, "bridgeListenAddress", config->listen_host, sizeof(config->listen_host)) && ok;
-    config->listen_port = (uint16_t)json_uint(json, "bridgePort", 0U);
-    ok = json_string(json, "pinnedObjectDir", config->pinned_object_dir, sizeof(config->pinned_object_dir)) && ok;
-    if (!json_string(json, "cgroupPath", config->cgroup_path, sizeof(config->cgroup_path))) {
+    ok = bpf2socks_json_string(json, "socksHost", config->socks_host, sizeof(config->socks_host)) && ok;
+    config->socks_port = (uint16_t)bpf2socks_json_uint(json, "socksPort", 0U);
+    ok = bpf2socks_json_string(json, "bridgeListenAddress", config->listen_host, sizeof(config->listen_host)) && ok;
+    config->listen_port = (uint16_t)bpf2socks_json_uint(json, "bridgePort", 0U);
+    ok = bpf2socks_json_string(json, "pinnedObjectDir", config->pinned_object_dir, sizeof(config->pinned_object_dir)) && ok;
+    if (!bpf2socks_json_string(json, "cgroupPath", config->cgroup_path, sizeof(config->cgroup_path))) {
         snprintf(config->cgroup_path, sizeof(config->cgroup_path), "%s", BPF2SOCKS_DEFAULT_CGROUP_PATH);
     }
-    config->enable_ipv6 = json_bool(json, "enableIpv6", false);
-    config->enable_dns_hijack = json_bool(json, "enableDnsHijack", false);
-    config->debug_stats = json_bool(json, "debugStats", false) || env_bool_enabled("BPF2SOCKS_DEBUG_STATS");
+    config->enable_ipv6 = bpf2socks_json_bool(json, "enableIpv6", false);
+    config->enable_dns_hijack = bpf2socks_json_bool(json, "enableDnsHijack", false);
+    config->debug_stats =
+        bpf2socks_json_bool(json, "debugStats", false) || env_bool_enabled("BPF2SOCKS_DEBUG_STATS");
     char token_ipv4_prefix[INET_ADDRSTRLEN + 4U];
-    if (json_string(json, "tokenIpv4Prefix", token_ipv4_prefix, sizeof(token_ipv4_prefix)) &&
+    if (bpf2socks_json_string(json, "tokenIpv4Prefix", token_ipv4_prefix, sizeof(token_ipv4_prefix)) &&
         bpf2socks_parse_token_ipv4_prefix(
             token_ipv4_prefix,
             config->token_ipv4_prefix,
@@ -297,7 +184,7 @@ static int load_runtime_config(
         ok = false;
     }
     char token_ipv6_prefix[128];
-    if (json_string(json, "tokenIpv6Prefix", token_ipv6_prefix, sizeof(token_ipv6_prefix)) &&
+    if (bpf2socks_json_string(json, "tokenIpv6Prefix", token_ipv6_prefix, sizeof(token_ipv6_prefix)) &&
         bpf2socks_parse_token_ipv6_prefix(
             token_ipv6_prefix,
             config->token_ipv6_prefix,
@@ -305,88 +192,113 @@ static int load_runtime_config(
         fprintf(stderr, "invalid bpf2socks IPv6 token prefix: %s\n", token_ipv6_prefix);
         ok = false;
     }
-    config->worker_count = json_uint(json, "workerCount", config->worker_count);
-    config->tcp_buffer_size = json_uint(json, "tcpBufferSize", config->tcp_buffer_size);
-    config->max_tcp_sessions = json_uint(json, "maxTcpSessions", config->max_tcp_sessions);
-    config->tcp_connect_timeout_milliseconds = json_uint(
+    config->worker_count = bpf2socks_json_uint(json, "workerCount", config->worker_count);
+    config->tcp_buffer_size = bpf2socks_json_uint(json, "tcpBufferSize", config->tcp_buffer_size);
+    config->max_tcp_sessions = bpf2socks_json_uint(json, "maxTcpSessions", config->max_tcp_sessions);
+    config->tcp_connect_timeout_milliseconds = bpf2socks_json_uint(
         json,
         "tcpConnectTimeoutMilliseconds",
         config->tcp_connect_timeout_milliseconds);
-    config->tcp_idle_timeout_milliseconds = json_uint(
+    config->tcp_idle_timeout_milliseconds = bpf2socks_json_uint(
         json,
         "tcpIdleTimeoutMilliseconds",
         config->tcp_idle_timeout_milliseconds);
-    config->udp_socket_buffer_size = json_uint(
+    config->udp_socket_buffer_size = bpf2socks_json_uint(
         json,
         "udpSocketBufferSize",
         config->udp_socket_buffer_size);
-    config->udp_batch_size = json_uint(json, "udpBatchSize", config->udp_batch_size);
-    config->max_udp_sessions = json_uint(json, "maxUdpSessions", config->max_udp_sessions);
-    config->max_udp_bindings = json_uint(json, "maxUdpBindings", config->max_udp_bindings);
-    config->udp_idle_timeout_seconds = json_uint(
+    config->udp_batch_size = bpf2socks_json_uint(json, "udpBatchSize", config->udp_batch_size);
+    config->max_udp_sessions = bpf2socks_json_uint(json, "maxUdpSessions", config->max_udp_sessions);
+    config->max_udp_bindings = bpf2socks_json_uint(json, "maxUdpBindings", config->max_udp_bindings);
+    config->udp_idle_timeout_seconds = bpf2socks_json_uint(
         json,
         "udpIdleTimeoutSeconds",
         config->udp_idle_timeout_seconds);
-    config->max_udp_pending_bytes = json_uint(
+    config->max_udp_pending_bytes = bpf2socks_json_uint(
         json,
         "maxUdpPendingBytes",
         config->max_udp_pending_bytes);
-    config->dns_transaction_timeout_milliseconds = json_uint(
+    config->dns_transaction_timeout_milliseconds = bpf2socks_json_uint(
         json,
         "dnsTransactionTimeoutMilliseconds",
         config->dns_transaction_timeout_milliseconds);
     normalize_runtime_tunables(config);
 
-    const char *policy_json = json;
-    const char *policy_value = json_value_pos(json, "policy");
-    if (policy_value != NULL) {
-        const char *policy_object = strchr(policy_value, '{');
-        if (policy_object != NULL) policy_json = policy_object;
-    }
-    policy->mode = json_uint(policy_json, "mode", BPF2SOCKS_MODE_GLOBAL);
-    policy->bypass_direct_cidrs = json_bool(policy_json, "bypassDirectCidrs", false);
+    const char *policy_object = bpf2socks_json_object(json, "policy");
+    const char *policy_json = policy_object != NULL ? policy_object : json;
+    policy->mode = bpf2socks_json_uint(policy_json, "mode", BPF2SOCKS_MODE_GLOBAL);
+    policy->bypass_direct_cidrs = bpf2socks_json_bool(policy_json, "bypassDirectCidrs", false);
     policy->enable_ipv6 = config->enable_ipv6;
     policy->enable_dns_hijack = config->enable_dns_hijack;
-    (void)json_string(policy_json, "directCidrPathV4", policy->direct_cidr_path_v4, sizeof(policy->direct_cidr_path_v4));
-    (void)json_string(policy_json, "directCidrPathV6", policy->direct_cidr_path_v6, sizeof(policy->direct_cidr_path_v6));
-    json_uint_array(policy_json, "uids", policy->uids, &policy->uid_count, BPF2SOCKS_MAX_UIDS);
-    json_uint_array(policy_json, "bypassUids", policy->bypass_uids, &policy->bypass_uid_count, BPF2SOCKS_MAX_UIDS);
-    json_string_array(
+    (void)bpf2socks_json_string(
+        policy_json,
+        "directCidrPathV4",
+        policy->direct_cidr_path_v4,
+        sizeof(policy->direct_cidr_path_v4));
+    (void)bpf2socks_json_string(
+        policy_json,
+        "directCidrPathV6",
+        policy->direct_cidr_path_v6,
+        sizeof(policy->direct_cidr_path_v6));
+    bpf2socks_json_uint_array(
+        policy_json,
+        "uids",
+        policy->uids,
+        &policy->uid_count,
+        BPF2SOCKS_MAX_UIDS);
+    bpf2socks_json_uint_array(
+        policy_json,
+        "bypassUids",
+        policy->bypass_uids,
+        &policy->bypass_uid_count,
+        BPF2SOCKS_MAX_UIDS);
+    (void)bpf2socks_json_string_array(
         json,
         "hotspotInterfacePrefixes",
         (char *)policy->hotspot_interface_prefixes,
         BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
         &policy->hotspot_interface_prefix_count,
         BPF2SOCKS_MAX_INTERFACES);
-    json_string_array(
-        json,
-        "ignoredInterfaces",
-        (char *)policy->ignored_interfaces,
-        BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
-        &policy->ignored_interface_count,
-        BPF2SOCKS_MAX_INTERFACES);
-    json_string_array(
+    if (!bpf2socks_json_string_array(
+            json,
+            "ignoredInterfaces",
+            (char *)policy->ignored_interfaces,
+            BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
+            &policy->ignored_interface_count,
+            BPF2SOCKS_MAX_INTERFACES)) {
+        ok = false;
+    }
+    for (size_t index = 0U; index < policy->ignored_interface_count; ++index) {
+        if (!bpf2socks_interface_selector_valid(policy->ignored_interfaces[index])) {
+            fprintf(
+                stderr,
+                "invalid bpf2socks ignored interface selector: %s\n",
+                policy->ignored_interfaces[index]);
+            ok = false;
+        }
+    }
+    (void)bpf2socks_json_string_array(
         json,
         "proxyPrivateCidrsV4",
         (char *)policy->proxy_private_cidrs_v4,
         BPF2SOCKS_MAX_CIDR_TEXT_LEN,
         &policy->proxy_private_cidr_v4_count,
         BPF2SOCKS_MAX_POLICY_CIDRS);
-    json_string_array(
+    (void)bpf2socks_json_string_array(
         json,
         "bypassPrivateCidrsV4",
         (char *)policy->bypass_private_cidrs_v4,
         BPF2SOCKS_MAX_CIDR_TEXT_LEN,
         &policy->bypass_private_cidr_v4_count,
         BPF2SOCKS_MAX_POLICY_CIDRS);
-    json_string_array(
+    (void)bpf2socks_json_string_array(
         json,
         "proxyPrivateCidrsV6",
         (char *)policy->proxy_private_cidrs_v6,
         BPF2SOCKS_MAX_CIDR_TEXT_LEN,
         &policy->proxy_private_cidr_v6_count,
         BPF2SOCKS_MAX_POLICY_CIDRS);
-    json_string_array(
+    (void)bpf2socks_json_string_array(
         json,
         "bypassPrivateCidrsV6",
         (char *)policy->bypass_private_cidrs_v6,
@@ -417,23 +329,6 @@ static const char *pid_path_arg(int argc, char **argv) {
     return arg_value(argc, argv, "--pid");
 }
 
-static void print_json_string(const char *value) {
-    putchar('"');
-    if (value != NULL) {
-        for (const char *ptr = value; *ptr != '\0'; ++ptr) {
-            if (*ptr == '"' || *ptr == '\\') {
-                putchar('\\');
-                putchar(*ptr);
-            } else if ((unsigned char)*ptr < 0x20U) {
-                printf("\\u%04x", (unsigned int)(unsigned char)*ptr);
-            } else {
-                putchar(*ptr);
-            }
-        }
-    }
-    putchar('"');
-}
-
 static void print_probe_json(
     bool supported,
     const char *message,
@@ -442,7 +337,7 @@ static void print_probe_json(
     bool bpf_supported,
     bool hotspot_policy) {
     printf("{\"supported\":%s,\"message\":", supported ? "true" : "false");
-    print_json_string(message);
+    bpf2socks_json_print_string(message);
     if (splice_supported) {
         printf(
             ",\"capabilities\":{\"splice\":true,"

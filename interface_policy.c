@@ -71,17 +71,35 @@ static void clear_lpm6_map(int map_fd) {
 static int refresh_ignored_ifindices(const struct bpf2socks_interface_runtime *interfaces) {
     clear_ifindex_map(interfaces->bpf_runtime->ignored_ifindex_map_fd);
 
+    struct if_nameindex *system_interfaces = if_nameindex();
+    if (system_interfaces == NULL) return -1;
+
     uint8_t value = 1U;
-    for (size_t i = 0; i < interfaces->policy->ignored_interface_count && i < BPF2SOCKS_MAX_INTERFACES; ++i) {
-        const char *name = interfaces->policy->ignored_interfaces[i];
-        if (name[0] == '\0') continue;
-        unsigned int ifindex = if_nametoindex(name);
-        if (ifindex == 0U) continue;
-        uint32_t key = ifindex;
+    for (const struct if_nameindex *entry = system_interfaces;
+         entry->if_index != 0U && entry->if_name != NULL;
+         ++entry) {
+        bool ignored = false;
+        for (size_t selector_index = 0U;
+             selector_index < interfaces->policy->ignored_interface_count &&
+             selector_index < BPF2SOCKS_MAX_INTERFACES;
+             ++selector_index) {
+            if (bpf2socks_interface_matches_selector(
+                    entry->if_name,
+                    interfaces->policy->ignored_interfaces[selector_index])) {
+                ignored = true;
+                break;
+            }
+        }
+        if (!ignored) continue;
+        uint32_t key = entry->if_index;
         if (bpf2socks_update_map(interfaces->bpf_runtime->ignored_ifindex_map_fd, &key, &value) < 0) {
+            int saved = errno;
+            if_freenameindex(system_interfaces);
+            errno = saved;
             return -1;
         }
     }
+    if_freenameindex(system_interfaces);
     return 0;
 }
 
