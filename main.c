@@ -389,6 +389,11 @@ static int probe_with_config(const char *path) {
         print_probe_json(false, message, true, false, false, hotspot_policy);
         return 1;
     }
+    if (bpf2socks_raise_memlock_limit() < 0) {
+        snprintf(message, sizeof(message), "failed to raise memlock limit: errno=%d", errno);
+        print_probe_json(false, message, true, true, false, hotspot_policy);
+        return 1;
+    }
     if (bpf2socks_bpf_probe(&config, &policy, message, sizeof(message)) == 0) {
         print_probe_json(true, "ok", true, true, true, hotspot_policy);
         return 0;
@@ -397,7 +402,7 @@ static int probe_with_config(const char *path) {
     return 1;
 }
 
-static void cleanup_tc_policy_pin(
+static void cleanup_fixed_bpf_pin(
     const struct bpf2socks_runtime_config *config,
     const char *name) {
     char path[BPF2SOCKS_MAX_PATH_LEN];
@@ -405,10 +410,12 @@ static void cleanup_tc_policy_pin(
     if (written >= 0 && (size_t)written < sizeof(path)) (void)unlink(path);
 }
 
-static void cleanup_tc_policy_pins(const struct bpf2socks_runtime_config *config) {
+static void cleanup_fixed_bpf_pins(const struct bpf2socks_runtime_config *config) {
     if (config == NULL) return;
-    cleanup_tc_policy_pin(config, "tc_ingress");
-    cleanup_tc_policy_pin(config, "tc_egress");
+    cleanup_fixed_bpf_pin(config, "tc_ingress");
+    cleanup_fixed_bpf_pin(config, "tc_egress");
+    cleanup_fixed_bpf_pin(config, "local_addr_v4");
+    cleanup_fixed_bpf_pin(config, "local_addr_v6");
 }
 
 static int current_open_fd_count(uint64_t *out_count) {
@@ -486,6 +493,10 @@ static int start_with_config(const char *path, const char *pid_path) {
     struct bpf2socks_runtime_config config;
     struct bpf2socks_policy_config policy;
     if (load_runtime_config(path, &config, &policy) < 0) return 2;
+    if (bpf2socks_raise_memlock_limit() != 0) {
+        fprintf(stderr, "failed to raise bpf2socks memlock limit: errno=%d\n", errno);
+        return 1;
+    }
     if (bpf2socks_raise_nofile_limit(BPF2SOCKS_DEFAULT_NOFILE_LIMIT) != 0) {
         fprintf(stderr, "failed to raise bpf2socks file descriptor limit: errno=%d\n", errno);
     }
@@ -507,7 +518,7 @@ static int start_with_config(const char *path, const char *pid_path) {
     struct bpf2socks_bpf_runtime runtime;
     if (bpf2socks_bpf_start(&config, &policy, &runtime) < 0) {
         int saved_errno = errno;
-        cleanup_tc_policy_pins(&config);
+        cleanup_fixed_bpf_pins(&config);
         errno = saved_errno;
         fprintf(stderr, "failed to start bpf2socks BPF runtime: errno=%d\n", errno);
         return 1;
@@ -528,6 +539,7 @@ static int start_with_config(const char *path, const char *pid_path) {
         (void)bpf2socks_update_map(runtime.tc_runtime_control_map_fd, &control_key, &control);
     }
     bpf2socks_bpf_stop(&runtime);
+    cleanup_fixed_bpf_pins(&config);
     return result == 0 ? 0 : 1;
 }
 
@@ -544,7 +556,7 @@ static int stop_with_config(const char *path, const char *pid_path) {
         fclose(file);
     }
     (void)bpf2socks_detach_cgroup_path(config.cgroup_path);
-    cleanup_tc_policy_pins(&config);
+    cleanup_fixed_bpf_pins(&config);
     return 0;
 }
 

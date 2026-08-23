@@ -8,8 +8,10 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,7 @@
 struct bpf2socks_interface_runtime {
     pthread_t thread;
     int netlink_fd;
+    _Atomic bool stop_requested;
     const struct bpf2socks_policy_config *policy;
     struct bpf2socks_bpf_runtime *bpf_runtime;
 };
@@ -274,7 +277,18 @@ static void handle_interface_policy_message(
 static void *interface_policy_thread(void *arg) {
     struct bpf2socks_interface_runtime *interfaces = arg;
     char buf[8192];
-    while (!bpf2socks_stop_requested) {
+    while (!atomic_load_explicit(&interfaces->stop_requested, memory_order_acquire)) {
+        struct pollfd pfd = {
+            .fd = interfaces->netlink_fd,
+            .events = POLLIN,
+        };
+        int ready = poll(&pfd, 1U, 100);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) continue;
+        if ((pfd.revents & POLLIN) == 0) break;
         ssize_t len = recv(interfaces->netlink_fd, buf, sizeof(buf), 0);
         if (len < 0 && errno == EINTR) continue;
         if (len <= 0) break;
@@ -306,6 +320,7 @@ int bpf2socks_interface_policy_start(
     struct bpf2socks_interface_runtime *interfaces = calloc(1U, sizeof(*interfaces));
     if (interfaces == NULL) return -1;
     interfaces->netlink_fd = -1;
+    atomic_init(&interfaces->stop_requested, false);
     interfaces->policy = policy;
     interfaces->bpf_runtime = runtime;
 
@@ -342,12 +357,8 @@ void bpf2socks_interface_policy_stop(struct bpf2socks_bpf_runtime *runtime) {
     struct bpf2socks_interface_runtime *interfaces = runtime->interfaces;
     runtime->interfaces = NULL;
 
-    int fd = interfaces->netlink_fd;
-    interfaces->netlink_fd = -1;
-    if (fd >= 0) {
-        (void)shutdown(fd, SHUT_RD);
-        close(fd);
-    }
+    atomic_store_explicit(&interfaces->stop_requested, true, memory_order_release);
     (void)pthread_join(interfaces->thread, NULL);
+    if (interfaces->netlink_fd >= 0) close(interfaces->netlink_fd);
     free(interfaces);
 }

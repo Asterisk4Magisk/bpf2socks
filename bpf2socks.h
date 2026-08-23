@@ -40,7 +40,7 @@
 #define BPF2SOCKS_MIN_TCP_IDLE_TIMEOUT_MILLISECONDS 1000U
 #define BPF2SOCKS_MAX_TCP_IDLE_TIMEOUT_MILLISECONDS 3600000U
 #define BPF2SOCKS_DEFAULT_UDP_SOCKET_BUFFER_SIZE 524288U
-#define BPF2SOCKS_DEFAULT_UDP_BATCH_SIZE 10U
+#define BPF2SOCKS_DEFAULT_UDP_BATCH_SIZE 32U
 #define BPF2SOCKS_DEFAULT_MAX_UDP_SESSIONS 4096U
 #define BPF2SOCKS_DEFAULT_MAX_UDP_BINDINGS 16384U
 #define BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_SECONDS 60U
@@ -371,6 +371,7 @@ int bpf2socks_socks5_udp_recvmmsg(
 int bpf2socks_splice_probe(char *message, size_t message_size);
 int bpf2socks_advanced_socket_probe(char *message, size_t message_size);
 int bpf2socks_raise_nofile_limit(uint32_t requested_limit);
+int bpf2socks_raise_memlock_limit(void);
 
 struct bpf2socks_session_capacity {
     uint32_t worker_count;

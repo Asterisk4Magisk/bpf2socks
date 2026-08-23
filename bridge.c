@@ -405,6 +405,25 @@ static int stats_path_from_pid_path(const char *pid_path, char *out, size_t out_
     return 0;
 }
 
+static bool pid_file_enabled(const char *pid_path) {
+    return pid_path != NULL && pid_path[0] != '\0' && strcmp(pid_path, "/dev/null") != 0;
+}
+
+static int write_pid_file(const char *pid_path) {
+    FILE *file = fopen(pid_path, "w");
+    if (file == NULL) return -1;
+    int write_result = fprintf(file, "%ld\n", (long)getpid());
+    int saved_errno = write_result < 0 ? errno : 0;
+    int close_result = fclose(file);
+    if (close_result != 0 && saved_errno == 0) saved_errno = errno;
+    if (write_result < 0 || close_result != 0) {
+        (void)unlink(pid_path);
+        errno = saved_errno != 0 ? saved_errno : EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static void aggregate_worker_stats(
     struct bpf2socks_bridge_worker *workers,
     uint32_t worker_count,
@@ -507,6 +526,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
     int result = -1;
     pthread_t stats_thread;
     bool stats_started = false;
+    bool pid_file_written = false;
     for (uint32_t i = 0; i < worker_count; ++i) {
         workers[i].id = i;
         workers[i].tcp_listener_fd = -1;
@@ -595,6 +615,15 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
         }
     }
 
+    if (pid_file_enabled(pid_path)) {
+        if (write_pid_file(pid_path) < 0) {
+            fprintf(stderr, "failed to write bpf2socks PID file: errno=%d\n", errno);
+            bpf2socks_stop_requested = 1;
+            goto done;
+        }
+        pid_file_written = true;
+    }
+
     result = 0;
 
 done:
@@ -610,6 +639,7 @@ done:
     destroy_worker_stats_snapshot_mutexes(workers, worker_count);
     free(threads);
     free(workers);
+    if (pid_file_written) (void)unlink(pid_path);
     return result;
 }
 

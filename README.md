@@ -78,7 +78,7 @@ bpf2socks --stats --pid FILE
   "tcpConnectTimeoutMilliseconds": 10000,
   "tcpIdleTimeoutMilliseconds": 300000,
   "udpSocketBufferSize": 524288,
-  "udpBatchSize": 10,
+  "udpBatchSize": 32,
   "maxUdpSessions": 4096,
   "maxUdpBindings": 16384,
   "udpIdleTimeoutSeconds": 60,
@@ -129,7 +129,7 @@ bpf2socks --stats --pid FILE
 | `tcpConnectTimeoutMilliseconds` | 10000; normalized to 1000–60000. |
 | `tcpIdleTimeoutMilliseconds` | 300000; non-zero values normalized to 1000–3600000. Zero disables the idle timeout. |
 | `udpSocketBufferSize` | 524288 bytes; zero resets to the default. |
-| `udpBatchSize` | 10; zero resets to the default. |
+| `udpBatchSize` | 32; zero resets to the default. |
 | `maxUdpSessions` | 4096; zero resets to the default. |
 | `maxUdpBindings` | 16384; raised to at least `maxUdpSessions`. |
 | `udpIdleTimeoutSeconds` | 60; zero resets to the default. |

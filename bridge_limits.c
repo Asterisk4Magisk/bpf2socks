@@ -190,3 +190,16 @@ int bpf2socks_raise_nofile_limit(uint32_t requested_limit) {
     limit.rlim_cur = target;
     return setrlimit(RLIMIT_NOFILE, &limit);
 }
+
+int bpf2socks_raise_memlock_limit(void) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) return -1;
+    struct rlimit unlimited = {
+        .rlim_cur = RLIM_INFINITY,
+        .rlim_max = RLIM_INFINITY,
+    };
+    if (setrlimit(RLIMIT_MEMLOCK, &unlimited) == 0) return 0;
+    if (limit.rlim_cur >= limit.rlim_max) return 0;
+    limit.rlim_cur = limit.rlim_max;
+    return setrlimit(RLIMIT_MEMLOCK, &limit);
+}
