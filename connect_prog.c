@@ -324,23 +324,23 @@ static void emit_ipv4_dns_force_proxy_policy_from_regs(
     }
 }
 
-static void emit_ipv6_dns_drop_policy(
+static void emit_ipv6_dns_force_proxy_policy_from_regs(
     struct bpf_builder *builder,
     const struct bpf2socks_policy_config *policy,
     uint8_t protocol,
     bool protocol_from_context,
-    size_t *drop_jumps,
-    size_t *drop_jump_count) {
+    size_t *force_proxy_jumps,
+    size_t *force_proxy_jump_count) {
     if (policy == NULL || !policy->enable_dns_hijack) return;
 
     if (protocol_from_context) {
         emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
         size_t not_udp = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
-        drop_jumps[(*drop_jump_count)++] =
+        force_proxy_jumps[(*force_proxy_jump_count)++] =
             emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_5, htons(53), 0));
         patch_jump(builder, not_udp, builder->count);
     } else if (protocol == BPF2SOCKS_PROTO_UDP) {
-        drop_jumps[(*drop_jump_count)++] =
+        force_proxy_jumps[(*force_proxy_jump_count)++] =
             emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_5, htons(53), 0));
     }
 }
@@ -1334,18 +1334,18 @@ static int build_ipv6_sock_addr_prog(
     if (attach_type == BPF_CGROUP_UDP6_SENDMSG && protocol == BPF2SOCKS_PROTO_UDP && !protocol_from_context) {
         emit_udp_peer_cache_restore_v6(&b, udp_peer_map_fd);
     }
-    emit_ipv6_dns_drop_policy(
-        &b,
-        policy,
-        protocol,
-        protocol_from_context,
-        drop_jumps,
-        &drop_jump_count);
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_SAVED_V6_WORD0));
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8, STACK_SAVED_V6_WORD1));
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_9, STACK_SAVED_V6_WORD2));
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_4, STACK_SAVED_V6_LAST_WORD));
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_5, STACK_SAVED_PORT));
+    emit_ipv6_dns_force_proxy_policy_from_regs(
+        &b,
+        policy,
+        protocol,
+        protocol_from_context,
+        force_proxy_jumps,
+        &force_proxy_jump_count);
     emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V6_WORD0));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V6_WORD1));
