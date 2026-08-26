@@ -31,6 +31,9 @@ enum bpf2socks_udp_downlink_send_result bpf2socks_udp_downlink_classify_send_res
     int sent,
     unsigned int requested,
     int send_errno);
+bool bpf2socks_udp_downlink_should_use_zerocopy(
+    bool shared_listener,
+    size_t total_payload_bytes);
 void bpf2socks_udp_downlink_queue_init(struct bpf2socks_udp_downlink_queue *queue);
 void bpf2socks_udp_downlink_queue_push(
     struct bpf2socks_udp_downlink_queue *queue,

@@ -42,7 +42,6 @@
 #define IPV6_HDRINCL 36
 #endif
 
-#define BPF2SOCKS_UDP_ZEROCOPY_MIN_BYTES 8192U
 #define BPF2SOCKS_DNS_CHANNELS_PER_WORKER 2U
 #define BPF2SOCKS_DNS_MAX_TRANSACTIONS_PER_WORKER 8192U
 #define BPF2SOCKS_DNS_CHANNEL_REBUILD_DELAY_MS 1000ULL
@@ -1952,9 +1951,8 @@ static bool udp_downlink_batch_should_zerocopy(const struct udp_downlink_batch *
     for (unsigned int i = 0U; i < batch->count; ++i) {
         if (batch->messages[i] == NULL) continue;
         total += batch->messages[i]->payload_len;
-        if (total >= BPF2SOCKS_UDP_ZEROCOPY_MIN_BYTES) return true;
     }
-    return false;
+    return bpf2socks_udp_downlink_should_use_zerocopy(batch->use_pktinfo, total);
 }
 
 static int send_udp_downlink_mmsg(

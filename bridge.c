@@ -154,7 +154,6 @@ static int bind_udp_listener(const struct bpf2socks_runtime_config *config) {
         config->udp_socket_buffer_size,
         BPF2SOCKS_DEFAULT_UDP_SOCKET_BUFFER_SIZE);
     bpf2socks_bridge_tune_socket_buffers(fd, udp_buffer, udp_buffer);
-    bpf2socks_bridge_tune_udp_advanced(fd);
     if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) != 0) {
         int saved = errno;
         close(fd);
@@ -191,7 +190,6 @@ static int bind_udp6_listener(const struct bpf2socks_runtime_config *config) {
         config->udp_socket_buffer_size,
         BPF2SOCKS_DEFAULT_UDP_SOCKET_BUFFER_SIZE);
     bpf2socks_bridge_tune_socket_buffers(fd, udp_buffer, udp_buffer);
-    bpf2socks_bridge_tune_udp_advanced(fd);
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
     if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)) != 0) {
         int saved = errno;

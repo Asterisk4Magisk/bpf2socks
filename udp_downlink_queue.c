@@ -5,6 +5,8 @@
 
 #include <errno.h>
 
+#define BPF2SOCKS_UDP_ZEROCOPY_MIN_BYTES 8192U
+
 enum bpf2socks_udp_downlink_send_result bpf2socks_udp_downlink_classify_send_result(
     int sent,
     unsigned int requested,
@@ -19,6 +21,13 @@ enum bpf2socks_udp_downlink_send_result bpf2socks_udp_downlink_classify_send_res
         return BPF2SOCKS_UDP_DOWNLINK_SEND_RETRY;
     }
     return BPF2SOCKS_UDP_DOWNLINK_SEND_FATAL;
+}
+
+bool bpf2socks_udp_downlink_should_use_zerocopy(
+    bool shared_listener,
+    size_t total_payload_bytes) {
+    return !shared_listener &&
+        total_payload_bytes >= BPF2SOCKS_UDP_ZEROCOPY_MIN_BYTES;
 }
 
 void bpf2socks_udp_downlink_queue_init(struct bpf2socks_udp_downlink_queue *queue) {
