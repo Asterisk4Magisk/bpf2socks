@@ -17,6 +17,8 @@
 #define ETH_P_IPV6 0x86ddU
 #define IPPROTO_TCP_VALUE 6U
 #define IPPROTO_UDP_VALUE 17U
+#define IKE_PORT 500U
+#define NAT_T_PORT 4500U
 #define AF_INET_VALUE 2U
 #define AF_INET6_VALUE 10U
 #define IP_FRAGMENT_MASK 0x3fffU
@@ -216,6 +218,8 @@ INLINE bool ipv6_in_token_prefix(const __u8 address[16], const __u8 prefix[16]) 
 }
 
 INLINE bool policy4_proxy(__be32 destination, __u8 protocol, __u16 destination_port, __u16 flags) {
+    if (protocol == IPPROTO_UDP_VALUE &&
+        (destination_port == IKE_PORT || destination_port == NAT_T_PORT)) return false;
     if ((flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) != 0U &&
         protocol == IPPROTO_UDP_VALUE && destination_port == 53U) {
         return true;
@@ -232,6 +236,8 @@ INLINE bool policy4_proxy(__be32 destination, __u8 protocol, __u16 destination_p
 }
 
 INLINE bool policy6_proxy(const __u8 destination[16], __u8 protocol, __u16 destination_port, __u16 flags) {
+    if (protocol == IPPROTO_UDP_VALUE &&
+        (destination_port == IKE_PORT || destination_port == NAT_T_PORT)) return false;
     if ((flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) != 0U &&
         protocol == IPPROTO_UDP_VALUE && destination_port == 53U) {
         return true;

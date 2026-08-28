@@ -20,6 +20,8 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define BPF2SOCKS_MAX_INLINE_BYPASS_UIDS 16U
+#define BPF2SOCKS_IKE_PORT 500U
+#define BPF2SOCKS_NAT_T_PORT 4500U
 /* BPF_MAP_TYPE_LRU_HASH. Android NDK headers expose it as an enum, not a preprocessor macro. */
 #define BPF2SOCKS_TOKEN_MAP_TYPE 9U
 
@@ -360,6 +362,29 @@ static size_t emit_connected_udp_dns_continue(
 static void patch_connected_udp_dns_continue(struct bpf_builder *builder, size_t jump) {
     if (jump != (size_t)-1) {
         patch_jump(builder, jump, builder->count);
+    }
+}
+
+static void emit_ipsec_udp_bypass_from_port(
+    struct bpf_builder *builder,
+    uint8_t protocol,
+    bool protocol_from_context,
+    uint8_t port_reg,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (protocol_from_context) {
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
+        size_t not_udp = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
+        bypass_jumps[(*bypass_jump_count)++] =
+            emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, port_reg, htons(BPF2SOCKS_IKE_PORT), 0));
+        bypass_jumps[(*bypass_jump_count)++] =
+            emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, port_reg, htons(BPF2SOCKS_NAT_T_PORT), 0));
+        patch_jump(builder, not_udp, builder->count);
+    } else if (protocol == BPF2SOCKS_PROTO_UDP) {
+        bypass_jumps[(*bypass_jump_count)++] =
+            emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, port_reg, htons(BPF2SOCKS_IKE_PORT), 0));
+        bypass_jumps[(*bypass_jump_count)++] =
+            emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, port_reg, htons(BPF2SOCKS_NAT_T_PORT), 0));
     }
 }
 
@@ -1167,6 +1192,8 @@ static int build_ipv4_sock_addr_prog(
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip4)));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
+    emit_ipsec_udp_bypass_from_port(
+        &b, protocol, protocol_from_context, BPF_REG_8, bypass_jumps, &bypass_jump_count);
     // Connected UDP send() may not hit UDP_SENDMSG on Android kernels, so CONNECT must continue to policy.
     // This can expose the token peer via getpeername(), but it avoids direct UDP leakage.
     if (attach_type == BPF_CGROUP_INET4_CONNECT && protocol_from_context) {
@@ -1282,6 +1309,8 @@ static int build_ipv6_sock_addr_prog(
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
+    emit_ipsec_udp_bypass_from_port(
+        &b, protocol, protocol_from_context, BPF_REG_5, bypass_jumps, &bypass_jump_count);
     bool emitted_v4mapped_branch = emit_ipv4_mapped_ipv6_branch(
         &b,
         policy,
@@ -1442,6 +1471,8 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
+    emit_ipsec_udp_bypass_from_port(
+        &b, protocol, protocol_from_context, BPF_REG_5, bypass_jumps, &bypass_jump_count);
     (void)emit_ipv4_mapped_ipv6_branch(
         &b,
         policy,
