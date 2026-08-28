@@ -191,6 +191,12 @@ static int bind_udp6_listener(const struct bpf2socks_runtime_config *config) {
         BPF2SOCKS_DEFAULT_UDP_SOCKET_BUFFER_SIZE);
     bpf2socks_bridge_tune_socket_buffers(fd, udp_buffer, udp_buffer);
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_TRANSPARENT, &one, sizeof(one)) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
     if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)) != 0) {
         int saved = errno;
         close(fd);

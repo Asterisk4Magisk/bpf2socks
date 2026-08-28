@@ -469,7 +469,9 @@ static int send_raw_udp6_to_client(
     udp->check = 0;
     udp->check = htons(udp_ipv6_checksum(binding->original_dst.addr, client->sin6_addr.s6_addr, udp, body, payload_len));
 
-    ssize_t sent = sendto(fd, packet, ip_len, 0, (const struct sockaddr *)client, sizeof(*client));
+    struct sockaddr_in6 destination = *client;
+    destination.sin6_port = htons(IPPROTO_UDP);
+    ssize_t sent = sendto(fd, packet, ip_len, 0, (const struct sockaddr *)&destination, sizeof(destination));
     if (sent == (ssize_t)ip_len) return 0;
     if (sent >= 0) errno = EIO;
     return -1;
