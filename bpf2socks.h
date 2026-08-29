@@ -57,10 +57,6 @@
 #define BPF2SOCKS_TOKEN_IPV6_PREFIX_BITS 64U
 #define BPF2SOCKS_TC_SCRATCH_SIZE 224U
 
-#ifndef MSG_ZEROCOPY
-#define MSG_ZEROCOPY 0x4000000
-#endif
-
 #define BPF2SOCKS_MODE_BLACKLIST 0U
 #define BPF2SOCKS_MODE_WHITELIST 1U
 #define BPF2SOCKS_MODE_GLOBAL 2U
@@ -216,6 +212,16 @@ struct bpf2socks_bridge_stats {
     uint64_t tcp_connect_timeouts;
     uint64_t tcp_idle_timeouts;
     uint64_t tcp_fd_exhaustions;
+    uint64_t udp_token_lookup_full_attempts;
+    uint64_t udp_token_lookup_full_hits;
+    uint64_t udp_token_lookup_zero_attempts;
+    uint64_t udp_token_lookup_zero_hits;
+    uint64_t udp_token_lookup_fallbacks;
+    uint64_t udp_copy_sends;
+    uint64_t udp_binding_hash_lookups;
+    uint64_t udp_binding_hash_collision_steps;
+    uint64_t dns_free_stack_allocations;
+    uint64_t dns_full_table_evictions;
 };
 
 int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_stats *out);

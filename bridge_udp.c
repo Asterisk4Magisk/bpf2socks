@@ -65,6 +65,7 @@ struct udp_client_packet {
     bool has_original_dst;
     bool original_from_socket;
     bool connected_udp_token;
+    enum bpf2socks_udp_token_lookup_mode token_lookup_mode;
     struct bpf2socks_sockaddr original_dst;
     uint8_t *payload;
     size_t payload_len;
@@ -172,6 +173,7 @@ struct udp_state {
     struct bpf2socks_udp_client_session *lru_tail;
     struct bpf2socks_udp_reply_binding *binding_lru_head;
     struct bpf2socks_udp_reply_binding *binding_lru_tail;
+    struct bpf2socks_udp_binding_index binding_index;
     struct bpf2socks_udp_downlink_channel *retired_downlink_channels;
     struct udp_fd_ref listener_ref;
     struct udp_fd_ref listener6_ref;
@@ -216,12 +218,6 @@ static bool same_sockaddr(
         return ia->sin_port == ib->sin_port && ia->sin_addr.s_addr == ib->sin_addr.s_addr;
     }
     return memcmp(a, b, a_len) == 0;
-}
-
-static bool same_original_dst(const struct bpf2socks_sockaddr *a, const struct bpf2socks_sockaddr *b) {
-    if (a->family != b->family || a->port != b->port) return false;
-    size_t len = a->family == AF_INET ? 4U : 16U;
-    return memcmp(a->addr, b->addr, len) == 0;
 }
 
 static uint32_t sockaddr_hash(const struct sockaddr_storage *addr, socklen_t addr_len) {
@@ -279,17 +275,6 @@ static int original_to_sockaddr(const struct bpf2socks_original_dst *src, struct
         return 0;
     }
     return -1;
-}
-
-static int lookup_original_with_client_fallback(
-    int map_fd,
-    const struct bpf2socks_token_key *key,
-    struct bpf2socks_original_dst *original) {
-    if (bpf2socks_token_lookup(map_fd, key, original) == 0) return 0;
-    struct bpf2socks_token_key fallback = *key;
-    fallback.client_port = 0;
-    memset(fallback.client_addr, 0, sizeof(fallback.client_addr));
-    return bpf2socks_token_lookup(map_fd, &fallback, original);
 }
 
 static bool packet_needs_original_reply_socket(const struct udp_client_packet *packet) {
@@ -720,6 +705,7 @@ static void destroy_binding(
     struct bpf2socks_udp_client_session *session,
     struct bpf2socks_udp_reply_binding *binding) {
     if (session == NULL || binding == NULL) return;
+    (void)bpf2socks_udp_binding_index_remove(&state->binding_index, binding);
     unlink_binding_from_session(session, binding);
     binding_session_lru_remove(session, binding);
     binding_global_lru_remove(state, binding);
@@ -1559,6 +1545,7 @@ static int flush_session_pending_packets(
             count);
         if (sent <= 0) return -1;
         worker->stats.udp_packets_to_upstream += (uint64_t)sent;
+        worker->stats.udp_copy_sends += (uint64_t)sent;
         session->last_seen_ms = monotonic_ms();
         lru_touch(state, session);
         for (int i = 0; i < sent; ++i) {
@@ -1637,8 +1624,6 @@ static struct bpf2socks_udp_client_session *find_session(
          session = session->next) {
         if (session->used &&
             same_sockaddr(&session->client_addr, session->client_addr_len, client_addr, client_addr_len)) {
-            session->last_seen_ms = monotonic_ms();
-            lru_touch(state, session);
             return session;
         }
     }
@@ -1710,14 +1695,22 @@ static struct bpf2socks_udp_client_session *alloc_session(struct udp_state *stat
 }
 
 static struct bpf2socks_udp_reply_binding *find_binding(
+    struct udp_state *state,
     struct bpf2socks_udp_client_session *session,
-    const struct bpf2socks_sockaddr *original) {
-    for (struct bpf2socks_udp_reply_binding *binding = session->bindings;
-         binding != NULL;
-         binding = binding->next) {
-        if (same_original_dst(&binding->original_dst, original)) return binding;
+    const struct bpf2socks_sockaddr *original,
+    struct bpf2socks_bridge_worker *worker) {
+    if (state == NULL || session == NULL || original == NULL) return NULL;
+    uint64_t collision_steps = 0U;
+    struct bpf2socks_udp_reply_binding *binding = bpf2socks_udp_binding_index_find(
+        &state->binding_index,
+        session,
+        original,
+        &collision_steps);
+    if (worker != NULL) {
+        ++worker->stats.udp_binding_hash_lookups;
+        worker->stats.udp_binding_hash_collision_steps += collision_steps;
     }
-    return NULL;
+    return binding;
 }
 
 static struct bpf2socks_udp_reply_binding *create_binding(
@@ -1752,6 +1745,10 @@ static struct bpf2socks_udp_reply_binding *create_binding(
     }
     binding->used = true;
     binding->owner = session;
+    if (bpf2socks_udp_binding_index_insert(&state->binding_index, binding) != 0) {
+        release_binding(state, binding);
+        return NULL;
+    }
     binding->next = session->bindings;
     session->bindings = binding;
     binding_session_lru_add_tail(session, binding);
@@ -1801,10 +1798,14 @@ static struct bpf2socks_udp_reply_binding *create_fullcone_binding(
 static struct bpf2socks_udp_client_session *get_session(
     struct udp_state *state,
     const struct udp_client_packet *packet,
-    struct bpf2socks_bridge_worker *worker) {
-    struct bpf2socks_udp_client_session *session =
-        find_session(state, &packet->client_addr, packet->client_addr_len);
+    struct bpf2socks_bridge_worker *worker,
+    struct bpf2socks_udp_client_session *session) {
     if (session != NULL) {
+        session->last_seen_ms = monotonic_ms();
+        lru_touch(state, session);
+        if (packet->token_lookup_mode != BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN) {
+            session->token_lookup_mode = packet->token_lookup_mode;
+        }
         ++worker->stats.udp_session_hits;
         ++worker->stats.udp_associate_reuses;
         return session;
@@ -1819,6 +1820,7 @@ static struct bpf2socks_udp_client_session *get_session(
     session->used = true;
     session->client_addr = packet->client_addr;
     session->client_addr_len = packet->client_addr_len;
+    session->token_lookup_mode = packet->token_lookup_mode;
     session->last_seen_ms = monotonic_ms();
     if (build_udp_associate_pipeline_request(session) < 0) {
         close_session(state, session);
@@ -1849,8 +1851,10 @@ static struct bpf2socks_udp_client_session *get_session(
 }
 
 static int lookup_udp_original(
-    const struct bpf2socks_runtime_config *config,
-    struct udp_client_packet *packet) {
+    struct bpf2socks_bridge_worker *worker,
+    struct udp_client_packet *packet,
+    enum bpf2socks_udp_token_lookup_mode preference) {
+    const struct bpf2socks_runtime_config *config = worker->config;
     struct bpf2socks_token_key key;
     struct bpf2socks_original_dst original;
     memset(&key, 0, sizeof(key));
@@ -1867,13 +1871,31 @@ static int lookup_udp_original(
         key.client_port = ntohs(client->sin6_port);
         memcpy(key.client_addr, &client->sin6_addr, 16);
     }
-    if (lookup_original_with_client_fallback(config->token_map_fd, &key, &original) < 0) {
+    struct bpf2socks_udp_token_lookup_trace trace;
+    int lookup_result = bpf2socks_udp_token_lookup_adaptive(
+            config->token_map_fd,
+            &key,
+            preference,
+            &original,
+            &trace);
+    worker->stats.udp_token_lookup_full_attempts += trace.full_client_attempts;
+    worker->stats.udp_token_lookup_zero_attempts += trace.zero_client_attempts;
+    if (trace.matched_mode == BPF2SOCKS_UDP_TOKEN_LOOKUP_FULL_CLIENT) {
+        ++worker->stats.udp_token_lookup_full_hits;
+    } else if (trace.matched_mode == BPF2SOCKS_UDP_TOKEN_LOOKUP_ZERO_CLIENT) {
+        ++worker->stats.udp_token_lookup_zero_hits;
+    }
+    if (trace.full_client_attempts != 0U && trace.zero_client_attempts != 0U) {
+        ++worker->stats.udp_token_lookup_fallbacks;
+    }
+    if (lookup_result < 0) {
         if (packet->has_original_dst) {
             packet->original_from_socket = true;
             return 0;
         }
         return -1;
     }
+    packet->token_lookup_mode = trace.matched_mode;
     packet->connected_udp_token =
         (original.flags & BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP) != 0U;
     return original_to_sockaddr(&original, &packet->original_dst);
@@ -1947,35 +1969,11 @@ static int fill_udp_downlink_pktinfo(
     return 0;
 }
 
-static bool udp_downlink_batch_should_zerocopy(const struct udp_downlink_batch *batch) {
-    if (batch == NULL) return false;
-    size_t total = 0U;
-    for (unsigned int i = 0U; i < batch->count; ++i) {
-        if (batch->messages[i] == NULL) continue;
-        total += batch->messages[i]->payload_len;
-    }
-    return bpf2socks_udp_downlink_should_use_zerocopy(batch->use_pktinfo, total);
-}
-
 static int send_udp_downlink_mmsg(
     int fd,
     struct mmsghdr *vec,
-    unsigned int count,
-    bool zerocopy) {
-    if (zerocopy) {
-        bpf2socks_drain_zerocopy_completions(fd);
-    }
-    int sent = sendmmsg(fd, vec, count, zerocopy ? MSG_ZEROCOPY : 0);
-    if (sent < 0 &&
-        zerocopy &&
-        (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-        bpf2socks_drain_zerocopy_completions(fd);
-        sent = sendmmsg(fd, vec, count, 0);
-    }
-    if (zerocopy && sent > 0) {
-        bpf2socks_drain_zerocopy_completions(fd);
-    }
-    return sent;
+    unsigned int count) {
+    return sendmmsg(fd, vec, count, 0);
 }
 
 static enum bpf2socks_udp_downlink_send_result send_downlink_channel_packet(
@@ -2026,7 +2024,7 @@ static enum bpf2socks_udp_downlink_send_result send_downlink_channel_packet(
             packet->binding) < 0) {
         return BPF2SOCKS_UDP_DOWNLINK_SEND_FATAL;
     }
-    int sent = send_udp_downlink_mmsg(channel->fd, &vec, 1U, false);
+    int sent = send_udp_downlink_mmsg(channel->fd, &vec, 1U);
     int send_errno = errno;
     return bpf2socks_udp_downlink_classify_send_result(sent, 1U, send_errno);
 }
@@ -2051,6 +2049,7 @@ static int flush_downlink_channel(
         session->last_seen_ms = now_ms;
         packet->binding->last_seen_ms = now_ms;
         ++worker->stats.udp_packets_to_client;
+        ++worker->stats.udp_copy_sends;
         (void)bpf2socks_udp_downlink_queue_pop(&channel->queue);
         release_downlink_packet(state, session, packet);
     }
@@ -2089,8 +2088,7 @@ static int flush_udp_downlink_batch(
         }
     }
 
-    bool zerocopy = udp_downlink_batch_should_zerocopy(batch);
-    int sent = send_udp_downlink_mmsg(batch->fd, vec, batch->count, zerocopy);
+    int sent = send_udp_downlink_mmsg(batch->fd, vec, batch->count);
     int send_errno = errno;
     enum bpf2socks_udp_downlink_send_result result =
         bpf2socks_udp_downlink_classify_send_result(sent, batch->count, send_errno);
@@ -2105,6 +2103,7 @@ static int flush_udp_downlink_batch(
     for (int i = 0; i < accepted; ++i) {
         batch->bindings[i]->last_seen_ms = now_ms;
         ++worker->stats.udp_packets_to_client;
+        ++worker->stats.udp_copy_sends;
     }
     if (result == BPF2SOCKS_UDP_DOWNLINK_SEND_RETRY) {
         if (state == NULL || batch->session->udp_fd < 0) {
@@ -2590,6 +2589,7 @@ static int prepare_dns_client_packet(
     struct dns_channel *channel = select_dns_channel(state, worker, now_ms);
     if (channel == NULL) return -1;
 
+    bool allocate_from_free_stack = state->dns_table.free_count > 0U;
     struct bpf2socks_dns_transaction *tx = bpf2socks_dns_table_alloc(
         &state->dns_table,
         channel->index,
@@ -2597,6 +2597,11 @@ static int prepare_dns_client_packet(
         info->question_fingerprint,
         now_ms);
     if (tx == NULL) return -1;
+    if (allocate_from_free_stack) {
+        ++worker->stats.dns_free_stack_allocations;
+    } else {
+        ++worker->stats.dns_full_table_evictions;
+    }
 
     channel = &state->dns_channels[tx->channel_index];
     if (ensure_dns_channel(state, worker, channel, now_ms) < 0) {
@@ -2674,6 +2679,7 @@ static void flush_dns_outgoing_packets(
             continue;
         }
         worker->stats.udp_packets_to_upstream += (uint64_t)sent;
+        worker->stats.udp_copy_sends += (uint64_t)sent;
         if ((unsigned int)sent < send_count) {
             ++worker->stats.udp_send_errors;
             for (unsigned int j = (unsigned int)sent; j < send_count; ++j) {
@@ -2723,6 +2729,7 @@ static int send_dns_response_with_binding(
                 : send_raw_udp_to_client(binding->reply_fd, session, binding, message->payload, message->payload_len);
             if (send_result < 0) return -1;
             ++worker->stats.udp_packets_to_client;
+            ++worker->stats.udp_copy_sends;
             return 0;
         }
         struct udp_downlink_batch batch;
@@ -2925,11 +2932,21 @@ static void handle_udp_client_packets(
         packet.payload_len = vec[i].msg_len;
         ++worker->stats.udp_packets_from_client;
 
-        if (parse_udp_client_packet_cmsgs(&vec[i].msg_hdr, worker->config, &packet) < 0 ||
-            lookup_udp_original(worker->config, &packet) < 0) {
+        struct bpf2socks_udp_client_session *existing_session = NULL;
+        int parse_result = parse_udp_client_packet_cmsgs(&vec[i].msg_hdr, worker->config, &packet);
+        if (parse_result == 0) {
+            existing_session = find_session(state, &packet.client_addr, packet.client_addr_len);
+        }
+        enum bpf2socks_udp_token_lookup_mode preference = existing_session != NULL
+            ? existing_session->token_lookup_mode
+            : BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN;
+        if (parse_result < 0 || lookup_udp_original(worker, &packet, preference) < 0) {
             ++worker->stats.udp_token_misses;
             fprintf(stderr, "missing UDP original destination: errno=%d\n", errno);
             continue;
+        }
+        if (existing_session != NULL && packet.token_lookup_mode != BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN) {
+            existing_session->token_lookup_mode = packet.token_lookup_mode;
         }
 
         if (is_dns_fast_path_candidate(worker->config, &packet)) {
@@ -2952,12 +2969,13 @@ static void handle_udp_client_packets(
             }
         }
 
-        struct bpf2socks_udp_client_session *session = get_session(state, &packet, worker);
+        struct bpf2socks_udp_client_session *session = get_session(state, &packet, worker, existing_session);
         if (session == NULL) {
             fprintf(stderr, "SOCKS5 UDP ASSOCIATE failed: errno=%d\n", errno);
             continue;
         }
-        struct bpf2socks_udp_reply_binding *binding = find_binding(session, &packet.original_dst);
+        struct bpf2socks_udp_reply_binding *binding = find_binding(
+            state, session, &packet.original_dst, worker);
         if (binding == NULL) {
             binding = create_packet_binding(state, session, &packet, worker);
             if (binding == NULL) continue;
@@ -3041,6 +3059,7 @@ static void handle_udp_client_packets(
             continue;
         }
         worker->stats.udp_packets_to_upstream += (uint64_t)sent;
+        worker->stats.udp_copy_sends += (uint64_t)sent;
         if ((unsigned int)sent < send_batch.count) {
             ++worker->stats.udp_send_errors;
             drop_session(state, session);
@@ -3089,7 +3108,8 @@ static void handle_udp_upstream_packets(
 
     for (int i = 0; i < received; ++i) {
         ++worker->stats.udp_packets_from_upstream;
-        struct bpf2socks_udp_reply_binding *binding = find_binding(session, &messages[i].addr);
+        struct bpf2socks_udp_reply_binding *binding = find_binding(
+            state, session, &messages[i].addr, worker);
         if (binding == NULL) {
             binding = create_fullcone_binding(state, session, &messages[i].addr, worker);
             if (binding == NULL) {
@@ -3161,6 +3181,7 @@ static void handle_udp_upstream_packets(
                 session->last_seen_ms = now_ms;
                 binding->last_seen_ms = now_ms;
                 ++worker->stats.udp_packets_to_client;
+                ++worker->stats.udp_copy_sends;
             } else {
                 if (queue_udp_downlink_batch(
                         state,
@@ -3288,6 +3309,16 @@ static int init_state(struct udp_state *state, struct bpf2socks_bridge_worker *w
         memset(state, 0, sizeof(*state));
         return -1;
     }
+    if (bpf2socks_udp_binding_index_init(&state->binding_index, state->binding_cap) != 0) {
+        free(state->session_buckets);
+        free(state->events);
+        free(state->session_refs);
+        free(state->bindings);
+        free(state->sessions);
+        memset(state, 0, sizeof(*state));
+        state->epoll_fd = -1;
+        return -1;
+    }
     state->session_cap = max_sessions;
     for (size_t i = 0; i < max_sessions; ++i) {
         state->sessions[i].tcp_fd = -1;
@@ -3323,6 +3354,7 @@ static int init_state(struct udp_state *state, struct bpf2socks_bridge_worker *w
             &state->dns_table,
             BPF2SOCKS_DNS_CHANNELS_PER_WORKER,
             BPF2SOCKS_DNS_MAX_TRANSACTIONS_PER_WORKER) < 0) {
+        bpf2socks_udp_binding_index_free(&state->binding_index);
         free(state->session_buckets);
         free(state->events);
         free(state->session_refs);
@@ -3359,6 +3391,7 @@ static void free_state(struct udp_state *state) {
     free(state->session_buckets);
     free(state->events);
     free(state->session_refs);
+    bpf2socks_udp_binding_index_free(&state->binding_index);
     free(state->bindings);
     free(state->sessions);
     bpf2socks_dns_table_free(&state->dns_table);

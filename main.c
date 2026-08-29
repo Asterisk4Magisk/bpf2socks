@@ -7,12 +7,14 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #define BPF2SOCKS_FD_RUNTIME_RESERVE 32ULL
@@ -489,7 +491,7 @@ static int apply_nofile_session_capacity(struct bpf2socks_runtime_config *config
     return -1;
 }
 
-static int start_with_config(const char *path, const char *pid_path) {
+static int start_with_config_unlocked(const char *path, const char *pid_path) {
     struct bpf2socks_runtime_config config;
     struct bpf2socks_policy_config policy;
     if (load_runtime_config(path, &config, &policy) < 0) return 2;
@@ -543,6 +545,35 @@ static int start_with_config(const char *path, const char *pid_path) {
     return result == 0 ? 0 : 1;
 }
 
+static int start_with_config(const char *path, const char *pid_path) {
+    char lock_path[BPF2SOCKS_MAX_PATH_LEN];
+    int written = snprintf(lock_path, sizeof(lock_path), "%s.lock", pid_path);
+    if (written < 0 || (size_t)written >= sizeof(lock_path)) {
+        errno = ENAMETOOLONG;
+        fprintf(stderr, "bpf2socks instance lock path is too long\n");
+        return 1;
+    }
+    int lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (lock_fd < 0) {
+        fprintf(stderr, "failed to open bpf2socks instance lock: errno=%d\n", errno);
+        return 1;
+    }
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        int saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        fprintf(stderr, "bpf2socks is already running for this pid path: errno=%d\n", errno);
+        return 1;
+    }
+    int result = start_with_config_unlocked(path, pid_path);
+    int saved_errno = errno;
+    (void)flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+    (void)unlink(lock_path);
+    errno = saved_errno;
+    return result;
+}
+
 static int stop_with_config(const char *path, const char *pid_path) {
     struct bpf2socks_runtime_config config;
     struct bpf2socks_policy_config policy;
@@ -592,7 +623,17 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         "\"udpSendErrors\":%" PRIu64 ","
         "\"dnsValidResponses\":%" PRIu64 ","
         "\"dnsTransactionTimeouts\":%" PRIu64 ","
-        "\"dnsChannelTimeoutRebuilds\":%" PRIu64
+        "\"dnsChannelTimeoutRebuilds\":%" PRIu64 ","
+        "\"udpTokenLookupFullAttempts\":%" PRIu64 ","
+        "\"udpTokenLookupFullHits\":%" PRIu64 ","
+        "\"udpTokenLookupZeroAttempts\":%" PRIu64 ","
+        "\"udpTokenLookupZeroHits\":%" PRIu64 ","
+        "\"udpTokenLookupFallbacks\":%" PRIu64 ","
+        "\"udpCopySends\":%" PRIu64 ","
+        "\"udpBindingHashLookups\":%" PRIu64 ","
+        "\"udpBindingHashCollisionSteps\":%" PRIu64 ","
+        "\"dnsFreeStackAllocations\":%" PRIu64 ","
+        "\"dnsFullTableEvictions\":%" PRIu64
         "}\n",
         stats->tcp_accepts,
         stats->tcp_connect_failures,
@@ -623,7 +664,17 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         stats->udp_send_errors,
         stats->dns_valid_responses,
         stats->dns_transaction_timeouts,
-        stats->dns_channel_timeout_rebuilds);
+        stats->dns_channel_timeout_rebuilds,
+        stats->udp_token_lookup_full_attempts,
+        stats->udp_token_lookup_full_hits,
+        stats->udp_token_lookup_zero_attempts,
+        stats->udp_token_lookup_zero_hits,
+        stats->udp_token_lookup_fallbacks,
+        stats->udp_copy_sends,
+        stats->udp_binding_hash_lookups,
+        stats->udp_binding_hash_collision_steps,
+        stats->dns_free_stack_allocations,
+        stats->dns_full_table_evictions);
 }
 
 static int stats_with_pid(const char *pid_path) {

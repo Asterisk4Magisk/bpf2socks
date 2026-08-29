@@ -43,6 +43,8 @@ struct bpf2socks_dns_table {
     int32_t *lookup;
     uint16_t *next_ids;
     uint64_t *response_generations;
+    size_t *free_indices;
+    size_t free_count;
     size_t capacity;
     size_t count;
     uint32_t channel_count;

@@ -5,6 +5,8 @@
 #define BPF2SOCKS_BRIDGE_INTERNAL_H
 
 #include "bpf2socks.h"
+#include "udp_binding_index.h"
+#include "udp_token_lookup.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -69,6 +71,7 @@ struct bpf2socks_udp_reply_binding {
     struct bpf2socks_udp_reply_binding *global_lru_prev;
     struct bpf2socks_udp_reply_binding *global_lru_next;
     struct bpf2socks_udp_reply_binding *free_next;
+    struct bpf2socks_udp_reply_binding *hash_next;
 };
 
 struct bpf2socks_udp_pending_packet {
@@ -91,6 +94,7 @@ enum bpf2socks_udp_session_stage {
 struct bpf2socks_udp_client_session {
     bool used;
     enum bpf2socks_udp_session_stage stage;
+    enum bpf2socks_udp_token_lookup_mode token_lookup_mode;
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
     int tcp_fd;
@@ -149,7 +153,6 @@ void bpf2socks_bridge_record_socket_buffers(int fd);
 void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream);
 void bpf2socks_bridge_tune_udp_advanced(int fd);
 void bpf2socks_bridge_enable_tcp_fastopen_listener(int fd);
-void bpf2socks_drain_zerocopy_completions(int fd);
 int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker);
 int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker);
 

@@ -521,14 +521,7 @@ int bpf2socks_socks5_udp_sendmmsg(
         vec[i].msg_hdr.msg_iovlen = 2U;
     }
 
-    bpf2socks_drain_zerocopy_completions(udp_fd);
-    int sent = sendmmsg(udp_fd, vec, count, MSG_ZEROCOPY);
-    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS)) {
-        bpf2socks_drain_zerocopy_completions(udp_fd);
-        sent = sendmmsg(udp_fd, vec, count, 0);
-    }
-    bpf2socks_drain_zerocopy_completions(udp_fd);
-    return sent;
+    return sendmmsg(udp_fd, vec, count, 0);
 }
 
 int bpf2socks_socks5_udp_recvmmsg(

@@ -37,13 +37,6 @@
 #ifndef UDP_GRO
 #define UDP_GRO 104
 #endif
-#ifndef SO_ZEROCOPY
-#define SO_ZEROCOPY 60
-#endif
-#ifndef MSG_ZEROCOPY
-#define MSG_ZEROCOPY 0x4000000
-#endif
-
 static void set_probe_message(char *message, size_t message_size, const char *feature, int error) {
     if (message == NULL || message_size == 0U) return;
     snprintf(message, message_size, "%s is unavailable: errno=%d", feature, error);
@@ -124,41 +117,6 @@ static int probe_udp_segment_sendmsg(char *message, size_t message_size) {
     return 0;
 }
 
-static int probe_msg_zerocopy_udp(char *message, size_t message_size) {
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        set_probe_message(message, message_size, "MSG_ZEROCOPY UDP", errno);
-        return -1;
-    }
-    int one = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one)) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        set_probe_message(message, message_size, "SO_ZEROCOPY UDP", errno);
-        return -1;
-    }
-
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(9);
-    (void)inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
-
-    uint8_t payload[1200];
-    memset(payload, 0x52, sizeof(payload));
-    ssize_t sent = sendto(fd, payload, sizeof(payload), MSG_ZEROCOPY, (const struct sockaddr *)&dst, sizeof(dst));
-    int saved = errno;
-    bpf2socks_drain_zerocopy_completions(fd);
-    close(fd);
-    if (sent != (ssize_t)sizeof(payload)) {
-        errno = saved;
-        set_probe_message(message, message_size, "MSG_ZEROCOPY UDP", errno);
-        return -1;
-    }
-    return 0;
-}
-
 static int probe_io_uring_setup(char *message, size_t message_size) {
 #ifdef __NR_io_uring_setup
     struct io_uring_params params;
@@ -207,13 +165,6 @@ int bpf2socks_advanced_socket_probe(char *message, size_t message_size) {
     if (probe_setsockopt("UDP_GRO", AF_INET, SOCK_DGRAM, 0, IPPROTO_UDP, UDP_GRO, 1, message, message_size) < 0) {
         return -1;
     }
-    if (probe_setsockopt("SO_ZEROCOPY TCP", AF_INET, SOCK_STREAM, 0, SOL_SOCKET, SO_ZEROCOPY, 1, message, message_size) < 0) {
-        return -1;
-    }
-    if (probe_setsockopt("SO_ZEROCOPY UDP", AF_INET, SOCK_DGRAM, 0, SOL_SOCKET, SO_ZEROCOPY, 1, message, message_size) < 0) {
-        return -1;
-    }
-    if (probe_msg_zerocopy_udp(message, message_size) < 0) return -1;
     if (probe_io_uring_setup(message, message_size) < 0) return -1;
     if (message != NULL && message_size > 0U) snprintf(message, message_size, "ok");
     return 0;
@@ -229,24 +180,10 @@ void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream) {
 }
 
 void bpf2socks_bridge_tune_udp_advanced(int fd) {
-    int one = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof(one));
+    (void)fd;
 }
 
 void bpf2socks_bridge_enable_tcp_fastopen_listener(int fd) {
     int backlog = 4096;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &backlog, sizeof(backlog));
-}
-
-void bpf2socks_drain_zerocopy_completions(int fd) {
-    char control[256];
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-    while (recvmsg(fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT) >= 0) {
-        memset(&msg, 0, sizeof(msg));
-        msg.msg_control = control;
-        msg.msg_controllen = sizeof(control);
-    }
 }

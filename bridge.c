@@ -331,6 +331,16 @@ static void copy_udp_stats(
     destination->dns_valid_responses = source->dns_valid_responses;
     destination->dns_transaction_timeouts = source->dns_transaction_timeouts;
     destination->dns_channel_timeout_rebuilds = source->dns_channel_timeout_rebuilds;
+    destination->udp_token_lookup_full_attempts = source->udp_token_lookup_full_attempts;
+    destination->udp_token_lookup_full_hits = source->udp_token_lookup_full_hits;
+    destination->udp_token_lookup_zero_attempts = source->udp_token_lookup_zero_attempts;
+    destination->udp_token_lookup_zero_hits = source->udp_token_lookup_zero_hits;
+    destination->udp_token_lookup_fallbacks = source->udp_token_lookup_fallbacks;
+    destination->udp_copy_sends = source->udp_copy_sends;
+    destination->udp_binding_hash_lookups = source->udp_binding_hash_lookups;
+    destination->udp_binding_hash_collision_steps = source->udp_binding_hash_collision_steps;
+    destination->dns_free_stack_allocations = source->dns_free_stack_allocations;
+    destination->dns_full_table_evictions = source->dns_full_table_evictions;
 }
 
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker) {
@@ -394,6 +404,16 @@ static void add_worker_stats(struct bpf2socks_bridge_stats *total, const struct 
     total->tcp_connect_timeouts += stats->tcp_connect_timeouts;
     total->tcp_idle_timeouts += stats->tcp_idle_timeouts;
     total->tcp_fd_exhaustions += stats->tcp_fd_exhaustions;
+    total->udp_token_lookup_full_attempts += stats->udp_token_lookup_full_attempts;
+    total->udp_token_lookup_full_hits += stats->udp_token_lookup_full_hits;
+    total->udp_token_lookup_zero_attempts += stats->udp_token_lookup_zero_attempts;
+    total->udp_token_lookup_zero_hits += stats->udp_token_lookup_zero_hits;
+    total->udp_token_lookup_fallbacks += stats->udp_token_lookup_fallbacks;
+    total->udp_copy_sends += stats->udp_copy_sends;
+    total->udp_binding_hash_lookups += stats->udp_binding_hash_lookups;
+    total->udp_binding_hash_collision_steps += stats->udp_binding_hash_collision_steps;
+    total->dns_free_stack_allocations += stats->dns_free_stack_allocations;
+    total->dns_full_table_evictions += stats->dns_full_table_evictions;
 }
 
 static int stats_path_from_pid_path(const char *pid_path, char *out, size_t out_size) {
@@ -658,9 +678,15 @@ int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_st
     }
     size_t bytes = fread(out, 1U, sizeof(*out), file);
     int read_error = ferror(file);
+    int extra = fgetc(file);
+    if (ferror(file) != 0) read_error = 1;
     int close_result = fclose(file);
     size_t legacy_size = offsetof(struct bpf2socks_bridge_stats, tcp_drops_capacity);
-    if ((bytes != legacy_size && bytes != sizeof(*out)) || read_error != 0 || close_result != 0) {
+    size_t previous_size = offsetof(
+        struct bpf2socks_bridge_stats,
+        udp_token_lookup_full_attempts);
+    if ((bytes != legacy_size && bytes != previous_size && bytes != sizeof(*out)) ||
+        extra != EOF || read_error != 0 || close_result != 0) {
         memset(out, 0, sizeof(*out));
         errno = EIO;
         return -1;

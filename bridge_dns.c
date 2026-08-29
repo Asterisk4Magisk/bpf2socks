@@ -13,7 +13,6 @@
 #define DNS_NAME_POINTER 0xc0U
 #define DNS_NAME_POINTER_MASK 0x3fffU
 #define DNS_MAX_POINTER_HOPS 16U
-#define DNS_FREE_INDEX ((size_t)-1)
 #define DNS_LRU_NONE ((size_t)-1)
 
 static uint16_t read_be16(const uint8_t *packet, size_t offset) {
@@ -172,7 +171,10 @@ static void lru_attach_tail(struct bpf2socks_dns_table *table, size_t index) {
     table->lru_tail = index;
 }
 
-static void release_index(struct bpf2socks_dns_table *table, size_t index) {
+static void release_index(
+    struct bpf2socks_dns_table *table,
+    size_t index,
+    bool return_to_free_stack) {
     if (table == NULL || index >= table->capacity) return;
     struct bpf2socks_dns_transaction *tx = &table->transactions[index];
     if (!tx->used) return;
@@ -185,6 +187,9 @@ static void release_index(struct bpf2socks_dns_table *table, size_t index) {
     tx->lru_prev = DNS_LRU_NONE;
     tx->lru_next = DNS_LRU_NONE;
     if (table->count > 0U) --table->count;
+    if (return_to_free_stack && table->free_indices != NULL && table->free_count < table->capacity) {
+        table->free_indices[table->free_count++] = index;
+    }
 }
 
 int bpf2socks_dns_table_init(
@@ -202,19 +207,22 @@ int bpf2socks_dns_table_init(
     table->lookup = malloc((size_t)channel_count * 65536U * sizeof(*table->lookup));
     table->next_ids = calloc(channel_count, sizeof(*table->next_ids));
     table->response_generations = calloc(channel_count, sizeof(*table->response_generations));
+    table->free_indices = malloc(capacity * sizeof(*table->free_indices));
     if (table->transactions == NULL || table->lookup == NULL || table->next_ids == NULL ||
-        table->response_generations == NULL) {
+        table->response_generations == NULL || table->free_indices == NULL) {
         bpf2socks_dns_table_free(table);
         errno = ENOMEM;
         return -1;
     }
     table->capacity = capacity;
+    table->free_count = capacity;
     table->channel_count = channel_count;
     for (size_t i = 0; i < (size_t)channel_count * 65536U; ++i) table->lookup[i] = -1;
     for (size_t i = 0; i < capacity; ++i) {
         table->transactions[i].reply_fd = -1;
         table->transactions[i].lru_prev = DNS_LRU_NONE;
         table->transactions[i].lru_next = DNS_LRU_NONE;
+        table->free_indices[i] = capacity - 1U - i;
     }
     return 0;
 }
@@ -228,16 +236,10 @@ void bpf2socks_dns_table_free(struct bpf2socks_dns_table *table) {
     free(table->lookup);
     free(table->next_ids);
     free(table->response_generations);
+    free(table->free_indices);
     memset(table, 0, sizeof(*table));
     table->lru_head = DNS_LRU_NONE;
     table->lru_tail = DNS_LRU_NONE;
-}
-
-static size_t find_free_slot(struct bpf2socks_dns_table *table) {
-    for (size_t i = 0; i < table->capacity; ++i) {
-        if (!table->transactions[i].used) return i;
-    }
-    return DNS_FREE_INDEX;
 }
 
 static bool allocate_id(struct bpf2socks_dns_table *table, uint32_t channel, uint16_t *out_id) {
@@ -261,18 +263,21 @@ struct bpf2socks_dns_transaction *bpf2socks_dns_table_alloc(
     uint32_t question_fingerprint,
     uint64_t now_ms) {
     if (table == NULL || table->transactions == NULL || table->lookup == NULL ||
+        table->free_indices == NULL ||
         preferred_channel >= table->channel_count) {
         errno = EINVAL;
         return NULL;
     }
-    size_t slot = find_free_slot(table);
-    if (slot == DNS_FREE_INDEX) {
+    size_t slot;
+    if (table->free_count > 0U) {
+        slot = table->free_indices[--table->free_count];
+    } else {
         if (table->lru_head == DNS_LRU_NONE) {
             errno = ENOMEM;
             return NULL;
         }
         slot = table->lru_head;
-        release_index(table, slot);
+        release_index(table, slot, false);
     }
 
     uint16_t rewritten_id = 0U;
@@ -285,6 +290,7 @@ struct bpf2socks_dns_transaction *bpf2socks_dns_table_alloc(
         }
     }
     errno = ENOSPC;
+    if (table->free_count < table->capacity) table->free_indices[table->free_count++] = slot;
     return NULL;
 
 found_id:
@@ -331,7 +337,7 @@ void bpf2socks_dns_table_release(
     if (table == NULL || tx == NULL || table->transactions == NULL) return;
     size_t index = (size_t)(tx - table->transactions);
     if (index >= table->capacity) return;
-    release_index(table, index);
+    release_index(table, index, true);
 }
 
 size_t bpf2socks_dns_table_expire(
@@ -352,7 +358,7 @@ size_t bpf2socks_dns_table_expire(
             tx->response_generation == table->response_generations[tx->channel_index]) {
             stale_channels[tx->channel_index] = true;
         }
-        release_index(table, index);
+        release_index(table, index, true);
         ++expired;
     }
     return expired;
