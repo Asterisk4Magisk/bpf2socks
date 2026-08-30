@@ -16,12 +16,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 struct bpf2socks_interface_runtime {
     pthread_t thread;
     int netlink_fd;
+    int stop_fd;
     _Atomic bool stop_requested;
     const struct bpf2socks_policy_config *policy;
     struct bpf2socks_bpf_runtime *bpf_runtime;
@@ -278,17 +280,23 @@ static void *interface_policy_thread(void *arg) {
     struct bpf2socks_interface_runtime *interfaces = arg;
     char buf[8192];
     while (!atomic_load_explicit(&interfaces->stop_requested, memory_order_acquire)) {
-        struct pollfd pfd = {
-            .fd = interfaces->netlink_fd,
-            .events = POLLIN,
+        struct pollfd pfds[2] = {
+            {
+                .fd = interfaces->netlink_fd,
+                .events = POLLIN,
+            },
+            {
+                .fd = interfaces->stop_fd,
+                .events = POLLIN,
+            },
         };
-        int ready = poll(&pfd, 1U, 100);
+        int ready = poll(pfds, 2U, -1);
         if (ready < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        if (ready == 0) continue;
-        if ((pfd.revents & POLLIN) == 0) break;
+        if ((pfds[1].revents & POLLIN) != 0) break;
+        if ((pfds[0].revents & POLLIN) == 0) break;
         ssize_t len = recv(interfaces->netlink_fd, buf, sizeof(buf), 0);
         if (len < 0 && errno == EINTR) continue;
         if (len <= 0) break;
@@ -320,6 +328,7 @@ int bpf2socks_interface_policy_start(
     struct bpf2socks_interface_runtime *interfaces = calloc(1U, sizeof(*interfaces));
     if (interfaces == NULL) return -1;
     interfaces->netlink_fd = -1;
+    interfaces->stop_fd = -1;
     atomic_init(&interfaces->stop_requested, false);
     interfaces->policy = policy;
     interfaces->bpf_runtime = runtime;
@@ -332,8 +341,18 @@ int bpf2socks_interface_policy_start(
         return -1;
     }
 
+    interfaces->stop_fd = eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (interfaces->stop_fd < 0) {
+        int saved = errno;
+        close(interfaces->netlink_fd);
+        free(interfaces);
+        errno = saved;
+        return -1;
+    }
+
     if (refresh_interface_policy(interfaces) < 0) {
         int saved = errno;
+        close(interfaces->stop_fd);
         close(interfaces->netlink_fd);
         free(interfaces);
         errno = saved;
@@ -342,6 +361,7 @@ int bpf2socks_interface_policy_start(
 
     int thread_result = pthread_create(&interfaces->thread, NULL, interface_policy_thread, interfaces);
     if (thread_result != 0) {
+        close(interfaces->stop_fd);
         close(interfaces->netlink_fd);
         free(interfaces);
         errno = thread_result;
@@ -358,7 +378,13 @@ void bpf2socks_interface_policy_stop(struct bpf2socks_bpf_runtime *runtime) {
     runtime->interfaces = NULL;
 
     atomic_store_explicit(&interfaces->stop_requested, true, memory_order_release);
+    uint64_t signal = 1U;
+    ssize_t written;
+    do {
+        written = write(interfaces->stop_fd, &signal, sizeof(signal));
+    } while (written < 0 && errno == EINTR);
     (void)pthread_join(interfaces->thread, NULL);
+    if (interfaces->stop_fd >= 0) close(interfaces->stop_fd);
     if (interfaces->netlink_fd >= 0) close(interfaces->netlink_fd);
     free(interfaces);
 }
