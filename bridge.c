@@ -42,6 +42,7 @@
 struct bridge_thread_args {
     struct bpf2socks_bridge_worker *worker;
     bool udp;
+    int *result;
 };
 
 struct bridge_worker_threads {
@@ -49,6 +50,8 @@ struct bridge_worker_threads {
     pthread_t udp_thread;
     bool tcp_started;
     bool udp_started;
+    int tcp_result;
+    int udp_result;
 };
 
 struct bridge_stats_thread_args {
@@ -223,23 +226,26 @@ static void *bridge_worker_thread(void *arg) {
     if (thread_args == NULL) return NULL;
     struct bpf2socks_bridge_worker *worker = thread_args->worker;
     bool udp = thread_args->udp;
+    int *result = thread_args->result;
     free(thread_args);
-    if (udp) {
-        (void)bpf2socks_bridge_udp_worker_run(worker);
-    } else {
-        (void)bpf2socks_bridge_tcp_worker_run(worker);
-    }
+    *result = udp
+        ? bpf2socks_bridge_udp_worker_run(worker)
+        : bpf2socks_bridge_tcp_worker_run(worker);
+    if (*result != 0) bpf2socks_request_stop();
     return NULL;
 }
 
 static int start_worker_thread(
     struct bpf2socks_bridge_worker *worker,
     bool udp,
-    pthread_t *thread) {
+    pthread_t *thread,
+    int *result) {
     struct bridge_thread_args *args = malloc(sizeof(*args));
     if (args == NULL) return -1;
     args->worker = worker;
     args->udp = udp;
+    args->result = result;
+    *result = -1;
     int rc = pthread_create(thread, NULL, bridge_worker_thread, args);
     if (rc != 0) {
         free(args);
@@ -491,7 +497,7 @@ static int write_stats_snapshot(const char *path, const struct bpf2socks_bridge_
 static void *bridge_stats_thread(void *arg) {
     struct bridge_stats_thread_args *args = arg;
     if (args == NULL) return NULL;
-    while (!bpf2socks_stop_requested) {
+    while (!bpf2socks_stop_is_requested()) {
         struct bpf2socks_bridge_stats stats;
         aggregate_worker_stats(args->workers, args->worker_count, &stats);
         (void)write_stats_snapshot(args->stats_path, &stats);
@@ -568,7 +574,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
         int mutex_result = pthread_mutex_init(&workers[i].stats_snapshot_mutex, NULL);
         if (mutex_result != 0) {
             errno = mutex_result;
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
         workers[i].stats_snapshot_mutex_initialized = true;
@@ -576,7 +582,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
         workers[i].udp_listener_fd = bind_udp_listener(config);
         if (workers[i].udp_listener_fd < 0) {
             fprintf(stderr, "failed to bind bpf2socks UDP listener for worker %u: errno=%d\n", i, errno);
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
 
@@ -584,7 +590,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
             workers[i].udp_listener6_fd = bind_udp6_listener(config);
             if (workers[i].udp_listener6_fd < 0) {
                 fprintf(stderr, "failed to bind bpf2socks UDP6 listener for worker %u: errno=%d\n", i, errno);
-                bpf2socks_stop_requested = 1;
+                bpf2socks_request_stop();
                 goto done;
             }
         }
@@ -592,7 +598,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
         workers[i].tcp_listener_fd = bind_tcp_listener(config);
         if (workers[i].tcp_listener_fd < 0) {
             fprintf(stderr, "failed to bind bpf2socks TCP listener for worker %u: errno=%d\n", i, errno);
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
 
@@ -600,7 +606,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
             workers[i].tcp_listener6_fd = bind_tcp6_listener(config);
             if (workers[i].tcp_listener6_fd < 0) {
                 fprintf(stderr, "failed to bind bpf2socks TCP6 listener for worker %u: errno=%d\n", i, errno);
-                bpf2socks_stop_requested = 1;
+                bpf2socks_request_stop();
                 goto done;
             }
         }
@@ -613,7 +619,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
                 workers[i].tcp_listener6_fd,
                 workers[i].udp_listener6_fd) < 0) {
             fprintf(stderr, "failed to register bpf2socks reuseport sockets for worker %u: errno=%d\n", i, errno);
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
     }
@@ -623,18 +629,20 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
     }
 
     for (uint32_t i = 0; i < worker_count; ++i) {
-        if (start_worker_thread(&workers[i], false, &threads[i].tcp_thread) == 0) {
+        if (start_worker_thread(
+                &workers[i], false, &threads[i].tcp_thread, &threads[i].tcp_result) == 0) {
             threads[i].tcp_started = true;
         } else {
             fprintf(stderr, "failed to start bpf2socks TCP worker %u: errno=%d\n", i, errno);
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
-        if (start_worker_thread(&workers[i], true, &threads[i].udp_thread) == 0) {
+        if (start_worker_thread(
+                &workers[i], true, &threads[i].udp_thread, &threads[i].udp_result) == 0) {
             threads[i].udp_started = true;
         } else {
             fprintf(stderr, "failed to start bpf2socks UDP worker %u: errno=%d\n", i, errno);
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
     }
@@ -642,7 +650,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
     if (pid_file_enabled(pid_path)) {
         if (write_pid_file(pid_path) < 0) {
             fprintf(stderr, "failed to write bpf2socks PID file: errno=%d\n", errno);
-            bpf2socks_stop_requested = 1;
+            bpf2socks_request_stop();
             goto done;
         }
         pid_file_written = true;
@@ -652,11 +660,17 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
 
 done:
     for (uint32_t i = 0; i < worker_count; ++i) {
-        if (threads[i].tcp_started) pthread_join(threads[i].tcp_thread, NULL);
+        if (threads[i].tcp_started) {
+            pthread_join(threads[i].tcp_thread, NULL);
+            if (threads[i].tcp_result != 0) result = -1;
+        }
     }
-    bpf2socks_stop_requested = 1;
+    bpf2socks_request_stop();
     for (uint32_t i = 0; i < worker_count; ++i) {
-        if (threads[i].udp_started) pthread_join(threads[i].udp_thread, NULL);
+        if (threads[i].udp_started) {
+            pthread_join(threads[i].udp_thread, NULL);
+            if (threads[i].udp_result != 0) result = -1;
+        }
     }
     if (stats_started) pthread_join(stats_thread, NULL);
     close_workers(workers, worker_count);

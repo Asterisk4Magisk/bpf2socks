@@ -97,6 +97,25 @@ bool bpf2socks_tcp_connection_timed_out(
         now_ms - last_activity_ms >= (uint64_t)idle_timeout_ms;
 }
 
+int bpf2socks_tcp_worker_wait_timeout(
+    bool listeners_paused,
+    bool has_active_connections,
+    bool debug_stats) {
+    if (listeners_paused) return BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS;
+    return has_active_connections || debug_stats ? BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS : -1;
+}
+
+int bpf2socks_udp_worker_wait_timeout(
+    size_t session_count,
+    size_t binding_count,
+    size_t dns_transaction_count,
+    bool dns_handshake_in_progress,
+    bool debug_stats) {
+    bool timed_work = session_count != 0U || binding_count != 0U || dns_transaction_count != 0U ||
+        dns_handshake_in_progress || debug_stats;
+    return timed_work ? BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS : -1;
+}
+
 int bpf2socks_nofile_soft_limit(uint64_t *out_limit) {
     if (out_limit == NULL) {
         errno = EINVAL;

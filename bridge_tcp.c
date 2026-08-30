@@ -39,7 +39,6 @@
 #define BPF2SOCKS_TCP_RELAY_EVENTS (EPOLLERR | EPOLLHUP | EPOLLRDHUP)
 #define BPF2SOCKS_TCP_TIMEOUT_SCAN_MILLISECONDS 1000U
 #define BPF2SOCKS_TCP_STATS_PUBLISH_MILLISECONDS 250U
-#define BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS 100U
 
 enum tcp_stage {
     TCP_STAGE_CONNECTING,
@@ -948,7 +947,7 @@ static int client_original_dst(int client_fd, const struct bpf2socks_runtime_con
 }
 
 static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd) {
-    while (!bpf2socks_stop_requested) {
+    while (!bpf2socks_stop_is_requested()) {
         int client = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (client < 0 && errno == EINTR) continue;
@@ -1202,6 +1201,18 @@ int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
     if (epoll_fd < 0) return -1;
     worker->epoll_fd = epoll_fd;
 
+    struct epoll_event stop_event;
+    memset(&stop_event, 0, sizeof(stop_event));
+    stop_event.events = EPOLLIN;
+    int stop_fd = bpf2socks_stop_event_fd();
+    if (stop_fd < 0 || epoll_ctl(epoll_fd, EPOLL_CTL_ADD, stop_fd, &stop_event) != 0) {
+        int saved = stop_fd < 0 ? EINVAL : errno;
+        close(epoll_fd);
+        worker->epoll_fd = -1;
+        errno = saved;
+        return -1;
+    }
+
     struct tcp_worker_state state;
     memset(&state, 0, sizeof(state));
     state.worker = worker;
@@ -1236,13 +1247,23 @@ int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
         return -1;
     }
 
+    int result = 0;
+    int wait_errno = 0;
     struct epoll_event events[BPF2SOCKS_TCP_EVENTS];
-    while (!bpf2socks_stop_requested) {
+    while (!bpf2socks_stop_is_requested()) {
         resume_tcp_listeners_if_due(&state);
-        int timeout = state.listeners_paused ? (int)BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS : 1000;
+        int timeout = bpf2socks_tcp_worker_wait_timeout(
+            state.listeners_paused,
+            state.active != NULL,
+            worker->config->debug_stats);
         int ready = epoll_wait(epoll_fd, events, BPF2SOCKS_TCP_EVENTS, timeout);
         if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) break;
+        if (ready < 0) {
+            wait_errno = errno;
+            result = -1;
+            break;
+        }
+        if (bpf2socks_stop_is_requested()) break;
         for (int i = 0; i < ready; ++i) {
             handle_connection_event(&state, events[i].data.ptr, events[i].events);
         }
@@ -1258,5 +1279,6 @@ int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
     close_fd_if_open(&state.spare_fd);
     close(epoll_fd);
     worker->epoll_fd = -1;
-    return 0;
+    if (result != 0) errno = wait_errno;
+    return result;
 }

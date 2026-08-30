@@ -24,11 +24,9 @@
 #define BPF2SOCKS_FD_PER_WORKER_UDP 7ULL
 #define BPF2SOCKS_FD_PER_WORKER_UDP_IPV6 2ULL
 
-volatile sig_atomic_t bpf2socks_stop_requested = 0;
-
 static void on_signal(int signo) {
     (void)signo;
-    bpf2socks_stop_requested = 1;
+    bpf2socks_request_stop();
 }
 
 static void install_signal_handlers(void) {
@@ -525,6 +523,14 @@ static int start_with_config_unlocked(const char *path, const char *pid_path) {
         fprintf(stderr, "failed to start bpf2socks BPF runtime: errno=%d\n", errno);
         return 1;
     }
+    if (bpf2socks_stop_event_init() < 0) {
+        int saved_errno = errno;
+        bpf2socks_bpf_stop(&runtime);
+        cleanup_fixed_bpf_pins(&config);
+        errno = saved_errno;
+        fprintf(stderr, "failed to create bpf2socks stop event: errno=%d\n", errno);
+        return 1;
+    }
     install_signal_handlers();
     config.token_map_fd = runtime.token_map_fd;
     config.reuseport_tcp4_map_fd = runtime.reuseport_tcp4_map_fd;
@@ -541,6 +547,7 @@ static int start_with_config_unlocked(const char *path, const char *pid_path) {
         (void)bpf2socks_update_map(runtime.tc_runtime_control_map_fd, &control_key, &control);
     }
     bpf2socks_bpf_stop(&runtime);
+    bpf2socks_stop_event_close();
     cleanup_fixed_bpf_pins(&config);
     return result == 0 ? 0 : 1;
 }

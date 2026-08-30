@@ -20,6 +20,8 @@
 #define BPF2SOCKS_UDP_BUFFER_SIZE 65535U
 #define BPF2SOCKS_SESSION_HASH_BUCKETS 4096U
 #define BPF2SOCKS_MAX_SOCKS5_UDP_HEADER 22U
+#define BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS 1000
+#define BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS 100
 
 struct bpf2socks_udp_pending_budget {
     size_t cap_bytes;
@@ -134,6 +136,16 @@ bool bpf2socks_tcp_connection_timed_out(
     bool relay_established,
     uint32_t connect_timeout_ms,
     uint32_t idle_timeout_ms);
+int bpf2socks_tcp_worker_wait_timeout(
+    bool listeners_paused,
+    bool has_active_connections,
+    bool debug_stats);
+int bpf2socks_udp_worker_wait_timeout(
+    size_t session_count,
+    size_t binding_count,
+    size_t dns_transaction_count,
+    bool dns_handshake_in_progress,
+    bool debug_stats);
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker);
 void bpf2socks_bridge_publish_udp_stats(struct bpf2socks_bridge_worker *worker);
 void bpf2socks_bridge_copy_stats_snapshot(

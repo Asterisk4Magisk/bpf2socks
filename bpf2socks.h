@@ -5,7 +5,6 @@
 #define ASTERISK_BPF2SOCKS_H
 
 #include <linux/bpf.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -64,7 +63,11 @@
 #define BPF2SOCKS_PROTO_TCP 6U
 #define BPF2SOCKS_PROTO_UDP 17U
 
-extern volatile sig_atomic_t bpf2socks_stop_requested;
+int bpf2socks_stop_event_init(void);
+int bpf2socks_stop_event_fd(void);
+void bpf2socks_stop_event_close(void);
+bool bpf2socks_stop_is_requested(void);
+void bpf2socks_request_stop(void);
 
 struct bpf2socks_lpm4_key {
     uint32_t prefixlen;

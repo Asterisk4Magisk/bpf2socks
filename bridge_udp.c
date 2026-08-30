@@ -3425,6 +3425,18 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
         free_state(&state);
         return -1;
     }
+    struct epoll_event stop_event;
+    memset(&stop_event, 0, sizeof(stop_event));
+    stop_event.events = EPOLLIN;
+    int stop_fd = bpf2socks_stop_event_fd();
+    if (stop_fd < 0 || epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, stop_fd, &stop_event) != 0) {
+        int saved = stop_fd < 0 ? EINVAL : errno;
+        free(client_payloads);
+        free(upstream_packets);
+        free_state(&state);
+        errno = saved;
+        return -1;
+    }
     state.listener_ref.fd = worker->udp_listener_fd;
     if (add_udp_epoll_fd(&state, worker->udp_listener_fd, &state.listener_ref) < 0) {
         free(client_payloads);
@@ -3442,15 +3454,34 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
         }
     }
 
+    int result = 0;
+    int wait_errno = 0;
     uint64_t next_stats_publish_ms = 0U;
-    while (!bpf2socks_stop_requested) {
-        int ready = epoll_wait(state.epoll_fd, state.events, (int)state.event_cap, 1000);
+    while (!bpf2socks_stop_is_requested()) {
+        bool dns_handshake_in_progress = false;
+        for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
+            enum dns_channel_stage stage = state.dns_channels[i].stage;
+            if (stage != DNS_CHANNEL_IDLE && stage != DNS_CHANNEL_READY) {
+                dns_handshake_in_progress = true;
+                break;
+            }
+        }
+        int timeout = bpf2socks_udp_worker_wait_timeout(
+            state.session_count,
+            state.binding_count,
+            state.dns_table.count,
+            dns_handshake_in_progress,
+            worker->config->debug_stats);
+        int ready = epoll_wait(state.epoll_fd, state.events, (int)state.event_cap, timeout);
         if (ready < 0 && errno == EINTR) {
             continue;
         }
         if (ready < 0) {
+            wait_errno = errno;
+            result = -1;
             break;
         }
+        if (bpf2socks_stop_is_requested()) break;
         if (ready == 0) {
             evict_idle_bindings(&state, worker->config, worker);
             expire_sessions(&state, worker->config);
@@ -3532,5 +3563,6 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
     free(client_payloads);
     free(upstream_packets);
     free_state(&state);
-    return 0;
+    if (result != 0) errno = wait_errno;
+    return result;
 }
