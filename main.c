@@ -607,6 +607,7 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         "\"tcpConnectTimeouts\":%" PRIu64 ","
         "\"tcpIdleTimeouts\":%" PRIu64 ","
         "\"tcpFdExhaustions\":%" PRIu64 ","
+        "\"tcpTokenDeleteFailures\":%" PRIu64 ","
         "\"tcpBytesClientToUpstream\":%" PRIu64 ","
         "\"tcpBytesUpstreamToClient\":%" PRIu64 ","
         "\"udpPacketsFromClient\":%" PRIu64 ","
@@ -648,6 +649,7 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         stats->tcp_connect_timeouts,
         stats->tcp_idle_timeouts,
         stats->tcp_fd_exhaustions,
+        stats->tcp_token_delete_failures,
         stats->tcp_bytes_client_to_upstream,
         stats->tcp_bytes_upstream_to_client,
         stats->udp_packets_from_client,

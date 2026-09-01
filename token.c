@@ -3,10 +3,29 @@
 
 #include "bpf2socks.h"
 
+#include <errno.h>
 #include <string.h>
 
 int bpf2socks_token_lookup(int map_fd, const struct bpf2socks_token_key *key, struct bpf2socks_original_dst *out) {
     if (map_fd < 0 || key == NULL || out == NULL) return -1;
     memset(out, 0, sizeof(*out));
     return bpf2socks_lookup_map(map_fd, key, out);
+}
+
+int bpf2socks_tcp_token_take(
+    int map_fd,
+    const struct bpf2socks_token_key *key,
+    struct bpf2socks_original_dst *out,
+    bool *delete_failed) {
+    if (map_fd < 0 || key == NULL || out == NULL || delete_failed == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *delete_failed = false;
+    if (bpf2socks_token_lookup(map_fd, key, out) < 0) return -1;
+    if (bpf2socks_delete_map(map_fd, key) < 0) {
+        *delete_failed = true;
+        errno = 0;
+    }
+    return 0;
 }

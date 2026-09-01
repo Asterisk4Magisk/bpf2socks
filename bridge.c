@@ -300,6 +300,7 @@ static void copy_tcp_stats(
     destination->tcp_connect_timeouts = source->tcp_connect_timeouts;
     destination->tcp_idle_timeouts = source->tcp_idle_timeouts;
     destination->tcp_fd_exhaustions = source->tcp_fd_exhaustions;
+    destination->tcp_token_delete_failures = source->tcp_token_delete_failures;
 }
 
 static void destroy_worker_stats_snapshot_mutexes(
@@ -410,6 +411,7 @@ static void add_worker_stats(struct bpf2socks_bridge_stats *total, const struct 
     total->tcp_connect_timeouts += stats->tcp_connect_timeouts;
     total->tcp_idle_timeouts += stats->tcp_idle_timeouts;
     total->tcp_fd_exhaustions += stats->tcp_fd_exhaustions;
+    total->tcp_token_delete_failures += stats->tcp_token_delete_failures;
     total->udp_token_lookup_full_attempts += stats->udp_token_lookup_full_attempts;
     total->udp_token_lookup_full_hits += stats->udp_token_lookup_full_hits;
     total->udp_token_lookup_zero_attempts += stats->udp_token_lookup_zero_attempts;
@@ -699,7 +701,11 @@ int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_st
     size_t previous_size = offsetof(
         struct bpf2socks_bridge_stats,
         udp_token_lookup_full_attempts);
-    if ((bytes != legacy_size && bytes != previous_size && bytes != sizeof(*out)) ||
+    size_t prior_full_size = offsetof(
+        struct bpf2socks_bridge_stats,
+        tcp_token_delete_failures);
+    if ((bytes != legacy_size && bytes != previous_size && bytes != prior_full_size &&
+         bytes != sizeof(*out)) ||
         extra != EOF || read_error != 0 || close_result != 0) {
         memset(out, 0, sizeof(*out));
         errno = EIO;

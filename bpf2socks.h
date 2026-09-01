@@ -225,6 +225,7 @@ struct bpf2socks_bridge_stats {
     uint64_t udp_binding_hash_collision_steps;
     uint64_t dns_free_stack_allocations;
     uint64_t dns_full_table_evictions;
+    uint64_t tcp_token_delete_failures;
 };
 
 int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_stats *out);
@@ -304,6 +305,11 @@ int bpf2socks_delete_map(int map_fd, const void *key);
 int bpf2socks_pin_fd(int fd, const char *path);
 
 int bpf2socks_token_lookup(int map_fd, const struct bpf2socks_token_key *key, struct bpf2socks_original_dst *out);
+int bpf2socks_tcp_token_take(
+    int map_fd,
+    const struct bpf2socks_token_key *key,
+    struct bpf2socks_original_dst *out,
+    bool *delete_failed);
 int bpf2socks_parse_token_ipv4_prefix(const char *text, uint8_t out[4], uint32_t *prefix_bits);
 bool bpf2socks_ipv4_matches_token_prefix(
     uint32_t addr_net,

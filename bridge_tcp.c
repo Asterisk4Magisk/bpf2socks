@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 
 #include "bridge_internal.h"
+#include "tcp_active_list.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -93,8 +94,13 @@ struct tcp_connection {
     size_t response_expected;
     uint64_t created_at_ms;
     uint64_t last_activity_ms;
+    bool active_linked;
+    struct tcp_connection *active_prev;
+    struct tcp_connection *active_next;
     struct tcp_connection *next;
 };
+
+BPF2SOCKS_DEFINE_TCP_ACTIVE_LIST(tcp_active_list, struct tcp_connection)
 
 struct tcp_worker_state {
     struct bpf2socks_bridge_worker *worker;
@@ -327,12 +333,19 @@ static int fill_tcp_token_key(int client_fd, struct bpf2socks_token_key *key) {
 static int lookup_original_with_client_fallback(
     int map_fd,
     const struct bpf2socks_token_key *key,
-    struct bpf2socks_original_dst *original) {
-    if (bpf2socks_token_lookup(map_fd, key, original) == 0) return 0;
+    struct bpf2socks_original_dst *original,
+    struct bpf2socks_bridge_stats *stats) {
+    bool delete_failed = false;
+    if (bpf2socks_tcp_token_take(map_fd, key, original, &delete_failed) == 0) {
+        if (delete_failed) ++stats->tcp_token_delete_failures;
+        return 0;
+    }
     struct bpf2socks_token_key fallback = *key;
     fallback.client_port = 0U;
     memset(fallback.client_addr, 0, sizeof(fallback.client_addr));
-    return bpf2socks_token_lookup(map_fd, &fallback, original);
+    if (bpf2socks_tcp_token_take(map_fd, &fallback, original, &delete_failed) < 0) return -1;
+    if (delete_failed) ++stats->tcp_token_delete_failures;
+    return 0;
 }
 
 static int original_to_sockaddr(const struct bpf2socks_original_dst *src, struct bpf2socks_sockaddr *dst) {
@@ -388,20 +401,11 @@ static int lookup_tcp_original_from_socket(
 }
 
 static void active_add(struct tcp_worker_state *state, struct tcp_connection *connection) {
-    connection->next = state->active;
-    state->active = connection;
+    tcp_active_list_add(&state->active, connection);
 }
 
 static void active_remove(struct tcp_worker_state *state, struct tcp_connection *connection) {
-    struct tcp_connection **slot = &state->active;
-    while (*slot != NULL) {
-        if (*slot == connection) {
-            *slot = connection->next;
-            connection->next = NULL;
-            return;
-        }
-        slot = &(*slot)->next;
-    }
+    (void)tcp_active_list_remove(&state->active, connection);
 }
 
 static void closed_add(struct tcp_worker_state *state, struct tcp_connection *connection) {
@@ -498,7 +502,7 @@ static void expire_tcp_connections(struct tcp_worker_state *state, uint64_t now_
     state->next_timeout_scan_ms = now_ms + BPF2SOCKS_TCP_TIMEOUT_SCAN_MILLISECONDS;
     const struct bpf2socks_runtime_config *config = state->worker->config;
     for (struct tcp_connection *connection = state->active; connection != NULL;) {
-        struct tcp_connection *next = connection->next;
+        struct tcp_connection *next = connection->active_next;
         bool relay_established = connection->stage == TCP_STAGE_RELAY;
         if (bpf2socks_tcp_connection_timed_out(
                 now_ms,
@@ -935,11 +939,19 @@ static struct tcp_connection *create_connection(
     return connection;
 }
 
-static int client_original_dst(int client_fd, const struct bpf2socks_runtime_config *config, struct bpf2socks_sockaddr *dst) {
+static int client_original_dst(
+    int client_fd,
+    struct bpf2socks_bridge_worker *worker,
+    struct bpf2socks_sockaddr *dst) {
+    const struct bpf2socks_runtime_config *config = worker->config;
     struct bpf2socks_token_key key;
     struct bpf2socks_original_dst original;
     if (fill_tcp_token_key(client_fd, &key) < 0) return -1;
-    if (lookup_original_with_client_fallback(config->token_map_fd, &key, &original) < 0 &&
+    if (lookup_original_with_client_fallback(
+            config->token_map_fd,
+            &key,
+            &original,
+            &worker->stats) < 0 &&
         lookup_tcp_original_from_socket(client_fd, config, &original) < 0) {
         return -1;
     }
@@ -963,7 +975,7 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
         tune_tcp_socket(client, state->worker->config);
 
         struct bpf2socks_sockaddr dst;
-        if (client_original_dst(client, state->worker->config, &dst) < 0) {
+        if (client_original_dst(client, state->worker, &dst) < 0) {
             fprintf(stderr, "missing TCP original destination: errno=%d\n", errno);
             close(client);
             continue;
