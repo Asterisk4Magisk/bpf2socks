@@ -594,6 +594,7 @@ static int stop_with_config(const char *path, const char *pid_path) {
         fclose(file);
     }
     (void)bpf2socks_detach_cgroup_path(config.cgroup_path);
+    bpf2socks_udp6_recovery_cleanup();
     cleanup_fixed_bpf_pins(&config);
     return 0;
 }

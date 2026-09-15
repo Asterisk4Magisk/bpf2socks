@@ -692,4 +692,6 @@ int bpf2socks_reuseport(struct sk_reuseport_md *reuse) {
     return SK_PASS_VALUE;
 }
 
+#include "udp6_recovery.bpf.h"
+
 char _license[] SEC("license") = "GPL";

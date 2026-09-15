@@ -252,6 +252,11 @@ struct bpf2socks_bpf_runtime {
     int tc_original_to_token_map_fd;
     int tc_token_to_original_map_fd;
     int tc_scratch_map_fd;
+    int udp6_recovery_map_fd;
+    int udp6_record_prog_fd;
+    int udp6_recover_prog_fd;
+    bool udp6_recovery_attached;
+    bool udp6_recovery_qdisc_created;
     int reuseport_tcp4_map_fd;
     int reuseport_udp4_map_fd;
     int reuseport_tcp6_map_fd;
@@ -265,11 +270,17 @@ struct bpf2socks_bpf_runtime {
     int udp4_sendmsg_prog_fd;
     int udp6_sendmsg_prog_fd;
     int udp6_v4mapped_sendmsg_prog_fd;
+    int udp4_getpeername_prog_fd;
+    int udp6_getpeername_prog_fd;
     int udp4_recvmsg_prog_fd;
     int udp6_recvmsg_prog_fd;
     int udp6_v4mapped_recvmsg_prog_fd;
     struct bpf2socks_interface_runtime *interfaces;
 };
+
+int bpf2socks_udp6_recovery_start(struct bpf2socks_bpf_runtime *runtime);
+void bpf2socks_udp6_recovery_stop(struct bpf2socks_bpf_runtime *runtime);
+void bpf2socks_udp6_recovery_cleanup(void);
 
 int bpf2socks_load_uid_map(int uid_map_fd, const struct bpf2socks_policy_config *policy);
 int bpf2socks_load_direct_cidrs(int map_fd, const char *path, int expected_family);

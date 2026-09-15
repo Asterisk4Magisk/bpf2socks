@@ -93,6 +93,7 @@ static int resolve_map_fd(
         MAP_BINDING(reuseport_tcp6_map_fd, "reuseport_tcp6"),
         MAP_BINDING(reuseport_udp6_map_fd, "reuseport_udp6"),
         MAP_BINDING(tc_scratch_map_fd, "tc_scratch"),
+        MAP_BINDING(udp6_recovery_map_fd, "udp6_recovery_peers"),
     };
 #undef MAP_BINDING
     for (size_t index = 0U; index < sizeof(bindings) / sizeof(bindings[0]); ++index) {
@@ -167,8 +168,7 @@ static int relocate_maps(
         }
         return 0;
     }
-    errno = ENOEXEC;
-    return -1;
+    return 0; /* A program with no map references has no relocation section. */
 }
 
 static int load_program_section(
@@ -254,6 +254,26 @@ int bpf2socks_load_embedded_tc_programs(
         header->e_machine != EM_BPF) {
         errno = ENOEXEC;
         return -1;
+    }
+    if (policy->enable_ipv6) {
+        int probe = load_program_section(header, bpf2socks_embedded_bpf_object_size,
+            "classifier/udp6_probe", "b2s_u6_probe", BPF_PROG_TYPE_SCHED_CLS,
+            (enum bpf_attach_type)0, runtime, false);
+        if (probe < 0) {
+            fprintf(stderr, "UDP6 disconnect recovery unavailable: TC socket assignment probe errno=%d\n", errno);
+        } else {
+            close(probe);
+            runtime->udp6_recovery_map_fd = bpf2socks_create_map(
+                BPF_MAP_TYPE_LRU_HASH, 20U, 16U, BPF2SOCKS_MAX_UDP_PEER_MAP_ENTRIES, 0U);
+            if (runtime->udp6_recovery_map_fd < 0) return -1;
+            runtime->udp6_record_prog_fd = load_program_section(header, bpf2socks_embedded_bpf_object_size,
+                "classifier/udp6_record", "b2s_u6_record", BPF_PROG_TYPE_SCHED_CLS,
+                (enum bpf_attach_type)0, runtime, log_error);
+            runtime->udp6_recover_prog_fd = load_program_section(header, bpf2socks_embedded_bpf_object_size,
+                "classifier/udp6_recover", "b2s_u6_recover", BPF_PROG_TYPE_SCHED_CLS,
+                (enum bpf_attach_type)0, runtime, log_error);
+            if (runtime->udp6_record_prog_fd < 0 || runtime->udp6_recover_prog_fd < 0) return -1;
+        }
     }
     runtime->tc_ingress_prog_fd = load_program_section(
         header,

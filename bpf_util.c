@@ -465,9 +465,15 @@ int bpf2socks_detach_named_progs(int cgroup_fd) {
         BPF_CGROUP_INET6_CONNECT,
         BPF_CGROUP_UDP6_SENDMSG,
         BPF_CGROUP_UDP6_RECVMSG,
+        BPF_CGROUP_INET4_GETPEERNAME,
+        BPF_CGROUP_INET6_GETPEERNAME,
     };
     for (size_t i = 0; i < sizeof(attach_types) / sizeof(attach_types[0]); ++i) {
         if (bpf2socks_detach_named_for_type(cgroup_fd, attach_types[i]) != 0) {
+            /* These optional hooks are absent on older UDP-capable kernels. */
+            bool optional = attach_types[i] == BPF_CGROUP_INET4_GETPEERNAME ||
+                attach_types[i] == BPF_CGROUP_INET6_GETPEERNAME;
+            if (optional && (errno == EINVAL || errno == EOPNOTSUPP)) continue;
             return -1;
         }
     }
