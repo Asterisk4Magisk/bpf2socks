@@ -13,6 +13,11 @@
 
 #include "tc_token.h"
 
+/* Enhancement module wire contract; proxy marks include routing bits. */
+#define BPF2SOCKS_DNS_MARK_MASK UINT32_C(0x61000000)
+#define BPF2SOCKS_DNS_PROXY_DECISION UINT32_C(0x21000000)
+#define BPF2SOCKS_DNS_DIRECT_MARK UINT32_C(0x41000000)
+
 #define BPF2SOCKS_MAX_UIDS 8192U
 #define BPF2SOCKS_MAX_CIDR_MAP_ENTRIES 512U
 #define BPF2SOCKS_MAX_DIRECT_CIDR_MAP_ENTRIES 32768U
@@ -84,6 +89,7 @@ struct bpf2socks_policy_config {
     bool bypass_direct_cidrs;
     bool enable_ipv6;
     bool enable_dns_hijack;
+    bool enable_dns_enhancement;
     char direct_cidr_path_v4[BPF2SOCKS_MAX_PATH_LEN];
     char direct_cidr_path_v6[BPF2SOCKS_MAX_PATH_LEN];
     uint32_t uids[BPF2SOCKS_MAX_UIDS];
@@ -310,8 +316,7 @@ int bpf2socks_load_prog(
     bool log_error);
 int bpf2socks_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type);
 int bpf2socks_detach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type);
-int bpf2socks_detach_named_progs(int cgroup_fd);
-int bpf2socks_detach_cgroup_path(const char *cgroup_path);
+int bpf2socks_restore_cgroup(int cgroup_fd);
 int bpf2socks_delete_map(int map_fd, const void *key);
 int bpf2socks_pin_fd(int fd, const char *path);
 

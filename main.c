@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "bpf2socks.h"
+#include "bpf_cgroup_owned.h"
 #include "json_util.h"
 
 #include <arpa/inet.h>
@@ -23,6 +24,8 @@
 #define BPF2SOCKS_FD_PER_WORKER_TCP_IPV6 1ULL
 #define BPF2SOCKS_FD_PER_WORKER_UDP 7ULL
 #define BPF2SOCKS_FD_PER_WORKER_UDP_IPV6 2ULL
+
+static bool dns_enhancement_requested;
 
 static void on_signal(int signo) {
     (void)signo;
@@ -230,6 +233,11 @@ static int load_runtime_config(
     policy->bypass_direct_cidrs = bpf2socks_json_bool(policy_json, "bypassDirectCidrs", false);
     policy->enable_ipv6 = config->enable_ipv6;
     policy->enable_dns_hijack = config->enable_dns_hijack;
+    policy->enable_dns_enhancement = dns_enhancement_requested;
+    if (dns_enhancement_requested && !config->enable_dns_hijack) {
+        fprintf(stderr, "DNS enhancement requires DNS interception\n");
+        ok = false;
+    }
     (void)bpf2socks_json_string(
         policy_json,
         "directCidrPathV4",
@@ -412,6 +420,7 @@ static void cleanup_fixed_bpf_pin(
 
 static void cleanup_fixed_bpf_pins(const struct bpf2socks_runtime_config *config) {
     if (config == NULL) return;
+    if (asterisk_cgroup_reconcile(config->cgroup_path, config->pinned_object_dir) != 0) return;
     cleanup_fixed_bpf_pin(config, "tc_ingress");
     cleanup_fixed_bpf_pin(config, "tc_egress");
     cleanup_fixed_bpf_pin(config, "local_addr_v4");
@@ -438,8 +447,10 @@ static int current_open_fd_count(uint64_t *out_count) {
 
 static uint64_t static_fd_reserve(const struct bpf2socks_runtime_config *config, uint32_t worker_count) {
     uint64_t per_worker = BPF2SOCKS_FD_PER_WORKER_TCP + BPF2SOCKS_FD_PER_WORKER_UDP;
-    if (config->enable_ipv6) per_worker += BPF2SOCKS_FD_PER_WORKER_TCP_IPV6;
-    if (config->enable_ipv6) per_worker += BPF2SOCKS_FD_PER_WORKER_UDP_IPV6;
+    if (config->enable_ipv6 || config->enable_dns_hijack) {
+        per_worker += BPF2SOCKS_FD_PER_WORKER_TCP_IPV6;
+        per_worker += BPF2SOCKS_FD_PER_WORKER_UDP_IPV6;
+    }
     return BPF2SOCKS_FD_RUNTIME_RESERVE + BPF2SOCKS_FD_SAFETY_MARGIN + per_worker * worker_count;
 }
 
@@ -593,7 +604,7 @@ static int stop_with_config(const char *path, const char *pid_path) {
         }
         fclose(file);
     }
-    (void)bpf2socks_detach_cgroup_path(config.cgroup_path);
+    if (asterisk_cgroup_reconcile(config.cgroup_path, config.pinned_object_dir) != 0) return 1;
     bpf2socks_udp6_recovery_cleanup();
     cleanup_fixed_bpf_pins(&config);
     return 0;
@@ -698,6 +709,9 @@ static int stats_with_pid(const char *pid_path) {
 }
 
 int main(int argc, char **argv) {
+    for (int index = 1; index < argc; ++index) {
+        if (strcmp(argv[index], "--dns-enhancement") == 0) dns_enhancement_requested = true;
+    }
     if (argc >= 2 && strcmp(argv[1], "--probe") == 0) {
         return probe_with_config(config_path_arg(argc, argv));
     }

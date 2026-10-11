@@ -121,7 +121,7 @@ int bpf2socks_pin_fd(int fd, const char *path) {
     return (int)bpf2socks_bpf_sys(BPF_OBJ_PIN, &attr, sizeof(attr));
 }
 
-static int load_prog_once(
+static int load_prog_with_retry(
     const struct bpf_insn *insns,
     size_t insn_count,
     const char *name,
@@ -143,7 +143,14 @@ static int load_prog_once(
     if (name != NULL) {
         snprintf(attr.prog_name, BPF_OBJ_NAME_LEN, "%s", name);
     }
-    return (int)bpf2socks_bpf_sys(BPF_PROG_LOAD, &attr, sizeof(attr));
+    /* Like libbpf, retry only the verifier's transient EAGAIN. Keep this
+     * bounded; permanent verifier/resource failures must fail startup. */
+    int fd;
+    unsigned retries = 5U;
+    do {
+        fd = (int)bpf2socks_bpf_sys(BPF_PROG_LOAD, &attr, sizeof(attr));
+    } while (fd < 0 && errno == EAGAIN && retries-- > 0U);
+    return fd;
 }
 
 static int retry_without_verifier_log(
@@ -152,7 +159,7 @@ static int retry_without_verifier_log(
     const char *name,
     enum bpf_prog_type prog_type,
     enum bpf_attach_type expected_attach_type) {
-    return load_prog_once(insns, insn_count, name, prog_type, expected_attach_type, NULL, 0U, 0U);
+    return load_prog_with_retry(insns, insn_count, name, prog_type, expected_attach_type, NULL, 0U, 0U);
 }
 
 int bpf2socks_load_prog(
@@ -165,7 +172,7 @@ int bpf2socks_load_prog(
     static char log_buf[BPF2SOCKS_LOG_BUF_SIZE];
     memset(log_buf, 0, sizeof(log_buf));
     uint32_t log_level = log_error ? 1U : 0U;
-    int fd = load_prog_once(
+    int fd = load_prog_with_retry(
         insns,
         insn_count,
         name,
@@ -174,8 +181,7 @@ int bpf2socks_load_prog(
         log_buf,
         sizeof(log_buf),
         log_level);
-    if (fd < 0 && log_error && (errno == EAGAIN || errno == ENOSPC)) {
-        int log_errno = errno;
+    if (fd < 0 && log_error && errno == ENOSPC) {
         fd = retry_without_verifier_log(
             insns,
             insn_count,
@@ -183,312 +189,219 @@ int bpf2socks_load_prog(
             prog_type,
             expected_attach_type);
         if (fd >= 0) return fd;
-        if (errno == EAGAIN || errno == ENOSPC) {
-            errno = log_errno;
-        }
     }
     if (fd < 0 && log_error) {
+        int load_errno = errno;
         fprintf(
             stderr,
             "%s load failed: errno=%d (%s)\nverifier log:\n%s\n",
             name == NULL ? "bpf program" : name,
-            errno,
-            strerror(errno),
+            load_errno,
+            strerror(load_errno),
             log_buf);
+        errno = load_errno;
     }
     return fd;
 }
 
-int bpf2socks_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type) {
+// Attach/detach run serially on the helper's lifecycle thread. Keep references
+// only in this process; never adopt another process's saved recovery state.
+struct exclusive_attachment {
+    bool active;
+    int cgroup_fd;
+    int prog_fd;
+    int original_fd;
+    enum bpf_attach_type type;
+};
+
+static struct exclusive_attachment exclusive_attachments[6];
+
+static bool exclusive_hook(enum bpf_attach_type type) {
+    return type == BPF_CGROUP_INET4_CONNECT || type == BPF_CGROUP_INET6_CONNECT ||
+        type == BPF_CGROUP_UDP4_SENDMSG || type == BPF_CGROUP_UDP6_SENDMSG ||
+        type == BPF_CGROUP_UDP4_RECVMSG || type == BPF_CGROUP_UDP6_RECVMSG;
+}
+
+static int query_exclusive(int cgroup_fd, enum bpf_attach_type type, uint32_t *id) {
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.query.target_fd = (uint32_t)cgroup_fd;
+    attr.query.attach_type = type;
+    attr.query.prog_cnt = 1;
+    attr.query.prog_ids = (uintptr_t)id;
+    if (bpf2socks_bpf_sys(BPF_PROG_QUERY, &attr, sizeof(attr)) < 0) return -1;
+    if (attr.query.attach_flags != 0 || attr.query.prog_cnt != 1 || *id == 0) {
+        errno = EBUSY;
+        return -1;
+    }
+    return 0;
+}
+
+static bool unconditional_allow(int fd, uint32_t id) {
+    const struct bpf_insn expected[] = {
+        {.code = BPF_ALU64 | BPF_MOV | BPF_K, .imm = 1},
+        {.code = BPF_JMP | BPF_EXIT}
+    };
+    struct bpf_insn instructions[2];
+    memset(instructions, 0, sizeof(instructions));
+    struct bpf_prog_info info;
+    memset(&info, 0, sizeof(info));
+    info.xlated_prog_len = sizeof(instructions);
+    info.xlated_prog_insns = (uintptr_t)instructions;
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd = (uint32_t)fd;
+    attr.info.info_len = sizeof(info);
+    attr.info.info = (uintptr_t)&info;
+    return bpf2socks_bpf_sys(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) == 0 &&
+        info.id == id && info.type == BPF_PROG_TYPE_CGROUP_SOCK_ADDR &&
+        info.xlated_prog_len == sizeof(expected) &&
+        memcmp(instructions, expected, sizeof(expected)) == 0;
+}
+
+static int attach_with_flags(int cgroup_fd, int prog_fd, enum bpf_attach_type type, uint32_t flags) {
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.target_fd = (uint32_t)cgroup_fd;
     attr.attach_bpf_fd = (uint32_t)prog_fd;
-    attr.attach_type = attach_type;
-#ifdef BPF_F_ALLOW_MULTI
-    attr.attach_flags = BPF_F_ALLOW_MULTI;
-#else
-    attr.attach_flags = 0U;
-#endif
-    int result = (int)bpf2socks_bpf_sys(BPF_PROG_ATTACH, &attr, sizeof(attr));
-#ifdef BPF_F_ALLOW_MULTI
-    if (result != 0 && (errno == EINVAL || errno == EPERM || errno == ENOTSUP || errno == EOPNOTSUPP)) {
-        memset(&attr, 0, sizeof(attr));
-        attr.target_fd = (uint32_t)cgroup_fd;
-        attr.attach_bpf_fd = (uint32_t)prog_fd;
-        attr.attach_type = attach_type;
-        attr.attach_flags = 0U;
-        result = (int)bpf2socks_bpf_sys(BPF_PROG_ATTACH, &attr, sizeof(attr));
+    attr.attach_type = type;
+    attr.attach_flags = flags;
+    return (int)bpf2socks_bpf_sys(BPF_PROG_ATTACH, &attr, sizeof(attr));
+}
+
+int bpf2socks_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type) {
+    if (attach_with_flags(cgroup_fd, prog_fd, attach_type, BPF_F_ALLOW_MULTI) == 0) return 0;
+    int saved = errno;
+    if ((saved != EPERM && saved != EINVAL && saved != EBUSY) || !exclusive_hook(attach_type)) return -1;
+    struct exclusive_attachment *slot = NULL;
+    for (size_t i = 0; i < sizeof(exclusive_attachments) / sizeof(exclusive_attachments[0]); ++i) {
+        struct exclusive_attachment *entry = &exclusive_attachments[i];
+        if (entry->active && entry->cgroup_fd == cgroup_fd && entry->type == attach_type) {
+            errno = EBUSY;
+            return -1;
+        }
+        if (!entry->active) slot = entry;
     }
-#endif
-    return result;
+    uint32_t id = 0;
+    if (slot == NULL || query_exclusive(cgroup_fd, attach_type, &id) < 0) goto conflict;
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.prog_id = id;
+    int original = (int)bpf2socks_bpf_sys(BPF_PROG_GET_FD_BY_ID, &attr, sizeof(attr));
+    if (original < 0) goto conflict;
+    uint32_t checked_id = 0;
+    if (!unconditional_allow(original, id) ||
+        query_exclusive(cgroup_fd, attach_type, &checked_id) < 0 || checked_id != id) {
+        close(original);
+        goto conflict;
+    }
+    // Exclusive hooks have no compare-and-swap API on these kernels. Recheck
+    // immediately before replacing; concurrent system reattachment remains a
+    // kernel limitation, not something a process-local lock can prevent.
+    if (attach_with_flags(cgroup_fd, prog_fd, attach_type, 0) < 0) {
+        saved = errno;
+        close(original);
+        errno = saved;
+        return -1;
+    }
+    *slot = (struct exclusive_attachment){true, cgroup_fd, prog_fd, original, attach_type};
+    fprintf(stderr, "BPF hook %u: temporarily replaced verified allow-only program id=%u\n",
+        (unsigned)attach_type, id);
+    return 0;
+
+conflict:
+    fprintf(stderr, "BPF hook %u conflict: exclusive program is not a verified allow-only placeholder; preserved\n",
+        (unsigned)attach_type);
+    errno = saved;
+    return -1;
 }
 
 int bpf2socks_detach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type) {
+    if (cgroup_fd < 0 || prog_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+
+    struct bpf_prog_info info;
     union bpf_attr attr;
+    memset(&info, 0, sizeof(info));
+    memset(&attr, 0, sizeof(attr));
+    attr.info.bpf_fd = (uint32_t)prog_fd;
+    attr.info.info_len = sizeof(info);
+    attr.info.info = (uintptr_t)&info;
+    if (bpf2socks_bpf_sys(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) != 0) return -1;
+    if (info.id == 0 || info.type != BPF_PROG_TYPE_CGROUP_SOCK_ADDR) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint32_t ids[64];
+    memset(&attr, 0, sizeof(attr));
+    attr.query.target_fd = (uint32_t)cgroup_fd;
+    attr.query.attach_type = attach_type;
+    attr.query.prog_cnt = sizeof(ids) / sizeof(ids[0]);
+    attr.query.prog_ids = (uintptr_t)ids;
+    if (bpf2socks_bpf_sys(BPF_PROG_QUERY, &attr, sizeof(attr)) != 0) return -1;
+    if (attr.query.prog_cnt > sizeof(ids) / sizeof(ids[0])) {
+        errno = E2BIG;
+        return -1;
+    }
+    int attached = 0;
+    for (uint32_t i = 0; i < attr.query.prog_cnt; ++i) {
+        if (ids[i] == info.id) attached = 1;
+    }
+    for (size_t i = 0; i < sizeof(exclusive_attachments) / sizeof(exclusive_attachments[0]); ++i) {
+        struct exclusive_attachment *entry = &exclusive_attachments[i];
+        if (!entry->active || entry->cgroup_fd != cgroup_fd || entry->prog_fd != prog_fd ||
+            entry->type != attach_type) continue;
+        if (!attached || attr.query.prog_cnt != 1 || attr.query.attach_flags != 0) {
+            fprintf(stderr, "warning: BPF hook %u restoration skipped: attachment changed externally\n", (unsigned)attach_type);
+            close(entry->original_fd);
+            entry->active = false;
+            errno = EBUSY;
+            return -1;
+        }
+        // Restore directly, without first leaving the hook empty.
+        if (attach_with_flags(cgroup_fd, entry->original_fd, attach_type, 0) < 0) {
+            int saved = errno;
+            fprintf(stderr, "warning: BPF hook %u restoration failed: errno=%d\n", (unsigned)attach_type, saved);
+            errno = saved;
+            return -1;
+        }
+        close(entry->original_fd);
+        entry->active = false;
+        return 0;
+    }
+    if (!attached) return 0;
+
+    // Exclusive/OVERRIDE detach can ignore attach_bpf_fd. A loaded FD alone
+    // is not attachment authority, especially during failed-start rollback.
+    if (attr.query.attach_flags != BPF_F_ALLOW_MULTI) {
+        errno = EPERM;
+        return -1;
+    }
     memset(&attr, 0, sizeof(attr));
     attr.target_fd = (uint32_t)cgroup_fd;
-    if (prog_fd >= 0) {
-        attr.attach_bpf_fd = (uint32_t)prog_fd;
-    }
+    attr.attach_bpf_fd = (uint32_t)prog_fd;
     attr.attach_type = attach_type;
     return (int)bpf2socks_bpf_sys(BPF_PROG_DETACH, &attr, sizeof(attr));
 }
 
-static int bpf2socks_prog_fd_by_id(uint32_t prog_id) {
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.prog_id = prog_id;
-    return (int)bpf2socks_bpf_sys(BPF_PROG_GET_FD_BY_ID, &attr, sizeof(attr));
-}
-
-#define BPF2SOCKS_MAX_QUERY_PROGS 64U
-
-struct bpf2socks_prog_identity {
-    uint32_t id;
-    uint32_t type;
-    char name[BPF_OBJ_NAME_LEN];
-    uint8_t tag[BPF_TAG_SIZE];
-};
-
-struct bpf2socks_prog_snapshot_entry {
-    int prog_fd;
-    struct bpf2socks_prog_identity identity;
-};
-
-struct bpf2socks_prog_snapshot {
-    enum bpf_attach_type queried_attach_type;
-    uint32_t prog_count;
-    struct bpf2socks_prog_snapshot_entry entries[BPF2SOCKS_MAX_QUERY_PROGS];
-};
-
-static int bpf2socks_prog_identity(
-    int prog_fd,
-    struct bpf2socks_prog_identity *identity) {
-    if (identity == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-    struct bpf_prog_info info;
-    memset(&info, 0, sizeof(info));
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.info.bpf_fd = (uint32_t)prog_fd;
-    attr.info.info_len = sizeof(info);
-    attr.info.info = (uint64_t)(uintptr_t)&info;
-    if (bpf2socks_bpf_sys(BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) != 0) {
-        return -1;
-    }
-    memset(identity, 0, sizeof(*identity));
-    identity->id = info.id;
-    identity->type = info.type;
-    memcpy(identity->name, info.name, sizeof(identity->name));
-    memcpy(identity->tag, info.tag, sizeof(identity->tag));
-    return 0;
-}
-
-static int bpf2socks_query_prog_ids(
-    int cgroup_fd,
-    enum bpf_attach_type attach_type,
-    uint32_t *prog_ids,
-    uint32_t *prog_count) {
-    if (prog_ids == NULL || prog_count == NULL || *prog_count == 0U) {
-        errno = EINVAL;
-        return -1;
-    }
-    uint32_t capacity = *prog_count;
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.query.target_fd = (uint32_t)cgroup_fd;
-    attr.query.attach_type = attach_type;
-    attr.query.prog_cnt = capacity;
-    attr.query.prog_ids = (uint64_t)(uintptr_t)prog_ids;
-    if (bpf2socks_bpf_sys(BPF_PROG_QUERY, &attr, sizeof(attr)) != 0) {
-        if (errno == ENOSPC || attr.query.prog_cnt > capacity) {
-            errno = E2BIG;
-        }
-        return -1;
-    }
-    if (attr.query.prog_cnt > capacity) {
-        errno = E2BIG;
-        return -1;
-    }
-    *prog_count = attr.query.prog_cnt;
-    return 0;
-}
-
-static void bpf2socks_close_prog_snapshot(struct bpf2socks_prog_snapshot *snapshot) {
-    if (snapshot == NULL) return;
-    for (uint32_t i = 0; i < snapshot->prog_count; ++i) {
-        if (snapshot->entries[i].prog_fd >= 0) {
-            close(snapshot->entries[i].prog_fd);
-            snapshot->entries[i].prog_fd = -1;
-        }
-    }
-}
-
-static int bpf2socks_take_prog_snapshot(
-    int cgroup_fd,
-    enum bpf_attach_type attach_type,
-    struct bpf2socks_prog_snapshot *snapshot) {
-    if (snapshot == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(snapshot, 0, sizeof(*snapshot));
-    for (size_t i = 0; i < BPF2SOCKS_MAX_QUERY_PROGS; ++i) {
-        snapshot->entries[i].prog_fd = -1;
-    }
-    snapshot->queried_attach_type = attach_type;
-
-    uint32_t prog_ids[BPF2SOCKS_MAX_QUERY_PROGS];
-    memset(prog_ids, 0, sizeof(prog_ids));
-    uint32_t prog_count = BPF2SOCKS_MAX_QUERY_PROGS;
-    if (bpf2socks_query_prog_ids(cgroup_fd, attach_type, prog_ids, &prog_count) != 0) {
-        return -1;
-    }
-    snapshot->prog_count = prog_count;
-    for (uint32_t i = 0; i < prog_count; ++i) {
-        int prog_fd = bpf2socks_prog_fd_by_id(prog_ids[i]);
-        if (prog_fd < 0) {
-            int saved_errno = errno;
-            bpf2socks_close_prog_snapshot(snapshot);
-            errno = saved_errno;
-            return -1;
-        }
-        snapshot->entries[i].prog_fd = prog_fd;
-        if (bpf2socks_prog_identity(prog_fd, &snapshot->entries[i].identity) != 0) {
-            int saved_errno = errno;
-            bpf2socks_close_prog_snapshot(snapshot);
-            errno = saved_errno;
-            return -1;
-        }
-        if (snapshot->entries[i].identity.id != prog_ids[i]) {
-            bpf2socks_close_prog_snapshot(snapshot);
-            errno = ESTALE;
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static bool bpf2socks_prog_identity_equal(
-    const struct bpf2socks_prog_identity *left,
-    const struct bpf2socks_prog_identity *right) {
-    return left->id == right->id &&
-        left->type == right->type &&
-        memcmp(left->name, right->name, sizeof(left->name)) == 0 &&
-        memcmp(left->tag, right->tag, sizeof(left->tag)) == 0;
-}
-
-static bool bpf2socks_prog_is_owned(const struct bpf2socks_prog_identity *identity) {
-    return memcmp(identity->name, "b2s_", 4U) == 0;
-}
-
-typedef int (*bpf2socks_detach_prog_fn)(
-    int cgroup_fd,
-    int prog_fd,
-    enum bpf_attach_type attach_type);
-
-static int bpf2socks_detach_owned_snapshot_entries(
-    int cgroup_fd,
-    enum bpf_attach_type attach_type,
-    const struct bpf2socks_prog_snapshot *snapshot,
-    bpf2socks_detach_prog_fn detach_prog) {
-    if (snapshot == NULL || detach_prog == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-    for (uint32_t i = 0; i < snapshot->prog_count; ++i) {
-        if (bpf2socks_prog_is_owned(&snapshot->entries[i].identity) &&
-            detach_prog(cgroup_fd, snapshot->entries[i].prog_fd, attach_type) != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int bpf2socks_detach_named_for_type(int cgroup_fd, enum bpf_attach_type attach_type) {
-    struct bpf2socks_prog_snapshot first;
-    struct bpf2socks_prog_snapshot second;
-    if (bpf2socks_take_prog_snapshot(cgroup_fd, attach_type, &first) != 0) {
-        return -1;
-    }
-    if (bpf2socks_take_prog_snapshot(cgroup_fd, attach_type, &second) != 0) {
-        int saved_errno = errno;
-        bpf2socks_close_prog_snapshot(&first);
-        errno = saved_errno;
-        return -1;
-    }
-
+// Best-effort lifecycle cleanup, while both the cgroup and owned program FDs are
+// still open. Retry pending restoration once and release all saved references.
+int bpf2socks_restore_cgroup(int cgroup_fd) {
     int result = 0;
-    int saved_errno = 0;
-    if (first.queried_attach_type != second.queried_attach_type ||
-        first.prog_count != second.prog_count) {
-        result = -1;
-        saved_errno = ESTALE;
-        goto done;
-    }
-    for (uint32_t i = 0; i < first.prog_count; ++i) {
-        if (!bpf2socks_prog_identity_equal(&first.entries[i].identity, &second.entries[i].identity)) {
+    for (size_t i = 0; i < sizeof(exclusive_attachments) / sizeof(exclusive_attachments[0]); ++i) {
+        struct exclusive_attachment *entry = &exclusive_attachments[i];
+        if (!entry->active || entry->cgroup_fd != cgroup_fd) continue;
+        if (bpf2socks_detach_prog(cgroup_fd, entry->prog_fd, entry->type) < 0) {
+            fprintf(stderr, "warning: BPF hook %u final restoration failed: errno=%d\n", (unsigned)entry->type, errno);
             result = -1;
-            saved_errno = ESTALE;
-            goto done;
+        }
+        if (entry->active) {
+            close(entry->original_fd);
+            entry->active = false;
         }
     }
-    if (bpf2socks_detach_owned_snapshot_entries(
-            cgroup_fd,
-            attach_type,
-            &first,
-            bpf2socks_detach_prog) != 0) {
-        result = -1;
-        saved_errno = errno;
-        goto done;
-    }
-
-done:
-    bpf2socks_close_prog_snapshot(&second);
-    bpf2socks_close_prog_snapshot(&first);
-    if (result != 0) errno = saved_errno;
-    return result;
-}
-
-int bpf2socks_detach_named_progs(int cgroup_fd) {
-    if (cgroup_fd < 0) {
-        errno = EBADF;
-        return -1;
-    }
-    const enum bpf_attach_type attach_types[] = {
-        BPF_CGROUP_INET4_CONNECT,
-        BPF_CGROUP_UDP4_SENDMSG,
-        BPF_CGROUP_UDP4_RECVMSG,
-        BPF_CGROUP_INET6_CONNECT,
-        BPF_CGROUP_UDP6_SENDMSG,
-        BPF_CGROUP_UDP6_RECVMSG,
-        BPF_CGROUP_INET4_GETPEERNAME,
-        BPF_CGROUP_INET6_GETPEERNAME,
-    };
-    for (size_t i = 0; i < sizeof(attach_types) / sizeof(attach_types[0]); ++i) {
-        if (bpf2socks_detach_named_for_type(cgroup_fd, attach_types[i]) != 0) {
-            /* These optional hooks are absent on older UDP-capable kernels. */
-            bool optional = attach_types[i] == BPF_CGROUP_INET4_GETPEERNAME ||
-                attach_types[i] == BPF_CGROUP_INET6_GETPEERNAME;
-            if (optional && (errno == EINVAL || errno == EOPNOTSUPP)) continue;
-            return -1;
-        }
-    }
-    return 0;
-}
-
-int bpf2socks_detach_cgroup_path(const char *cgroup_path) {
-    const char *path = cgroup_path != NULL && cgroup_path[0] != '\0' ? cgroup_path : BPF2SOCKS_DEFAULT_CGROUP_PATH;
-    int cgroup_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (cgroup_fd < 0) return -1;
-    int result = bpf2socks_detach_named_progs(cgroup_fd);
-    int saved_errno = errno;
-    if (close(cgroup_fd) != 0 && result == 0) {
-        return -1;
-    }
-    if (result != 0) errno = saved_errno;
     return result;
 }

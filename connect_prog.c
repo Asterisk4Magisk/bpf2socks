@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "bpf2socks.h"
+#include "bpf_cgroup_owned.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -308,22 +309,79 @@ static void emit_uid_policy(
     }
 }
 
+/* Explicit UID bypass precedes marked DNS for both protocols. Legacy mode keeps
+ * the existing UDP behavior. UID helpers run before loading destinations. */
+static void emit_tcp_dns_forced_bypass(
+    struct bpf_builder *builder,
+    const struct bpf2socks_policy_config *policy,
+    int uid_map_fd,
+    uint8_t protocol,
+    bool protocol_from_context,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count,
+    size_t *drop_jumps,
+    size_t *drop_jump_count) {
+    if (policy == NULL || !policy->enable_dns_hijack) return;
+    size_t skip = (size_t)-1;
+    if (!policy->enable_dns_enhancement && protocol_from_context) {
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
+        skip = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_STREAM, 0));
+    } else if (!policy->enable_dns_enhancement && protocol != BPF2SOCKS_PROTO_TCP) {
+        return;
+    }
+    struct bpf2socks_policy_config bypass_only = *policy;
+    bypass_only.mode = BPF2SOCKS_MODE_GLOBAL;
+    emit_uid_policy(builder, &bypass_only, uid_map_fd, bypass_jumps,
+        bypass_jump_count, drop_jumps, drop_jump_count);
+    if (skip != (size_t)-1) patch_jump(builder, skip, builder->count);
+}
+
+static void emit_dns_enhancement_policy(
+    struct bpf_builder *builder,
+    uint8_t port_reg,
+    size_t *force_proxy_jumps,
+    size_t *force_proxy_jump_count,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    size_t not_dns = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, port_reg, htons(53), 0));
+    emit(builder, BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, sk)));
+    size_t no_sock = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, 0, 0));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_2, offsetof(struct bpf_sock, mark)));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_3, BPF2SOCKS_DNS_MARK_MASK));
+    bypass_jumps[(*bypass_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_3, BPF2SOCKS_DNS_DIRECT_MARK, 0));
+    force_proxy_jumps[(*force_proxy_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_3, BPF2SOCKS_DNS_PROXY_DECISION, 0));
+    patch_jump(builder, no_sock, builder->count);
+    /* Unmarked DNS, including resolver-owned sockets, uses ordinary policy. */
+    patch_jump(builder, not_dns, builder->count);
+}
+
 static void emit_ipv4_dns_force_proxy_policy_from_regs(
     struct bpf_builder *builder,
     const struct bpf2socks_policy_config *policy,
     uint8_t protocol,
     bool protocol_from_context,
     size_t *force_proxy_jumps,
-    size_t *force_proxy_jump_count) {
+    size_t *force_proxy_jump_count,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
     if (policy == NULL || !policy->enable_dns_hijack) return;
+    if (policy->enable_dns_enhancement) {
+        emit_dns_enhancement_policy(builder, BPF_REG_8, force_proxy_jumps,
+            force_proxy_jump_count, bypass_jumps, bypass_jump_count);
+        return;
+    }
 
     if (protocol_from_context) {
         emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
-        size_t not_udp = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
+        size_t tcp_dns = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, SOCK_STREAM, 0));
+        size_t not_dns = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
+        patch_jump(builder, tcp_dns, builder->count);
         force_proxy_jumps[(*force_proxy_jump_count)++] =
             emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_8, htons(53), 0));
-        patch_jump(builder, not_udp, builder->count);
-    } else if (protocol == BPF2SOCKS_PROTO_UDP) {
+        patch_jump(builder, not_dns, builder->count);
+    } else if (protocol == BPF2SOCKS_PROTO_UDP || protocol == BPF2SOCKS_PROTO_TCP) {
         force_proxy_jumps[(*force_proxy_jump_count)++] =
             emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_8, htons(53), 0));
     }
@@ -335,16 +393,25 @@ static void emit_ipv6_dns_force_proxy_policy_from_regs(
     uint8_t protocol,
     bool protocol_from_context,
     size_t *force_proxy_jumps,
-    size_t *force_proxy_jump_count) {
+    size_t *force_proxy_jump_count,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
     if (policy == NULL || !policy->enable_dns_hijack) return;
+    if (policy->enable_dns_enhancement) {
+        emit_dns_enhancement_policy(builder, BPF_REG_5, force_proxy_jumps,
+            force_proxy_jump_count, bypass_jumps, bypass_jump_count);
+        return;
+    }
 
     if (protocol_from_context) {
         emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
-        size_t not_udp = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
+        size_t tcp_dns = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, SOCK_STREAM, 0));
+        size_t not_dns = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
+        patch_jump(builder, tcp_dns, builder->count);
         force_proxy_jumps[(*force_proxy_jump_count)++] =
             emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_5, htons(53), 0));
-        patch_jump(builder, not_udp, builder->count);
-    } else if (protocol == BPF2SOCKS_PROTO_UDP) {
+        patch_jump(builder, not_dns, builder->count);
+    } else if (protocol == BPF2SOCKS_PROTO_UDP || protocol == BPF2SOCKS_PROTO_TCP) {
         force_proxy_jumps[(*force_proxy_jump_count)++] =
             emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_5, htons(53), 0));
     }
@@ -620,7 +687,6 @@ static void emit_udp_peer_cache_restore_v6(
 
 static void emit_ipv4_policy_checks_from_regs(
     struct bpf_builder *builder,
-    const struct bpf2socks_policy_config *policy,
     int proxy_cidr4_map_fd,
     int bypass_private_cidr4_map_fd,
     int local_interface_cidr4_map_fd,
@@ -631,7 +697,6 @@ static void emit_ipv4_policy_checks_from_regs(
     size_t *force_proxy_jump_count,
     size_t *bypass_jumps,
     size_t *bypass_jump_count) {
-    (void)policy;
     bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_7, 0, 0));
 
     emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_7));
@@ -720,7 +785,6 @@ static void emit_ipv4_mapped_ipv6_check_jumps(
 
 static void emit_ipv6_policy_checks(
     struct bpf_builder *builder,
-    const struct bpf2socks_policy_config *policy,
     int proxy_cidr6_map_fd,
     int bypass_private_cidr6_map_fd,
     int local_interface_cidr6_map_fd,
@@ -731,7 +795,6 @@ static void emit_ipv6_policy_checks(
     size_t *force_proxy_jump_count,
     size_t *bypass_jumps,
     size_t *bypass_jump_count) {
-    (void)policy;
     emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_7));
     emit(builder, BPF_ALU64_REG_OP(BPF_OR, BPF_REG_2, BPF_REG_8));
     emit(builder, BPF_ALU64_REG_OP(BPF_OR, BPF_REG_2, BPF_REG_9));
@@ -1033,13 +1096,12 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
         protocol,
         protocol_from_context,
         force_proxy_jumps,
-        &force_proxy_jump_count);
+        &force_proxy_jump_count, bypass_jumps, bypass_jump_count);
     emit_uid_policy(builder, policy, uid_map_fd, bypass_jumps, bypass_jump_count, drop_jumps, drop_jump_count);
     emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V4_ADDR));
     emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V4_PORT));
     emit_ipv4_policy_checks_from_regs(
         builder,
-        policy,
         proxy_cidr4_map_fd,
         bypass_private_cidr4_map_fd,
         local_interface_cidr4_map_fd,
@@ -1264,6 +1326,8 @@ static int build_ipv4_sock_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
+    emit_tcp_dns_forced_bypass(&b, policy, uid_map_fd, protocol, protocol_from_context,
+        bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     if (attach_type == BPF_CGROUP_UDP4_SENDMSG) {
         emit_connected_udp_send_reuse(&b, token_map_fd, false, false);
     }
@@ -1292,7 +1356,7 @@ static int build_ipv4_sock_addr_prog(
         protocol,
         protocol_from_context,
         force_proxy_jumps,
-        &force_proxy_jump_count);
+        &force_proxy_jump_count, bypass_jumps, &bypass_jump_count);
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_SAVED_V4_ADDR));
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8, STACK_SAVED_V4_PORT));
     emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
@@ -1300,7 +1364,6 @@ static int build_ipv4_sock_addr_prog(
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V4_PORT));
     emit_ipv4_policy_checks_from_regs(
         &b,
-        policy,
         proxy_cidr4_map_fd,
         bypass_private_cidr4_map_fd,
         local_interface_cidr4_map_fd,
@@ -1381,6 +1444,8 @@ static int build_ipv6_sock_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
+    emit_tcp_dns_forced_bypass(&b, policy, uid_map_fd, protocol, protocol_from_context,
+        bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     if (attach_type == BPF_CGROUP_UDP6_SENDMSG) {
         emit_connected_udp_send_reuse(&b, token_map_fd, true, true);
         emit_connected_udp_send_reuse(&b, token_map_fd, true, false);
@@ -1455,26 +1520,31 @@ static int build_ipv6_sock_addr_prog(
         protocol,
         protocol_from_context,
         force_proxy_jumps,
-        &force_proxy_jump_count);
-    emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
-    emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V6_WORD0));
-    emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V6_WORD1));
-    emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_10, STACK_SAVED_V6_WORD2));
-    emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, STACK_SAVED_V6_LAST_WORD));
-    emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_10, STACK_SAVED_PORT));
-    emit_ipv6_policy_checks(
-        &b,
-        policy,
-        proxy_cidr6_map_fd,
-        bypass_private_cidr6_map_fd,
-        local_interface_cidr6_map_fd,
-        direct_cidr6_map_fd,
-        ignored_ifindex_map_fd,
-        ignored_route_cidr6_map_fd,
-        force_proxy_jumps,
-        &force_proxy_jump_count,
-        bypass_jumps,
-        &bypass_jump_count);
+        &force_proxy_jump_count, bypass_jumps, &bypass_jump_count);
+    if (!policy->enable_ipv6) {
+        // Explicit resolver decisions above remain eligible; app sockets obey IPv6 policy.
+        bypass_jumps[bypass_jump_count++] =
+            emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+    } else {
+        emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
+        emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V6_WORD0));
+        emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V6_WORD1));
+        emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_10, STACK_SAVED_V6_WORD2));
+        emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, STACK_SAVED_V6_LAST_WORD));
+        emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_10, STACK_SAVED_PORT));
+        emit_ipv6_policy_checks(
+            &b,
+            proxy_cidr6_map_fd,
+            bypass_private_cidr6_map_fd,
+            local_interface_cidr6_map_fd,
+            direct_cidr6_map_fd,
+            ignored_ifindex_map_fd,
+            ignored_route_cidr6_map_fd,
+            force_proxy_jumps,
+            &force_proxy_jump_count,
+            bypass_jumps,
+            &bypass_jump_count);
+    }
     size_t token_input_label = b.count;
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V6_WORD0));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V6_WORD1));
@@ -1547,6 +1617,8 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
+    emit_tcp_dns_forced_bypass(&b, policy, uid_map_fd, protocol, protocol_from_context,
+        bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     if (attach_type == BPF_CGROUP_UDP6_SENDMSG) {
         emit_connected_udp_send_reuse(&b, token_map_fd, true, true);
     }
@@ -1807,10 +1879,21 @@ static int attach_udp_getpeername_prog(
     int *prog_fd,
     bool log_error) {
     enum bpf_attach_type type = ipv6 ? BPF_CGROUP_INET6_GETPEERNAME : BPF_CGROUP_INET4_GETPEERNAME;
-    int capability_fd = load_noop_sock_addr_prog(type, "b2s_ppeer");
+    int capability_fd = load_noop_sock_addr_prog(type, ipv6 ? "b2s_ppeer6" : "b2s_ppeer4");
+    if (log_error && capability_fd >= 0 && asterisk_cgroup_pin(capability_fd, config->pinned_object_dir) != 0) {
+        close_fd(&capability_fd); return -1;
+    }
     int result = capability_fd < 0 ? -1 : bpf2socks_attach_prog(cgroup_fd, capability_fd, type);
     int saved_errno = errno;
-    if (result == 0) (void)bpf2socks_detach_prog(cgroup_fd, capability_fd, type);
+    if (result == 0 && bpf2socks_detach_prog(cgroup_fd, capability_fd, type) != 0) {
+        close_fd(&capability_fd); return -1;
+    }
+    if (log_error && capability_fd >= 0) {
+        char path[BPF2SOCKS_MAX_PATH_LEN];
+        if (asterisk_cgroup_path(path, sizeof(path), config->pinned_object_dir,
+                ipv6 ? "cgroup_peer_cap6" : "cgroup_peer_cap4") != 0 ||
+            (unlink(path) != 0 && errno != ENOENT)) { close_fd(&capability_fd); return -1; }
+    }
     close_fd(&capability_fd);
     if (result < 0) {
         errno = saved_errno;
@@ -1822,6 +1905,7 @@ static int attach_udp_getpeername_prog(
         ? build_udp6_reverse_addr_prog(config, token_map_fd, type, "b2s_upeer6", log_error)
         : build_udp4_reverse_addr_prog(config, token_map_fd, type, "b2s_upeer4", log_error);
     if (*prog_fd < 0) return -1;
+    if (log_error && asterisk_cgroup_pin(*prog_fd, config->pinned_object_dir) != 0) return -1;
     return bpf2socks_attach_prog(cgroup_fd, *prog_fd, type);
 }
 
@@ -1846,6 +1930,15 @@ static int load_constant_prog(
 static int open_cgroup_path(const char *path) {
     const char *actual = path != NULL && path[0] != '\0' ? path : BPF2SOCKS_DEFAULT_CGROUP_PATH;
     return open(actual, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+}
+
+// Cleanup is best-effort: it must not turn a successful capability probe
+// into an unsupported result or replace the original startup failure.
+static void cleanup_probe_attachment(int cgroup_fd, int prog_fd, enum bpf_attach_type type) {
+    if (bpf2socks_detach_prog(cgroup_fd, prog_fd, type) < 0) {
+        fprintf(stderr, "warning: BPF hook %u probe cleanup failed; continuing: errno=%d\n",
+            (unsigned)type, errno);
+    }
 }
 
 int bpf2socks_bpf_probe(
@@ -2009,7 +2102,7 @@ int bpf2socks_bpf_probe(
         snprintf(message, message_size, "cgroup udp4 recvmsg program cannot be loaded: errno=%d", errno);
         goto done;
     }
-    if (policy->enable_ipv6) {
+    if (policy->enable_ipv6 || policy->enable_dns_hijack) {
         connect6_fd = build_ipv6_sock_addr_prog(
             policy,
             config,
@@ -2117,7 +2210,7 @@ int bpf2socks_bpf_probe(
 
     noop_connect4_fd = load_noop_sock_addr_prog(BPF_CGROUP_INET4_CONNECT, "b2s_pconn4");
     noop_udp4_fd = load_noop_sock_addr_prog(BPF_CGROUP_UDP4_SENDMSG, "b2s_pudp4");
-    bool need_connect6_attach = policy->enable_ipv6 || connect6_v4mapped_fd >= 0;
+    bool need_connect6_attach = connect6_fd >= 0 || connect6_v4mapped_fd >= 0;
     bool need_udp6_attach = policy->enable_ipv6 || udp6_fd >= 0 || udp6_recv_fd >= 0;
     if (need_connect6_attach) {
         noop_connect6_fd = load_noop_sock_addr_prog(BPF_CGROUP_INET6_CONNECT, "b2s_pconn6");
@@ -2135,35 +2228,35 @@ int bpf2socks_bpf_probe(
         snprintf(message, message_size, "cgroup connect4 attach is unavailable: errno=%d", errno);
         goto done;
     }
-    (void)bpf2socks_detach_prog(cgroup_fd, noop_connect4_fd, BPF_CGROUP_INET4_CONNECT);
+    cleanup_probe_attachment(cgroup_fd, noop_connect4_fd, BPF_CGROUP_INET4_CONNECT);
     if (bpf2socks_attach_prog(cgroup_fd, noop_udp4_fd, BPF_CGROUP_UDP4_SENDMSG) < 0) {
         snprintf(message, message_size, "cgroup udp4 sendmsg attach is unavailable: errno=%d", errno);
         goto done;
     }
-    (void)bpf2socks_detach_prog(cgroup_fd, noop_udp4_fd, BPF_CGROUP_UDP4_SENDMSG);
+    cleanup_probe_attachment(cgroup_fd, noop_udp4_fd, BPF_CGROUP_UDP4_SENDMSG);
     if (bpf2socks_attach_prog(cgroup_fd, udp4_recv_fd, BPF_CGROUP_UDP4_RECVMSG) < 0) {
         snprintf(message, message_size, "cgroup udp4 recvmsg attach is unavailable: errno=%d", errno);
         goto done;
     }
-    (void)bpf2socks_detach_prog(cgroup_fd, udp4_recv_fd, BPF_CGROUP_UDP4_RECVMSG);
+    cleanup_probe_attachment(cgroup_fd, udp4_recv_fd, BPF_CGROUP_UDP4_RECVMSG);
     if (need_connect6_attach) {
         if (bpf2socks_attach_prog(cgroup_fd, noop_connect6_fd, BPF_CGROUP_INET6_CONNECT) < 0) {
             snprintf(message, message_size, "cgroup connect6 attach is unavailable: errno=%d", errno);
             goto done;
         }
-        (void)bpf2socks_detach_prog(cgroup_fd, noop_connect6_fd, BPF_CGROUP_INET6_CONNECT);
+        cleanup_probe_attachment(cgroup_fd, noop_connect6_fd, BPF_CGROUP_INET6_CONNECT);
     }
     if (need_udp6_attach) {
         if (bpf2socks_attach_prog(cgroup_fd, noop_udp6_fd, BPF_CGROUP_UDP6_SENDMSG) < 0) {
             snprintf(message, message_size, "cgroup udp6 sendmsg attach is unavailable: errno=%d", errno);
             goto done;
         }
-        (void)bpf2socks_detach_prog(cgroup_fd, noop_udp6_fd, BPF_CGROUP_UDP6_SENDMSG);
+        cleanup_probe_attachment(cgroup_fd, noop_udp6_fd, BPF_CGROUP_UDP6_SENDMSG);
         if (bpf2socks_attach_prog(cgroup_fd, udp6_recv_fd, BPF_CGROUP_UDP6_RECVMSG) < 0) {
             snprintf(message, message_size, "cgroup udp6 recvmsg attach is unavailable: errno=%d", errno);
             goto done;
         }
-        (void)bpf2socks_detach_prog(cgroup_fd, udp6_recv_fd, BPF_CGROUP_UDP6_RECVMSG);
+        cleanup_probe_attachment(cgroup_fd, udp6_recv_fd, BPF_CGROUP_UDP6_RECVMSG);
     }
     if (attach_udp_getpeername_prog(config, token_fd, cgroup_fd, false, &udp4_peer_fd, false) < 0 ||
         (need_udp6_attach && attach_udp_getpeername_prog(config, token_fd, cgroup_fd, true, &udp6_peer_fd, false) < 0)) {
@@ -2191,6 +2284,7 @@ int bpf2socks_bpf_probe(
     result = 0;
 
 done:
+    (void)bpf2socks_restore_cgroup(cgroup_fd);
     if (udp4_peer_fd >= 0) (void)bpf2socks_detach_prog(cgroup_fd, udp4_peer_fd, BPF_CGROUP_INET4_GETPEERNAME);
     if (udp6_peer_fd >= 0) (void)bpf2socks_detach_prog(cgroup_fd, udp6_peer_fd, BPF_CGROUP_INET6_GETPEERNAME);
     close_fd(&udp4_peer_fd);
@@ -2460,7 +2554,7 @@ int bpf2socks_bpf_start(
         stage = "open cgroup";
         goto fail;
     }
-    if (bpf2socks_detach_named_progs(runtime->cgroup_fd) < 0) {
+    if (asterisk_cgroup_reconcile(config->cgroup_path, config->pinned_object_dir) < 0) {
         stage = "detach previous cgroup programs";
         goto fail;
     }
@@ -2510,7 +2604,7 @@ int bpf2socks_bpf_start(
         stage = "load cgroup programs";
         goto fail;
     }
-    if (policy->enable_ipv6) {
+    if (policy->enable_ipv6 || policy->enable_dns_hijack) {
         runtime->connect6_prog_fd = build_ipv6_sock_addr_prog(
             policy,
             config,
@@ -2630,6 +2724,16 @@ int bpf2socks_bpf_start(
         stage = "start interface policy";
         goto fail;
     }
+    stage = "pin cgroup program identity";
+    if (runtime->connect4_prog_fd >= 0 && asterisk_cgroup_pin(runtime->connect4_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->connect6_prog_fd >= 0 && asterisk_cgroup_pin(runtime->connect6_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->connect6_v4mapped_prog_fd >= 0 && asterisk_cgroup_pin(runtime->connect6_v4mapped_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->udp4_sendmsg_prog_fd >= 0 && asterisk_cgroup_pin(runtime->udp4_sendmsg_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->udp6_sendmsg_prog_fd >= 0 && asterisk_cgroup_pin(runtime->udp6_sendmsg_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->udp6_v4mapped_sendmsg_prog_fd >= 0 && asterisk_cgroup_pin(runtime->udp6_v4mapped_sendmsg_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->udp4_recvmsg_prog_fd >= 0 && asterisk_cgroup_pin(runtime->udp4_recvmsg_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->udp6_recvmsg_prog_fd >= 0 && asterisk_cgroup_pin(runtime->udp6_recvmsg_prog_fd, config->pinned_object_dir) != 0) goto fail;
+    if (runtime->udp6_v4mapped_recvmsg_prog_fd >= 0 && asterisk_cgroup_pin(runtime->udp6_v4mapped_recvmsg_prog_fd, config->pinned_object_dir) != 0) goto fail;
     if (bpf2socks_attach_prog(runtime->cgroup_fd, runtime->connect4_prog_fd, BPF_CGROUP_INET4_CONNECT) < 0) {
         stage = "attach connect4";
         goto fail;
@@ -2645,7 +2749,7 @@ int bpf2socks_bpf_start(
         stage = "attach udp4 recvmsg";
         goto fail;
     }
-    if (policy->enable_ipv6) {
+    if (policy->enable_ipv6 || policy->enable_dns_hijack) {
         if (bpf2socks_attach_prog(runtime->cgroup_fd, runtime->connect6_prog_fd, BPF_CGROUP_INET6_CONNECT) < 0) {
             stage = "attach connect6";
             goto fail;
@@ -2733,6 +2837,7 @@ void bpf2socks_bpf_stop(struct bpf2socks_bpf_runtime *runtime) {
             (void)bpf2socks_detach_prog(runtime->cgroup_fd, runtime->connect4_prog_fd, BPF_CGROUP_INET4_CONNECT);
         }
     }
+    (void)bpf2socks_restore_cgroup(runtime->cgroup_fd);
     close_fd(&runtime->reuseport_prog_fd);
     close_fd(&runtime->tc_egress_prog_fd);
     close_fd(&runtime->tc_ingress_prog_fd);

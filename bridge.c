@@ -588,7 +588,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
             goto done;
         }
 
-        if (config->enable_ipv6) {
+        if (config->enable_ipv6 || config->enable_dns_hijack) {
             workers[i].udp_listener6_fd = bind_udp6_listener(config);
             if (workers[i].udp_listener6_fd < 0) {
                 fprintf(stderr, "failed to bind bpf2socks UDP6 listener for worker %u: errno=%d\n", i, errno);
@@ -604,7 +604,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
             goto done;
         }
 
-        if (config->enable_ipv6) {
+        if (config->enable_ipv6 || config->enable_dns_hijack) {
             workers[i].tcp_listener6_fd = bind_tcp6_listener(config);
             if (workers[i].tcp_listener6_fd < 0) {
                 fprintf(stderr, "failed to bind bpf2socks TCP6 listener for worker %u: errno=%d\n", i, errno);

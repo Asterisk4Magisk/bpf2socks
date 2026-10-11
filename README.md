@@ -157,6 +157,10 @@ The bridge automatically bypasses its own effective GID so its SOCKS connections
 
 Run as root with a mounted BPF filesystem, a usable cgroup hierarchy, the required BPF program/map/link types, and sufficient file-descriptor limits. The program attempts to raise `RLIMIT_NOFILE` to 65535 and further reduces configured capacities when the available limit is lower.
 
+Cgroup hooks prefer multi-program attachment. If an exclusive attachment blocks it, the six connect/sendmsg/recvmsg hooks may temporarily replace an existing program only when its translated instructions are exactly `r0 = 1; exit`. Unknown programs, unreadable instructions, and other attachment modes remain conflicts. This behavior applies with or without DNS enhancement.
+
+Original program file descriptors remain open for restoration during probe cleanup, failed startup, and graceful shutdown. Restoration attempts to reinstate the original program ID and exclusive flags, and refuses to overwrite an observed external change. Exclusive attachment has no atomic compare-and-replace operation on the supported older kernels, so concurrent external attachment changes cannot be fully excluded. Restoration is best-effort: failures produce warnings and cleanup continues. They do not invalidate a successful capability probe or replace an earlier startup failure. Final cleanup retries pending restoration once and releases saved references even if it fails. Process termination without cleanup cannot restore the original attachment.
+
 The configuration controls pinned objects, cgroup attachment, PID signaling, and traffic interception. Generate it from trusted application state and use an application-specific `pinnedObjectDir`.
 
 ## Parent-project integration

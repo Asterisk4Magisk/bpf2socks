@@ -455,7 +455,8 @@ static int send_raw_udp6_to_client(
     udp->check = htons(udp_ipv6_checksum(binding->original_dst.addr, client->sin6_addr.s6_addr, udp, body, payload_len));
 
     struct sockaddr_in6 destination = *client;
-    destination.sin6_port = htons(IPPROTO_UDP);
+    // The socket uses IPPROTO_RAW; the UDP protocol is in the IPv6 header.
+    destination.sin6_port = 0;
     ssize_t sent = sendto(fd, packet, ip_len, 0, (const struct sockaddr *)&destination, sizeof(destination));
     if (sent == (ssize_t)ip_len) return 0;
     if (sent >= 0) errno = EIO;

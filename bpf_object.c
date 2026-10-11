@@ -255,7 +255,7 @@ int bpf2socks_load_embedded_tc_programs(
         errno = ENOEXEC;
         return -1;
     }
-    if (policy->enable_ipv6) {
+    if (policy->enable_ipv6 || policy->enable_dns_hijack) {
         int probe = load_program_section(header, bpf2socks_embedded_bpf_object_size,
             "classifier/udp6_probe", "b2s_u6_probe", BPF_PROG_TYPE_SCHED_CLS,
             (enum bpf_attach_type)0, runtime, false);
