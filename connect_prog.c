@@ -353,7 +353,7 @@ static void emit_dns_enhancement_policy(
     force_proxy_jumps[(*force_proxy_jump_count)++] =
         emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_3, BPF2SOCKS_DNS_PROXY_DECISION, 0));
     patch_jump(builder, no_sock, builder->count);
-    /* Unmarked DNS, including resolver-owned sockets, uses ordinary policy. */
+    /* Unmarked DNS reaches UID selection; selected DNS then skips CIDR policy. */
     patch_jump(builder, not_dns, builder->count);
 }
 
@@ -1100,6 +1100,10 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
     emit_uid_policy(builder, policy, uid_map_fd, bypass_jumps, bypass_jump_count, drop_jumps, drop_jump_count);
     emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V4_ADDR));
     emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V4_PORT));
+    if (policy->enable_dns_hijack && policy->enable_dns_enhancement) {
+        force_proxy_jumps[force_proxy_jump_count++] =
+            emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_8, htons(53), 0));
+    }
     emit_ipv4_policy_checks_from_regs(
         builder,
         proxy_cidr4_map_fd,
@@ -1362,6 +1366,10 @@ static int build_ipv4_sock_addr_prog(
     emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V4_ADDR));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_10, STACK_SAVED_V4_PORT));
+    if (policy->enable_dns_hijack && policy->enable_dns_enhancement) {
+        force_proxy_jumps[force_proxy_jump_count++] =
+            emit_jump(&b, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_8, htons(53), 0));
+    }
     emit_ipv4_policy_checks_from_regs(
         &b,
         proxy_cidr4_map_fd,
@@ -1522,9 +1530,17 @@ static int build_ipv6_sock_addr_prog(
         force_proxy_jumps,
         &force_proxy_jump_count, bypass_jumps, &bypass_jump_count);
     if (!policy->enable_ipv6) {
-        // Explicit resolver decisions above remain eligible; app sockets obey IPv6 policy.
-        bypass_jumps[bypass_jump_count++] =
-            emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+        if (policy->enable_dns_hijack && policy->enable_dns_enhancement) {
+            // IPv6 off still intercepts selected DNS, matching the legacy DNS scope.
+            bypass_jumps[bypass_jump_count++] =
+                emit_jump(&b, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_5, htons(53), 0));
+            emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
+            force_proxy_jumps[force_proxy_jump_count++] =
+                emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+        } else {
+            bypass_jumps[bypass_jump_count++] =
+                emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+        }
     } else {
         emit_uid_policy(&b, policy, uid_map_fd, bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_10, STACK_SAVED_V6_WORD0));
@@ -1532,6 +1548,10 @@ static int build_ipv6_sock_addr_prog(
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_10, STACK_SAVED_V6_WORD2));
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, STACK_SAVED_V6_LAST_WORD));
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_10, STACK_SAVED_PORT));
+        if (policy->enable_dns_hijack && policy->enable_dns_enhancement) {
+            force_proxy_jumps[force_proxy_jump_count++] =
+                emit_jump(&b, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_5, htons(53), 0));
+        }
         emit_ipv6_policy_checks(
             &b,
             proxy_cidr6_map_fd,
