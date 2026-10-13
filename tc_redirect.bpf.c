@@ -221,7 +221,7 @@ INLINE bool policy4_proxy(__be32 destination, __u8 protocol, __u16 destination_p
     if (protocol == IPPROTO_UDP_VALUE &&
         (destination_port == IKE_PORT || destination_port == NAT_T_PORT)) return false;
     if ((flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) != 0U &&
-        protocol == IPPROTO_UDP_VALUE && destination_port == 53U) {
+        (protocol == IPPROTO_TCP_VALUE || protocol == IPPROTO_UDP_VALUE) && destination_port == 53U) {
         return true;
     }
     struct bpf2socks_lpm4_key_bpf key = {.prefixlen = 32U, .addr = destination};
@@ -239,7 +239,7 @@ INLINE bool policy6_proxy(const __u8 destination[16], __u8 protocol, __u16 desti
     if (protocol == IPPROTO_UDP_VALUE &&
         (destination_port == IKE_PORT || destination_port == NAT_T_PORT)) return false;
     if ((flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) != 0U &&
-        protocol == IPPROTO_UDP_VALUE && destination_port == 53U) {
+        (protocol == IPPROTO_TCP_VALUE || protocol == IPPROTO_UDP_VALUE) && destination_port == 53U) {
         return true;
     }
     struct bpf2socks_lpm6_key_bpf key = {.prefixlen = 128U};
@@ -541,13 +541,14 @@ INLINE int ingress6(
     struct ipv6_header *ip,
     void *data_end,
     const struct bpf2socks_tc_runtime_control *control) {
-    if ((control->flags & BPF2SOCKS_TC_RUNTIME_IPV6) == 0U) return TC_ACT_PIPE;
     if ((swap32(ip->version_flow) >> 28U) != 6U) return TC_ACT_SHOT;
     if (ip->next_header != IPPROTO_TCP_VALUE && ip->next_header != IPPROTO_UDP_VALUE) return TC_ACT_PIPE;
     if ((void *)(ip + 1) + sizeof(struct transport_ports) > data_end) return TC_ACT_SHOT;
     if (ipv6_in_token_prefix(ip->destination, control->token_ipv6_prefix)) return TC_ACT_SHOT;
     struct transport_ports *ports = (void *)(ip + 1);
     __u16 destination_port = swap16(ports->destination);
+    if ((control->flags & BPF2SOCKS_TC_RUNTIME_IPV6) == 0U &&
+        ((control->flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) == 0U || destination_port != 53U)) return TC_ACT_PIPE;
     if (!policy6_proxy(ip->destination, ip->next_header, destination_port, control->flags)) return TC_ACT_PIPE;
 
     __u32 zero = 0U;
@@ -585,7 +586,7 @@ INLINE int egress6(
     struct ipv6_header *ip,
     void *data_end,
     const struct bpf2socks_tc_runtime_control *control) {
-    if ((control->flags & BPF2SOCKS_TC_RUNTIME_IPV6) == 0U) return TC_ACT_PIPE;
+    if ((control->flags & (BPF2SOCKS_TC_RUNTIME_IPV6 | BPF2SOCKS_TC_RUNTIME_DNS_HIJACK)) == 0U) return TC_ACT_PIPE;
     if ((swap32(ip->version_flow) >> 28U) != 6U) return TC_ACT_SHOT;
     if (!ipv6_in_token_prefix(ip->source, control->token_ipv6_prefix)) return TC_ACT_PIPE;
     if (ip->next_header != IPPROTO_TCP_VALUE && ip->next_header != IPPROTO_UDP_VALUE) return TC_ACT_SHOT;

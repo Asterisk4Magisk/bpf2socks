@@ -23,6 +23,7 @@
 #define BPF2SOCKS_MAX_INLINE_BYPASS_UIDS 16U
 #define BPF2SOCKS_IKE_PORT 500U
 #define BPF2SOCKS_NAT_T_PORT 4500U
+#define BPF2SOCKS_DNS_TETHER_UID 1052U
 /* BPF_MAP_TYPE_LRU_HASH. Android NDK headers expose it as an enum, not a preprocessor macro. */
 #define BPF2SOCKS_TOKEN_MAP_TYPE 9U
 
@@ -353,7 +354,18 @@ static void emit_dns_enhancement_policy(
     force_proxy_jumps[(*force_proxy_jump_count)++] =
         emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_3, BPF2SOCKS_DNS_PROXY_DECISION, 0));
     patch_jump(builder, no_sock, builder->count);
-    /* Unmarked DNS reaches UID selection; selected DNS then skips CIDR policy. */
+    /* Match the iptables DNS exception after explicit marks and forced bypasses.
+     * UDP sendmsg hooks also see UDP-Lite, which is not DNS over UDP. */
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, protocol)));
+    size_t tcp_dns = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, BPF2SOCKS_PROTO_TCP, 0));
+    size_t not_dns_protocol = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, BPF2SOCKS_PROTO_UDP, 0));
+    patch_jump(builder, tcp_dns, builder->count);
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_current_uid_gid));
+    emit(builder, BPF_MOV32_REG(BPF_REG_0, BPF_REG_0));
+    force_proxy_jumps[(*force_proxy_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, BPF2SOCKS_DNS_TETHER_UID, 0));
+    patch_jump(builder, not_dns_protocol, builder->count);
+    /* Other unmarked DNS reaches UID selection and then skips CIDR policy. */
     patch_jump(builder, not_dns, builder->count);
 }
 
@@ -400,6 +412,9 @@ static void emit_ipv6_dns_force_proxy_policy_from_regs(
     if (policy->enable_dns_enhancement) {
         emit_dns_enhancement_policy(builder, BPF_REG_5, force_proxy_jumps,
             force_proxy_jump_count, bypass_jumps, bypass_jump_count);
+        /* The UID helper clobbers R1-R5; the caller saved the IPv6 destination. */
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_10, STACK_SAVED_V6_LAST_WORD));
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_10, STACK_SAVED_PORT));
         return;
     }
 
