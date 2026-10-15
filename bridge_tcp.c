@@ -63,6 +63,16 @@ enum tcp_side {
 
 struct tcp_connection;
 
+/* Empty relay pipes kept per worker so new relays skip pipe2/F_SETPIPE_SZ. */
+#define BPF2SOCKS_TCP_PIPE_POOL_CAP 16U
+
+struct tcp_pipe_pool {
+    int read_fds[BPF2SOCKS_TCP_PIPE_POOL_CAP];
+    int write_fds[BPF2SOCKS_TCP_PIPE_POOL_CAP];
+    size_t capacities[BPF2SOCKS_TCP_PIPE_POOL_CAP];
+    size_t count;
+};
+
 struct tcp_fd_ref {
     struct tcp_connection *connection;
     enum tcp_side side;
@@ -88,6 +98,7 @@ struct tcp_connection {
     bool session_reserved;
     bool request_pipelined;
     struct bpf2socks_bridge_worker *worker;
+    struct tcp_pipe_pool *pipe_pool;
     struct tcp_fd_ref client_ref;
     struct tcp_fd_ref upstream_ref;
     struct tcp_splice_pipe client_to_upstream;
@@ -115,6 +126,7 @@ struct tcp_worker_state {
     struct tcp_fd_ref listener6_ref;
     struct tcp_connection *active;
     struct tcp_connection *closed;
+    struct tcp_pipe_pool pipe_pool;
     /* Earliest connect/idle deadline; activity only moves deadlines later. */
     uint64_t next_deadline_ms;
     uint64_t next_stats_publish_ms;
@@ -444,7 +456,18 @@ static void init_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     pipe_state->output_shutdown = false;
 }
 
-static int open_splice_pipe(struct tcp_splice_pipe *pipe_state) {
+static int open_splice_pipe(struct tcp_pipe_pool *pool, struct tcp_splice_pipe *pipe_state) {
+    if (pool != NULL && pool->count > 0U) {
+        --pool->count;
+        pipe_state->read_fd = pool->read_fds[pool->count];
+        pipe_state->write_fd = pool->write_fds[pool->count];
+        pipe_state->capacity = pool->capacities[pool->count];
+        pipe_state->queued = 0U;
+        pipe_state->input_eof = false;
+        pipe_state->input_paused = false;
+        pipe_state->output_shutdown = false;
+        return 0;
+    }
     int fds[2] = {-1, -1};
     if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
     pipe_state->read_fd = fds[0];
@@ -472,9 +495,31 @@ static void close_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     pipe_state->output_shutdown = true;
 }
 
+/* Only a pipe known to be empty may be reused; anything else is closed. */
+static void release_splice_pipe(struct tcp_pipe_pool *pool, struct tcp_splice_pipe *pipe_state) {
+    if (pool != NULL && pipe_state->read_fd >= 0 && pipe_state->write_fd >= 0 &&
+        pipe_state->queued == 0U && pool->count < BPF2SOCKS_TCP_PIPE_POOL_CAP) {
+        pool->read_fds[pool->count] = pipe_state->read_fd;
+        pool->write_fds[pool->count] = pipe_state->write_fd;
+        pool->capacities[pool->count] = pipe_state->capacity;
+        ++pool->count;
+        pipe_state->read_fd = -1;
+        pipe_state->write_fd = -1;
+    }
+    close_splice_pipe(pipe_state);
+}
+
+static void close_pipe_pool(struct tcp_pipe_pool *pool) {
+    while (pool->count > 0U) {
+        --pool->count;
+        close(pool->read_fds[pool->count]);
+        close(pool->write_fds[pool->count]);
+    }
+}
+
 static int init_connection_splice_pipes(struct tcp_connection *connection) {
-    if (open_splice_pipe(&connection->client_to_upstream) != 0) return -1;
-    if (open_splice_pipe(&connection->upstream_to_client) != 0) {
+    if (open_splice_pipe(connection->pipe_pool, &connection->client_to_upstream) != 0) return -1;
+    if (open_splice_pipe(connection->pipe_pool, &connection->upstream_to_client) != 0) {
         close_splice_pipe(&connection->client_to_upstream);
         return -1;
     }
@@ -485,8 +530,8 @@ static void free_connection(struct tcp_connection *connection) {
     if (connection == NULL) return;
     close_fd_if_open(&connection->client_fd);
     close_fd_if_open(&connection->upstream_fd);
-    close_splice_pipe(&connection->client_to_upstream);
-    close_splice_pipe(&connection->upstream_to_client);
+    release_splice_pipe(connection->pipe_pool, &connection->client_to_upstream);
+    release_splice_pipe(connection->pipe_pool, &connection->upstream_to_client);
     free(connection);
 }
 
@@ -1052,6 +1097,7 @@ static struct tcp_connection *create_connection(
     init_splice_pipe(&connection->client_to_upstream);
     init_splice_pipe(&connection->upstream_to_client);
     connection->worker = state->worker;
+    connection->pipe_pool = &state->pipe_pool;
     connection->created_at_ms = monotonic_ms();
     connection->last_activity_ms = connection->created_at_ms;
     connection->client_ref.connection = connection;
@@ -1461,6 +1507,7 @@ int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
     }
 
     close_all_active(&state);
+    close_pipe_pool(&state.pipe_pool);
     publish_tcp_stats_if_due(&state, monotonic_ms(), true);
     close_fd_if_open(&state.spare_fd);
     close(epoll_fd);
