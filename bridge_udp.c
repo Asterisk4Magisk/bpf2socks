@@ -164,7 +164,24 @@ struct bpf2socks_udp_downlink_channel {
     bool raw;
 };
 
+/*
+ * Per-worker cache of token map lookups. Tokens are stable per connected UDP
+ * socket, per TC hotspot flow, and per flow for sendmsg() tokens, so most
+ * datagrams can skip the bpf() syscall. A short lifetime bounds how long a
+ * token that the kernel evicted and reassigned could be misresolved.
+ */
+#define BPF2SOCKS_UDP_TOKEN_CACHE_SIZE 4096U
+#define BPF2SOCKS_UDP_TOKEN_CACHE_TTL_MS 1000U
+
+struct udp_token_cache_entry {
+    struct bpf2socks_token_key key;
+    struct bpf2socks_original_dst original;
+    uint64_t expires_ms;
+    enum bpf2socks_udp_token_lookup_mode mode;
+};
+
 struct udp_state {
+    struct udp_token_cache_entry *token_cache;
     struct bpf2socks_udp_client_session *sessions;
     struct bpf2socks_udp_client_session *free_sessions;
     struct bpf2socks_udp_reply_binding *bindings;
@@ -1875,10 +1892,23 @@ static struct bpf2socks_udp_client_session *get_session(
     return session;
 }
 
+static struct udp_token_cache_entry *udp_token_cache_slot(
+    struct udp_state *state,
+    const struct bpf2socks_token_key *key) {
+    if (state->token_cache == NULL) {
+        state->token_cache = calloc(BPF2SOCKS_UDP_TOKEN_CACHE_SIZE, sizeof(*state->token_cache));
+        if (state->token_cache == NULL) return NULL;
+    }
+    uint32_t hash = bpf2socks_hash_bytes(key, sizeof(*key));
+    return &state->token_cache[hash & (BPF2SOCKS_UDP_TOKEN_CACHE_SIZE - 1U)];
+}
+
 static int lookup_udp_original(
+    struct udp_state *state,
     struct bpf2socks_bridge_worker *worker,
     struct udp_client_packet *packet,
-    enum bpf2socks_udp_token_lookup_mode preference) {
+    enum bpf2socks_udp_token_lookup_mode preference,
+    uint64_t now_ms) {
     const struct bpf2socks_runtime_config *config = worker->config;
     struct bpf2socks_token_key key;
     struct bpf2socks_original_dst original;
@@ -1895,6 +1925,14 @@ static int lookup_udp_original(
         const struct sockaddr_in6 *client = (const struct sockaddr_in6 *)&packet->client_addr;
         key.client_port = ntohs(client->sin6_port);
         memcpy(key.client_addr, &client->sin6_addr, 16);
+    }
+    struct udp_token_cache_entry *cached = udp_token_cache_slot(state, &key);
+    if (cached != NULL && cached->expires_ms > now_ms &&
+        memcmp(&cached->key, &key, sizeof(key)) == 0) {
+        packet->token_lookup_mode = cached->mode;
+        packet->connected_udp_token =
+            (cached->original.flags & BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP) != 0U;
+        return original_to_sockaddr(&cached->original, &packet->original_dst);
     }
     struct bpf2socks_udp_token_lookup_trace trace;
     int lookup_result = bpf2socks_udp_token_lookup_adaptive(
@@ -1923,6 +1961,12 @@ static int lookup_udp_original(
     packet->token_lookup_mode = trace.matched_mode;
     packet->connected_udp_token =
         (original.flags & BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP) != 0U;
+    if (cached != NULL && now_ms != 0U) {
+        cached->key = key;
+        cached->original = original;
+        cached->mode = trace.matched_mode;
+        cached->expires_ms = now_ms + BPF2SOCKS_UDP_TOKEN_CACHE_TTL_MS;
+    }
     return original_to_sockaddr(&original, &packet->original_dst);
 }
 
@@ -2962,7 +3006,7 @@ static void handle_udp_client_packets(
         enum bpf2socks_udp_token_lookup_mode preference = existing_session != NULL
             ? existing_session->token_lookup_mode
             : BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN;
-        if (parse_result < 0 || lookup_udp_original(worker, &packet, preference) < 0) {
+        if (parse_result < 0 || lookup_udp_original(state, worker, &packet, preference, now_ms) < 0) {
             ++worker->stats.udp_token_misses;
             fprintf(stderr, "missing UDP original destination: errno=%d\n", errno);
             continue;
@@ -3423,6 +3467,7 @@ static void free_state(struct udp_state *state) {
     free(state->bindings);
     free(state->sessions);
     bpf2socks_dns_table_free(&state->dns_table);
+    free(state->token_cache);
     memset(state, 0, sizeof(*state));
 }
 
