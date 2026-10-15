@@ -36,7 +36,8 @@
 
 #define BPF2SOCKS_TCP_EVENTS 256
 #define BPF2SOCKS_TCP_HANDSHAKE_CAP 32U
-#define BPF2SOCKS_TCP_RESPONSE_CAP 262U
+/* Method reply (2) plus the largest CONNECT reply (4 + 1 + 255 + 2). */
+#define BPF2SOCKS_TCP_RESPONSE_CAP 264U
 #define BPF2SOCKS_TCP_SPLICE_CHUNK 65536U
 #define BPF2SOCKS_TCP_RELAY_EVENTS (EPOLLERR | EPOLLHUP | EPOLLRDHUP)
 #define BPF2SOCKS_TCP_STATS_PUBLISH_MILLISECONDS 250U
@@ -946,6 +947,82 @@ static int read_connect_response(struct tcp_connection *connection) {
     return 0;
 }
 
+/* Length of the method reply plus CONNECT reply, 0 if unknown yet, SIZE_MAX if malformed. */
+static size_t pipelined_reply_length(const uint8_t *response, size_t length) {
+    if (length < 2U + 4U) return 0U;
+    switch (response[5]) {
+        case 0x01:
+            return 2U + 10U;
+        case 0x04:
+            return 2U + 22U;
+        case 0x03:
+            return length < 7U ? 0U : 2U + 4U + 1U + response[6] + 2U;
+        default:
+            return SIZE_MAX;
+    }
+}
+
+/*
+ * The hello and CONNECT request were pipelined, so read both replies with as
+ * few recv() calls as possible. Bytes past the replies are early upstream
+ * payload; they are queued into the upstream-to-client pipe.
+ */
+static int read_pipelined_replies(struct tcp_connection *connection) {
+    for (;;) {
+        size_t room = sizeof(connection->response) - connection->response_length;
+        if (room == 0U) {
+            errno = EPROTO;
+            return -1;
+        }
+        ssize_t received = recv(
+            connection->upstream_fd,
+            connection->response + connection->response_length,
+            room,
+            MSG_DONTWAIT);
+        if (received < 0 && errno == EINTR) continue;
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        if (received <= 0) return -1;
+        connection->response_length += (size_t)received;
+        connection_touch(connection);
+
+        const uint8_t *response = connection->response;
+        size_t length = connection->response_length;
+        if (length >= 2U && (response[0] != 0x05 || response[1] != 0x00)) {
+            errno = EPROTO;
+            return -1;
+        }
+        size_t needed = pipelined_reply_length(response, length);
+        if (needed == SIZE_MAX || (length >= 4U && (response[2] != 0x05 || response[3] != 0x00))) {
+            errno = EPROTO;
+            return -1;
+        }
+        if (needed != 0U && length >= needed) {
+            connection->response_expected = needed;
+            return 1;
+        }
+        /* A short read drained the socket; wait for the rest. */
+        if ((size_t)received < room) return 0;
+    }
+}
+
+static int finish_pipelined_replies(struct tcp_connection *connection) {
+    if (init_connection_splice_pipes(connection) < 0) return -1;
+    size_t extra = connection->response_length - connection->response_expected;
+    if (extra > 0U) {
+        ssize_t written = write(
+            connection->upstream_to_client.write_fd,
+            connection->response + connection->response_expected,
+            extra);
+        if (written != (ssize_t)extra) {
+            if (written >= 0) errno = EIO;
+            return -1;
+        }
+        connection->upstream_to_client.queued += extra;
+    }
+    connection->stage = TCP_STAGE_RELAY;
+    return 0;
+}
+
 static struct tcp_connection *create_connection(
     struct tcp_worker_state *state,
     int client_fd,
@@ -1211,7 +1288,12 @@ static void handle_upstream_handshake(
         result = flush_handshake(connection);
     }
     if (result == 0 && connection->stage == TCP_STAGE_HELLO_READ && (events & EPOLLIN) != 0) {
-        result = read_hello_and_build_request(connection, &connection->target);
+        if (connection->request_pipelined) {
+            result = read_pipelined_replies(connection);
+            result = result > 0 ? finish_pipelined_replies(connection) : result;
+        } else {
+            result = read_hello_and_build_request(connection, &connection->target);
+        }
     }
     if (result == 0 && connection->stage == TCP_STAGE_RESPONSE_READ && (events & EPOLLIN) != 0) {
         result = read_connect_response(connection);
