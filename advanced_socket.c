@@ -8,13 +8,11 @@
 #include <arpa/inet.h>
 #include <asm/unistd.h>
 #include <errno.h>
-#include <linux/io_uring.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -30,12 +28,6 @@
 #endif
 #ifndef TCP_CORK
 #define TCP_CORK 3
-#endif
-#ifndef UDP_SEGMENT
-#define UDP_SEGMENT 103
-#endif
-#ifndef UDP_GRO
-#define UDP_GRO 104
 #endif
 static void set_probe_message(char *message, size_t message_size, const char *feature, int error) {
     if (message == NULL || message_size == 0U) return;
@@ -68,73 +60,6 @@ static int probe_setsockopt(
     return 0;
 }
 
-static int probe_udp_segment_sendmsg(char *message, size_t message_size) {
-    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        set_probe_message(message, message_size, "UDP_SEGMENT cmsg", errno);
-        return -1;
-    }
-
-    struct sockaddr_in dst;
-    memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(9);
-    (void)inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr);
-
-    uint8_t payload[2400];
-    memset(payload, 0x51, sizeof(payload));
-    struct iovec iov = {
-        .iov_base = payload,
-        .iov_len = sizeof(payload),
-    };
-
-    char control[CMSG_SPACE(sizeof(uint16_t))];
-    memset(control, 0, sizeof(control));
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_name = &dst;
-    msg.msg_namelen = sizeof(dst);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1U;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = IPPROTO_UDP;
-    cmsg->cmsg_type = UDP_SEGMENT;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
-    uint16_t segment = 1200U;
-    memcpy(CMSG_DATA(cmsg), &segment, sizeof(segment));
-
-    ssize_t sent = sendmsg(fd, &msg, 0);
-    int saved = errno;
-    close(fd);
-    if (sent != (ssize_t)sizeof(payload)) {
-        errno = saved;
-        set_probe_message(message, message_size, "UDP_SEGMENT cmsg", errno);
-        return -1;
-    }
-    return 0;
-}
-
-static int probe_io_uring_setup(char *message, size_t message_size) {
-#ifdef __NR_io_uring_setup
-    struct io_uring_params params;
-    memset(&params, 0, sizeof(params));
-    int fd = (int)syscall(__NR_io_uring_setup, 2U, &params);
-    if (fd < 0) {
-        set_probe_message(message, message_size, "__NR_io_uring_setup", errno);
-        return -1;
-    }
-    close(fd);
-    return 0;
-#else
-    errno = ENOSYS;
-    set_probe_message(message, message_size, "__NR_io_uring_setup", errno);
-    return -1;
-#endif
-}
-
 int bpf2socks_advanced_socket_probe(char *message, size_t message_size) {
     if (message != NULL && message_size > 0U) message[0] = '\0';
     if (probe_setsockopt(
@@ -158,14 +83,6 @@ int bpf2socks_advanced_socket_probe(char *message, size_t message_size) {
     if (probe_setsockopt("TCP_CORK", AF_INET, SOCK_STREAM, 0, IPPROTO_TCP, TCP_CORK, 1, message, message_size) < 0) {
         return -1;
     }
-    if (probe_setsockopt("UDP_SEGMENT", AF_INET, SOCK_DGRAM, 0, IPPROTO_UDP, UDP_SEGMENT, 1200, message, message_size) < 0) {
-        return -1;
-    }
-    if (probe_udp_segment_sendmsg(message, message_size) < 0) return -1;
-    if (probe_setsockopt("UDP_GRO", AF_INET, SOCK_DGRAM, 0, IPPROTO_UDP, UDP_GRO, 1, message, message_size) < 0) {
-        return -1;
-    }
-    if (probe_io_uring_setup(message, message_size) < 0) return -1;
     if (message != NULL && message_size > 0U) snprintf(message, message_size, "ok");
     return 0;
 }
@@ -179,8 +96,45 @@ void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream) {
     }
 }
 
-void bpf2socks_bridge_tune_udp_advanced(int fd) {
-    (void)fd;
+static bool sockaddr_is_loopback(const struct sockaddr *addr, socklen_t addr_len) {
+    if (addr->sa_family == AF_INET && addr_len >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+        return (ntohl(in->sin_addr.s_addr) >> 24) == 127U;
+    }
+    if (addr->sa_family == AF_INET6 && addr_len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)addr;
+        return IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr);
+    }
+    return false;
+}
+
+/*
+ * Bionic routes connect() through libnetd_client, which performs a blocking
+ * FwmarkServer round trip per call. A loopback SOCKS upstream needs no
+ * network selection mark, so issue the syscall directly for it and keep the
+ * libc path for every other destination.
+ */
+int bpf2socks_bridge_connect(int fd, const struct sockaddr *addr, socklen_t addr_len) {
+#ifdef __NR_connect
+    if (addr != NULL && sockaddr_is_loopback(addr, addr_len)) {
+        return (int)syscall(__NR_connect, fd, addr, addr_len);
+    }
+#endif
+    return connect(fd, addr, addr_len);
+}
+
+/*
+ * Bionic's accept4() also performs a blocking FwmarkServer round trip
+ * (ON_ACCEPT) that only adds permission and billing bits to the mark. Replies
+ * from the bridge's accepted sockets route over loopback or the hotspot's
+ * local network, neither of which depends on those bits.
+ */
+int bpf2socks_bridge_accept4(int fd, int flags) {
+#ifdef __NR_accept4
+    return (int)syscall(__NR_accept4, fd, NULL, NULL, flags);
+#else
+    return accept4(fd, NULL, NULL, flags);
+#endif
 }
 
 void bpf2socks_bridge_enable_tcp_fastopen_listener(int fd) {

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -38,7 +39,6 @@
 #define BPF2SOCKS_TCP_RESPONSE_CAP 262U
 #define BPF2SOCKS_TCP_SPLICE_CHUNK 65536U
 #define BPF2SOCKS_TCP_RELAY_EVENTS (EPOLLERR | EPOLLHUP | EPOLLRDHUP)
-#define BPF2SOCKS_TCP_TIMEOUT_SCAN_MILLISECONDS 1000U
 #define BPF2SOCKS_TCP_STATS_PUBLISH_MILLISECONDS 250U
 
 enum tcp_stage {
@@ -70,6 +70,7 @@ struct tcp_splice_pipe {
     int write_fd;
     size_t queued;
     bool input_eof;
+    bool input_paused;
     bool output_shutdown;
 };
 
@@ -108,7 +109,8 @@ struct tcp_worker_state {
     struct tcp_fd_ref listener6_ref;
     struct tcp_connection *active;
     struct tcp_connection *closed;
-    uint64_t next_timeout_scan_ms;
+    /* Earliest connect/idle deadline; activity only moves deadlines later. */
+    uint64_t next_deadline_ms;
     uint64_t next_stats_publish_ms;
     uint64_t listeners_resume_ms;
     int spare_fd;
@@ -418,6 +420,7 @@ static void init_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     pipe_state->write_fd = -1;
     pipe_state->queued = 0U;
     pipe_state->input_eof = false;
+    pipe_state->input_paused = false;
     pipe_state->output_shutdown = false;
 }
 
@@ -428,6 +431,7 @@ static int open_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     pipe_state->write_fd = fds[1];
     pipe_state->queued = 0U;
     pipe_state->input_eof = false;
+    pipe_state->input_paused = false;
     pipe_state->output_shutdown = false;
     return 0;
 }
@@ -437,6 +441,7 @@ static void close_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     close_fd_if_open(&pipe_state->write_fd);
     pipe_state->queued = 0U;
     pipe_state->input_eof = true;
+    pipe_state->input_paused = false;
     pipe_state->output_shutdown = true;
 }
 
@@ -461,6 +466,8 @@ static void free_connection(struct tcp_connection *connection) {
 static void free_closed_connections(struct tcp_worker_state *state) {
     struct tcp_connection *connection = state->closed;
     state->closed = NULL;
+    /* Closing connections frees descriptors: retry paused listeners right away. */
+    if (connection != NULL && state->listeners_paused) state->listeners_resume_ms = 0U;
     while (connection != NULL) {
         struct tcp_connection *next = connection->next;
         free_connection(connection);
@@ -495,11 +502,31 @@ static void close_all_active(struct tcp_worker_state *state) {
     free_closed_connections(state);
 }
 
+static uint64_t connection_deadline(
+    const struct bpf2socks_runtime_config *config,
+    const struct tcp_connection *connection) {
+    if (connection->stage != TCP_STAGE_RELAY) {
+        if (connection->created_at_ms == 0U || config->tcp_connect_timeout_milliseconds == 0U) {
+            return BPF2SOCKS_NO_DEADLINE;
+        }
+        return connection->created_at_ms + config->tcp_connect_timeout_milliseconds;
+    }
+    if (connection->last_activity_ms == 0U || config->tcp_idle_timeout_milliseconds == 0U) {
+        return BPF2SOCKS_NO_DEADLINE;
+    }
+    return connection->last_activity_ms + config->tcp_idle_timeout_milliseconds;
+}
+
+static void note_connection_deadline(struct tcp_worker_state *state, const struct tcp_connection *connection) {
+    if (connection == NULL || connection->closing) return;
+    bpf2socks_note_deadline(&state->next_deadline_ms, connection_deadline(state->worker->config, connection));
+}
+
+/* Scans only when the earliest deadline is due, then recomputes it. */
 static void expire_tcp_connections(struct tcp_worker_state *state, uint64_t now_ms) {
     if (state == NULL || state->worker == NULL || state->worker->config == NULL) return;
-    if (now_ms == 0U) return;
-    if (state->next_timeout_scan_ms != 0U && now_ms < state->next_timeout_scan_ms) return;
-    state->next_timeout_scan_ms = now_ms + BPF2SOCKS_TCP_TIMEOUT_SCAN_MILLISECONDS;
+    if (now_ms == 0U || now_ms < state->next_deadline_ms) return;
+    state->next_deadline_ms = BPF2SOCKS_NO_DEADLINE;
     const struct bpf2socks_runtime_config *config = state->worker->config;
     for (struct tcp_connection *connection = state->active; connection != NULL;) {
         struct tcp_connection *next = connection->active_next;
@@ -517,6 +544,8 @@ static void expire_tcp_connections(struct tcp_worker_state *state, uint64_t now_
                 ++state->worker->stats.tcp_connect_timeouts;
             }
             close_connection(state, connection);
+        } else {
+            note_connection_deadline(state, connection);
         }
         connection = next;
     }
@@ -600,7 +629,7 @@ static int connect_nonblocking_addr(
     int fd = socket(addr->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     tune_upstream_tcp_socket(fd, worker != NULL ? worker->config : NULL);
-    if (connect(fd, addr, addr_len) == 0) {
+    if (bpf2socks_bridge_connect(fd, addr, addr_len) == 0) {
         *stage = TCP_STAGE_HELLO_WRITE;
         return fd;
     }
@@ -696,7 +725,7 @@ static void handle_accept_fd_exhaustion(struct tcp_worker_state *state, int list
     close_fd_if_open(&state->spare_fd);
     int client;
     do {
-        client = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        client = bpf2socks_bridge_accept4(listener_fd, SOCK_NONBLOCK | SOCK_CLOEXEC);
     } while (client < 0 && errno == EINTR);
     if (client >= 0) close(client);
     state->spare_fd = open_spare_fd();
@@ -709,21 +738,36 @@ static void record_fd_exhaustion(struct tcp_worker_state *state) {
     pause_tcp_listeners(state);
 }
 
-static uint32_t relay_side_events(bool input_open, bool output_pending) {
+/*
+ * Level-triggered epoll: never request readiness that cannot make progress.
+ * EPOLLIN/EPOLLRDHUP are requested only while the side may still be read and
+ * its pipe has room; otherwise a readable source with a full pipe, or a
+ * half-closed source, would wake the worker continuously.
+ */
+static uint32_t relay_side_events(bool want_input, bool output_pending) {
     uint32_t events = 0U;
-    if (input_open) events |= EPOLLIN;
+    if (want_input) events |= EPOLLIN | EPOLLRDHUP;
     if (output_pending) events |= EPOLLOUT;
     if (events != 0U) {
-        events |= BPF2SOCKS_TCP_RELAY_EVENTS;
+        events |= EPOLLERR | EPOLLHUP;
     }
     return events;
+}
+
+static bool splice_pipe_wants_input(const struct tcp_splice_pipe *pipe_state) {
+    return !pipe_state->input_eof && !pipe_state->input_paused;
+}
+
+static bool socket_has_unread_bytes(int fd) {
+    int pending = 0;
+    return ioctl(fd, FIONREAD, &pending) == 0 && pending > 0;
 }
 
 static uint32_t client_events(const struct tcp_connection *connection) {
     uint32_t events = BPF2SOCKS_TCP_RELAY_EVENTS;
     if (connection->stage == TCP_STAGE_RELAY) {
         events = relay_side_events(
-            !connection->client_to_upstream.input_eof,
+            splice_pipe_wants_input(&connection->client_to_upstream),
             connection->upstream_to_client.queued > 0U);
     }
     return events;
@@ -743,7 +787,7 @@ static uint32_t upstream_events(const struct tcp_connection *connection) {
             break;
         case TCP_STAGE_RELAY:
             events = relay_side_events(
-                !connection->upstream_to_client.input_eof,
+                splice_pipe_wants_input(&connection->upstream_to_client),
                 connection->client_to_upstream.queued > 0U);
             break;
     }
@@ -960,7 +1004,7 @@ static int client_original_dst(
 
 static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd) {
     while (!bpf2socks_stop_is_requested()) {
-        int client = accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int client = bpf2socks_bridge_accept4(listener_fd, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (client < 0 && errno == EINTR) continue;
         if (client < 0) {
@@ -1001,6 +1045,7 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
         connection->session_reserved = true;
 
         active_add(state, connection);
+        note_connection_deadline(state, connection);
         if (add_fd(state, connection->client_fd, &connection->client_ref, client_events(connection)) != 0 ||
             add_fd(state, connection->upstream_fd, &connection->upstream_ref, upstream_events(connection)) != 0) {
             int saved = errno;
@@ -1048,7 +1093,13 @@ static int splice_socket_to_pipe(
         }
         if (errno == EINTR) continue;
         if (moved_data) connection_touch(connection);
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* EAGAIN with unread socket data means the pipe is full. */
+            if (pipe_state->queued > 0U && socket_has_unread_bytes(source_fd)) {
+                pipe_state->input_paused = true;
+            }
+            return 0;
+        }
         return -1;
     }
 }
@@ -1071,6 +1122,7 @@ static int splice_pipe_to_socket(
             SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (moved > 0) {
             pipe_state->queued -= (size_t)moved;
+            pipe_state->input_paused = false;
             if (bytes_out != NULL) *bytes_out += (uint64_t)moved;
             moved_data = true;
             continue;
@@ -1166,17 +1218,11 @@ static void handle_splice_relay(
             close_connection(state, connection);
             return;
         }
-        if ((events & (EPOLLHUP | EPOLLRDHUP)) != 0) {
-            connection->client_to_upstream.input_eof = true;
-        }
     } else if (side == TCP_SIDE_UPSTREAM) {
         if ((events & EPOLLIN) != 0 &&
             splice_socket_to_pipe(connection, connection->upstream_fd, &connection->upstream_to_client) < 0) {
             close_connection(state, connection);
             return;
-        }
-        if ((events & (EPOLLHUP | EPOLLRDHUP)) != 0) {
-            connection->upstream_to_client.input_eof = true;
         }
     }
 
@@ -1205,6 +1251,7 @@ static void handle_connection_event(struct tcp_worker_state *state, struct tcp_f
         handle_upstream_handshake(state, connection, events);
     }
     update_connection_events(state, connection);
+    note_connection_deadline(state, connection);
 }
 
 int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
@@ -1233,6 +1280,7 @@ int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
     state.listener6_ref.side = TCP_SIDE_LISTENER;
     state.listener6_ref.fd = worker->tcp_listener6_fd;
     state.spare_fd = -1;
+    state.next_deadline_ms = BPF2SOCKS_NO_DEADLINE;
 
     if (add_fd(&state, worker->tcp_listener_fd, &state.listener_ref, EPOLLIN) != 0) {
         int saved = errno;
@@ -1266,7 +1314,8 @@ int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker) {
         resume_tcp_listeners_if_due(&state);
         int timeout = bpf2socks_tcp_worker_wait_timeout(
             state.listeners_paused,
-            state.active != NULL,
+            state.next_deadline_ms,
+            monotonic_ms(),
             worker->config->debug_stats);
         int ready = epoll_wait(epoll_fd, events, BPF2SOCKS_TCP_EVENTS, timeout);
         if (ready < 0 && errno == EINTR) continue;

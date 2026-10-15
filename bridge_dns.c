@@ -340,6 +340,15 @@ void bpf2socks_dns_table_release(
     release_index(table, index, true);
 }
 
+bool bpf2socks_dns_table_oldest(const struct bpf2socks_dns_table *table, uint64_t *sent_at_ms) {
+    if (table == NULL || table->transactions == NULL || sent_at_ms == NULL ||
+        table->lru_head == DNS_LRU_NONE || !table->transactions[table->lru_head].used) {
+        return false;
+    }
+    *sent_at_ms = table->transactions[table->lru_head].sent_at_ms;
+    return true;
+}
+
 size_t bpf2socks_dns_table_expire(
     struct bpf2socks_dns_table *table,
     uint64_t now_ms,

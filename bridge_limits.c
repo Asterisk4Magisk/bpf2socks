@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/resource.h>
+#include <unistd.h>
 
 #define BPF2SOCKS_TCP_FDS_PER_SESSION 6ULL
 #define BPF2SOCKS_UDP_FDS_PER_SESSION 2ULL
@@ -97,23 +98,40 @@ bool bpf2socks_tcp_connection_timed_out(
         now_ms - last_activity_ms >= (uint64_t)idle_timeout_ms;
 }
 
+void bpf2socks_note_deadline(uint64_t *next_deadline_ms, uint64_t deadline_ms) {
+    if (next_deadline_ms != NULL && deadline_ms < *next_deadline_ms) *next_deadline_ms = deadline_ms;
+}
+
+/* epoll_wait() timeout until the deadline; -1 (no wakeup) without one. */
+static int deadline_wait_timeout(uint64_t next_deadline_ms, uint64_t now_ms) {
+    if (next_deadline_ms == BPF2SOCKS_NO_DEADLINE) return -1;
+    if (now_ms == 0U || next_deadline_ms <= now_ms) return 0;
+    uint64_t remaining = next_deadline_ms - now_ms;
+    return remaining > (uint64_t)INT_MAX ? INT_MAX : (int)remaining;
+}
+
+static int min_wait_timeout(int timeout, int cap) {
+    return timeout < 0 || timeout > cap ? cap : timeout;
+}
+
 int bpf2socks_tcp_worker_wait_timeout(
     bool listeners_paused,
-    bool has_active_connections,
+    uint64_t next_deadline_ms,
+    uint64_t now_ms,
     bool debug_stats) {
-    if (listeners_paused) return BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS;
-    return has_active_connections || debug_stats ? BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS : -1;
+    int timeout = deadline_wait_timeout(next_deadline_ms, now_ms);
+    if (listeners_paused) timeout = min_wait_timeout(timeout, BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS);
+    if (debug_stats) timeout = min_wait_timeout(timeout, BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS);
+    return timeout;
 }
 
 int bpf2socks_udp_worker_wait_timeout(
-    size_t session_count,
-    size_t binding_count,
-    size_t dns_transaction_count,
-    bool dns_handshake_in_progress,
+    uint64_t next_deadline_ms,
+    uint64_t now_ms,
     bool debug_stats) {
-    bool timed_work = session_count != 0U || binding_count != 0U || dns_transaction_count != 0U ||
-        dns_handshake_in_progress || debug_stats;
-    return timed_work ? BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS : -1;
+    int timeout = deadline_wait_timeout(next_deadline_ms, now_ms);
+    if (debug_stats) timeout = min_wait_timeout(timeout, BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS);
+    return timeout;
 }
 
 int bpf2socks_nofile_soft_limit(uint64_t *out_limit) {
@@ -132,6 +150,37 @@ void bpf2socks_pending_budget_init(struct bpf2socks_udp_pending_budget *budget, 
     budget->cap_bytes = cap_bytes;
     atomic_init(&budget->used_bytes, 0U);
     atomic_init(&budget->peak_bytes, 0U);
+    atomic_init(&budget->waiting_workers, 0U);
+    for (uint32_t i = 0U; i < BPF2SOCKS_MAX_WORKER_COUNT; ++i) {
+        atomic_init(&budget->wake_fds[i], -1);
+    }
+}
+
+void bpf2socks_pending_budget_set_wake_fd(
+    struct bpf2socks_udp_pending_budget *budget,
+    uint32_t worker_id,
+    int fd) {
+    if (budget == NULL || worker_id >= BPF2SOCKS_MAX_WORKER_COUNT) return;
+    atomic_store_explicit(&budget->wake_fds[worker_id], fd, memory_order_release);
+}
+
+/* Register before re-checking the budget so a concurrent release cannot be missed. */
+void bpf2socks_pending_budget_wait(struct bpf2socks_udp_pending_budget *budget, uint32_t worker_id) {
+    if (budget == NULL || worker_id >= BPF2SOCKS_MAX_WORKER_COUNT) return;
+    (void)atomic_fetch_or_explicit(&budget->waiting_workers, 1U << worker_id, memory_order_acq_rel);
+}
+
+static void wake_pending_budget_waiters(struct bpf2socks_udp_pending_budget *budget) {
+    if (atomic_load_explicit(&budget->waiting_workers, memory_order_acquire) == 0U) return;
+    unsigned int waiters = atomic_exchange_explicit(&budget->waiting_workers, 0U, memory_order_acq_rel);
+    for (uint32_t i = 0U; waiters != 0U && i < BPF2SOCKS_MAX_WORKER_COUNT; ++i) {
+        if ((waiters & (1U << i)) == 0U) continue;
+        waiters &= ~(1U << i);
+        int fd = atomic_load_explicit(&budget->wake_fds[i], memory_order_acquire);
+        if (fd < 0) continue;
+        uint64_t one = 1U;
+        (void)write(fd, &one, sizeof(one));
+    }
 }
 
 static void update_pending_budget_peak(struct bpf2socks_udp_pending_budget *budget, size_t used_bytes) {
@@ -187,6 +236,7 @@ int bpf2socks_pending_budget_release(struct bpf2socks_udp_pending_budget *budget
                 used - bytes,
                 memory_order_acq_rel,
                 memory_order_relaxed)) {
+            wake_pending_budget_waiters(budget);
             return 0;
         }
     }

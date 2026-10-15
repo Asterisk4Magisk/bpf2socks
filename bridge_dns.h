@@ -83,6 +83,7 @@ void bpf2socks_dns_table_note_response(
 void bpf2socks_dns_table_release(
     struct bpf2socks_dns_table *table,
     struct bpf2socks_dns_transaction *tx);
+bool bpf2socks_dns_table_oldest(const struct bpf2socks_dns_table *table, uint64_t *sent_at_ms);
 size_t bpf2socks_dns_table_expire(
     struct bpf2socks_dns_table *table,
     uint64_t now_ms,

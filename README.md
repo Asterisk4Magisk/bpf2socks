@@ -73,7 +73,7 @@ bpf2socks --stats --pid FILE
   "tokenIpv4Prefix": "127.128.0.0/9",
   "tokenIpv6Prefix": "fd7a:7374:6572:6973::/64",
   "workerCount": 0,
-  "tcpBufferSize": 65536,
+  "tcpBufferSize": 262144,
   "maxTcpSessions": 4096,
   "tcpConnectTimeoutMilliseconds": 10000,
   "tcpIdleTimeoutMilliseconds": 300000,
@@ -124,7 +124,7 @@ bpf2socks --stats --pid FILE
 | `tokenIpv4Prefix` | `127.128.0.0/9`; fixed token pool that avoids the lower half of loopback space. |
 | `tokenIpv6Prefix` | `fd7a:7374:6572:6973::/64`; must retain the supported `/64` token layout. |
 | `workerCount` | `0` selects 4 workers on systems with at least 8 online CPUs, otherwise 2; capped at 8 and by session capacities. |
-| `tcpBufferSize` | 65536 bytes; zero resets to the default. |
+| `tcpBufferSize` | 262144 bytes; zero resets to the default. |
 | `maxTcpSessions` | 4096; zero resets to the default, maximum 8192. |
 | `tcpConnectTimeoutMilliseconds` | 10000; normalized to 1000–60000. |
 | `tcpIdleTimeoutMilliseconds` | 300000; non-zero values normalized to 1000–3600000. Zero disables the idle timeout. |

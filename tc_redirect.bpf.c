@@ -281,16 +281,37 @@ INLINE void fill_reverse_key(
     copy_bytes(key->token_addr, token->token_addr, original->family == AF_INET6_VALUE ? 16U : 4U);
 }
 
-INLINE bool reserve_token(
+INLINE void fill_bridge_value(
+    struct bpf2socks_original_dst_bpf *value,
+    const struct bpf2socks_tc_original_key *original) {
+    __builtin_memset(value, 0, sizeof(*value));
+    value->family = original->family;
+    value->protocol = original->protocol;
+    value->port = original->original_port;
+    copy_bytes(value->addr, original->original_addr, original->family == AF_INET6_VALUE ? 16U : 4U);
+}
+
+INLINE bool is_tcp_syn(const void *l4, const void *data_end) {
+    const struct tcp_header_min *tcp = l4;
+    if ((const void *)(tcp + 1) > data_end) return false;
+    return (swap16(tcp->flags) & 0x0012U) == 0x0002U;
+}
+
+INLINE bool find_reserved_token(
+    const struct bpf2socks_tc_original_key *original,
+    const struct bpf2socks_tc_runtime_control *control,
+    struct bpf2socks_tc_scratch *scratch) {
+    struct bpf2socks_tc_token_value *existing = map_lookup(&tc_original_to_token, original);
+    if (existing == 0 || existing->generation != control->generation) return false;
+    scratch->token = *existing;
+    return true;
+}
+
+INLINE bool allocate_token(
     const struct bpf2socks_tc_original_key *original,
     const struct bpf2socks_tc_runtime_control *control,
     struct bpf2socks_tc_scratch *scratch) {
     struct bpf2socks_tc_token_value *token = &scratch->token;
-    struct bpf2socks_tc_token_value *existing = map_lookup(&tc_original_to_token, original);
-    if (existing != 0 && existing->generation == control->generation) {
-        *token = *existing;
-        return true;
-    }
 
 #pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < BPF2SOCKS_TC_MAX_TOKEN_ATTEMPTS; ++attempt) {
@@ -330,14 +351,7 @@ INLINE bool reserve_token(
         struct bpf2socks_token_key_bpf *bridge_key = &scratch->bridge_key;
         struct bpf2socks_original_dst_bpf *bridge_value = &scratch->bridge_value;
         fill_bridge_key(bridge_key, original, token);
-        __builtin_memset(bridge_value, 0, sizeof(*bridge_value));
-        bridge_value->family = original->family;
-        bridge_value->protocol = original->protocol;
-        bridge_value->port = original->original_port;
-        copy_bytes(
-            bridge_value->addr,
-            original->original_addr,
-            original->family == AF_INET6_VALUE ? 16U : 4U);
+        fill_bridge_value(bridge_value, original);
         if (map_update(&bridge_token_map, bridge_key, bridge_value, BPF_NOEXIST) != 0) continue;
 
         struct bpf2socks_tc_reverse_key *reverse_key = &scratch->reverse_key;
@@ -365,6 +379,20 @@ INLINE bool reserve_token(
         return true;
     }
     return false;
+}
+
+/*
+ * The bridge consumes a TCP bridge_token_map entry when it accepts the
+ * connection, while the flow's token stays remembered here. A client that
+ * reuses its source port for the same destination would then reach the
+ * bridge without an original destination, so each new SYN republishes it.
+ */
+INLINE bool republish_bridge_token(
+    const struct bpf2socks_tc_original_key *original,
+    struct bpf2socks_tc_scratch *scratch) {
+    fill_bridge_key(&scratch->bridge_key, original, &scratch->token);
+    fill_bridge_value(&scratch->bridge_value, original);
+    return map_update(&bridge_token_map, &scratch->bridge_key, &scratch->bridge_value, BPF_ANY) == 0;
 }
 
 INLINE int rewrite_ipv4(
@@ -414,7 +442,7 @@ INLINE int ingress4(
     if ((swap32(ip->destination) & 0xff000000U) == 0x7f000000U) return TC_ACT_SHOT;
     struct transport_ports *ports = (void *)ip + header_length;
     __u16 destination_port = swap16(ports->destination);
-    if (!policy4_proxy(ip->destination, ip->protocol, destination_port, control->flags)) return TC_ACT_PIPE;
+    bool tcp_syn = ip->protocol == IPPROTO_TCP_VALUE && is_tcp_syn(ports, data_end);
 
     __u32 zero = 0U;
     struct bpf2socks_tc_scratch *scratch = map_lookup(&tc_scratch, &zero);
@@ -428,7 +456,13 @@ INLINE int ingress4(
     original->original_port = destination_port;
     copy_bytes(original->client_addr, (__u8 *)&ip->source, 4U);
     copy_bytes(original->original_addr, (__u8 *)&ip->destination, 4U);
-    if (!reserve_token(original, control, scratch)) return TC_ACT_PIPE;
+    /* An existing token means policy already admitted this flow; skip the LPM lookups. */
+    if (!find_reserved_token(original, control, scratch)) {
+        if (!policy4_proxy(ip->destination, ip->protocol, destination_port, control->flags)) return TC_ACT_PIPE;
+        if (!allocate_token(original, control, scratch)) return TC_ACT_PIPE;
+    } else if (tcp_syn && !republish_bridge_token(original, scratch)) {
+        return TC_ACT_PIPE;
+    }
 
     __be32 token_address;
     __builtin_memcpy(&token_address, scratch->token.token_addr, 4U);
@@ -547,9 +581,9 @@ INLINE int ingress6(
     if (ipv6_in_token_prefix(ip->destination, control->token_ipv6_prefix)) return TC_ACT_SHOT;
     struct transport_ports *ports = (void *)(ip + 1);
     __u16 destination_port = swap16(ports->destination);
+    bool tcp_syn = ip->next_header == IPPROTO_TCP_VALUE && is_tcp_syn(ports, data_end);
     if ((control->flags & BPF2SOCKS_TC_RUNTIME_IPV6) == 0U &&
         ((control->flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) == 0U || destination_port != 53U)) return TC_ACT_PIPE;
-    if (!policy6_proxy(ip->destination, ip->next_header, destination_port, control->flags)) return TC_ACT_PIPE;
 
     __u32 zero = 0U;
     struct bpf2socks_tc_scratch *scratch = map_lookup(&tc_scratch, &zero);
@@ -563,7 +597,13 @@ INLINE int ingress6(
     original->original_port = destination_port;
     copy_bytes(original->client_addr, ip->source, 16U);
     copy_bytes(original->original_addr, ip->destination, 16U);
-    if (!reserve_token(original, control, scratch)) return TC_ACT_PIPE;
+    /* An existing token means policy already admitted this flow; skip the LPM lookups. */
+    if (!find_reserved_token(original, control, scratch)) {
+        if (!policy6_proxy(ip->destination, ip->next_header, destination_port, control->flags)) return TC_ACT_PIPE;
+        if (!allocate_token(original, control, scratch)) return TC_ACT_PIPE;
+    } else if (tcp_syn && !republish_bridge_token(original, scratch)) {
+        return TC_ACT_PIPE;
+    }
     __u32 l4_offset = sizeof(struct ethernet_header) + sizeof(struct ipv6_header);
     __u32 checksum_offset = l4_offset +
         (ip->next_header == IPPROTO_TCP_VALUE

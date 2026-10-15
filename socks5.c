@@ -114,7 +114,7 @@ int bpf2socks_socks5_connect_nonblock(
     int fd = socket(addr->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     bpf2socks_bridge_tune_tcp_advanced(fd, true);
-    if (connect(fd, addr, addr_len) == 0) return fd;
+    if (bpf2socks_bridge_connect(fd, addr, addr_len) == 0) return fd;
     if (errno == EINPROGRESS) return fd;
     int saved = errno;
     close(fd);
@@ -440,7 +440,6 @@ int bpf2socks_socks5_udp_associate_addr(
         close(fd);
         return -1;
     }
-    bpf2socks_bridge_tune_udp_advanced(dgram);
     *tcp_fd = fd;
     *udp_fd = dgram;
     return 0;

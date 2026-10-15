@@ -20,13 +20,19 @@
 #define BPF2SOCKS_UDP_BUFFER_SIZE 65535U
 #define BPF2SOCKS_SESSION_HASH_BUCKETS 4096U
 #define BPF2SOCKS_MAX_SOCKS5_UDP_HEADER 22U
+/* Wait cap used only while debug statistics are published. */
 #define BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS 1000
-#define BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS 100
+/* Fallback retry while descriptors held by other processes keep accept() failing. */
+#define BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS 1000
+#define BPF2SOCKS_NO_DEADLINE UINT64_MAX
 
 struct bpf2socks_udp_pending_budget {
     size_t cap_bytes;
     atomic_size_t used_bytes;
     atomic_size_t peak_bytes;
+    /* Workers blocked on the budget and their eventfds, woken on release. */
+    atomic_uint waiting_workers;
+    atomic_int wake_fds[BPF2SOCKS_MAX_WORKER_COUNT];
 };
 
 struct bpf2socks_udp_downlink_channel;
@@ -136,15 +142,15 @@ bool bpf2socks_tcp_connection_timed_out(
     bool relay_established,
     uint32_t connect_timeout_ms,
     uint32_t idle_timeout_ms);
+void bpf2socks_note_deadline(uint64_t *next_deadline_ms, uint64_t deadline_ms);
 int bpf2socks_tcp_worker_wait_timeout(
     bool listeners_paused,
-    bool has_active_connections,
+    uint64_t next_deadline_ms,
+    uint64_t now_ms,
     bool debug_stats);
 int bpf2socks_udp_worker_wait_timeout(
-    size_t session_count,
-    size_t binding_count,
-    size_t dns_transaction_count,
-    bool dns_handshake_in_progress,
+    uint64_t next_deadline_ms,
+    uint64_t now_ms,
     bool debug_stats);
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker);
 void bpf2socks_bridge_publish_udp_stats(struct bpf2socks_bridge_worker *worker);
@@ -159,12 +165,18 @@ int bpf2socks_pending_budget_reserve(struct bpf2socks_udp_pending_budget *budget
 int bpf2socks_pending_budget_release(struct bpf2socks_udp_pending_budget *budget, size_t bytes);
 size_t bpf2socks_pending_budget_used(const struct bpf2socks_udp_pending_budget *budget);
 size_t bpf2socks_pending_budget_peak(const struct bpf2socks_udp_pending_budget *budget);
+void bpf2socks_pending_budget_set_wake_fd(
+    struct bpf2socks_udp_pending_budget *budget,
+    uint32_t worker_id,
+    int fd);
+void bpf2socks_pending_budget_wait(struct bpf2socks_udp_pending_budget *budget, uint32_t worker_id);
 uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback);
 void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t send_size);
 void bpf2socks_bridge_record_socket_buffers(int fd);
 void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream);
-void bpf2socks_bridge_tune_udp_advanced(int fd);
 void bpf2socks_bridge_enable_tcp_fastopen_listener(int fd);
+int bpf2socks_bridge_connect(int fd, const struct sockaddr *addr, socklen_t addr_len);
+int bpf2socks_bridge_accept4(int fd, int flags);
 int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker);
 int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker);
 

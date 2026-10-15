@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,6 +82,7 @@ enum udp_fd_kind {
     UDP_FD_DNS_CONTROL,
     UDP_FD_DNS_RELAY,
     UDP_FD_DOWNLINK,
+    UDP_FD_BUDGET_WAKE,
 };
 
 struct udp_fd_ref {
@@ -177,11 +179,15 @@ struct udp_state {
     struct bpf2socks_udp_downlink_channel *retired_downlink_channels;
     struct udp_fd_ref listener_ref;
     struct udp_fd_ref listener6_ref;
+    struct udp_fd_ref budget_wake_ref;
     struct dns_channel dns_channels[BPF2SOCKS_DNS_CHANNELS_PER_WORKER];
     struct bpf2socks_dns_table dns_table;
     int dns_raw4_fd;
     int dns_raw6_fd;
     int epoll_fd;
+    int budget_wake_fd;
+    /* Earliest session/binding/DNS deadline found by the last maintenance pass. */
+    uint64_t next_deadline_ms;
     size_t session_cap;
     size_t session_count;
     size_t binding_cap;
@@ -189,6 +195,7 @@ struct udp_state {
     struct bpf2socks_udp_pending_budget *pending_budget;
     size_t downlink_read_reservation;
     struct bpf2socks_udp_downlink_waiter_tracker downlink_budget_waiters;
+    uint32_t worker_id;
     size_t event_cap;
     uint32_t next_dns_channel;
 };
@@ -1418,7 +1425,7 @@ static int open_udp_associate_tcp_fd(
     int fd = socket(socks_addr->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     bpf2socks_bridge_tune_tcp_advanced(fd, true);
-    if (connect(fd, socks_addr, socks_addr_len) == 0) {
+    if (bpf2socks_bridge_connect(fd, socks_addr, socks_addr_len) == 0) {
         *stage = BPF2SOCKS_UDP_SESSION_ASSOC_WRITE;
         return fd;
     }
@@ -1508,7 +1515,6 @@ static int create_udp_associate_relay_socket(
     }
     int udp_fd = socket(relay_addr.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (udp_fd < 0) return -1;
-    bpf2socks_bridge_tune_udp_advanced(udp_fd);
     bpf2socks_bridge_tune_socket_buffers(
         udp_fd,
         worker->config->udp_socket_buffer_size,
@@ -2488,7 +2494,6 @@ static int advance_dns_channel(
                 channel->relay_addr.ss_family,
                 SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
             if (udp_fd < 0) return -1;
-            bpf2socks_bridge_tune_udp_advanced(udp_fd);
             bpf2socks_bridge_tune_socket_buffers(
                 udp_fd,
                 worker->config->udp_socket_buffer_size,
@@ -3289,6 +3294,8 @@ static int init_state(struct udp_state *state, struct bpf2socks_bridge_worker *w
     state->epoll_fd = -1;
     state->dns_raw4_fd = -1;
     state->dns_raw6_fd = -1;
+    state->budget_wake_fd = -1;
+    state->next_deadline_ms = BPF2SOCKS_NO_DEADLINE;
     size_t max_sessions = worker->udp_session_cap;
     state->binding_cap = worker->udp_binding_cap;
     state->pending_budget = worker->udp_pending_budget;
@@ -3381,6 +3388,11 @@ static void free_state(struct udp_state *state) {
         close(state->dns_raw6_fd);
         state->dns_raw6_fd = -1;
     }
+    if (state->budget_wake_fd >= 0) {
+        bpf2socks_pending_budget_set_wake_fd(state->pending_budget, state->worker_id, -1);
+        close(state->budget_wake_fd);
+        state->budget_wake_fd = -1;
+    }
     if (state->epoll_fd >= 0) {
         close(state->epoll_fd);
         state->epoll_fd = -1;
@@ -3397,6 +3409,82 @@ static void free_state(struct udp_state *state) {
     free(state->sessions);
     bpf2socks_dns_table_free(&state->dns_table);
     memset(state, 0, sizeof(*state));
+}
+
+/*
+ * Mirrors the expiry walks: each list is ordered oldest first, and an expired
+ * entry that is still draining downlink packets is skipped because its
+ * progress is driven by socket events, not by time.
+ */
+static uint64_t udp_next_deadline(
+    const struct udp_state *state,
+    const struct bpf2socks_runtime_config *config,
+    uint64_t now_ms) {
+    uint64_t next = BPF2SOCKS_NO_DEADLINE;
+    uint64_t idle_ms = (uint64_t)bpf2socks_udp_effective_idle_timeout(
+        config->udp_idle_timeout_seconds,
+        BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_SECONDS) * 1000ULL;
+    for (const struct bpf2socks_udp_client_session *session = state->lru_head;
+         session != NULL && session->used;
+         session = session->lru_next) {
+        uint64_t deadline = session->last_seen_ms + idle_ms;
+        bool draining = session->downlink_pending_count > 0U || session->downlink_waiting_budget;
+        if (deadline > now_ms || !draining) {
+            bpf2socks_note_deadline(&next, deadline);
+            break;
+        }
+    }
+    for (const struct bpf2socks_udp_reply_binding *binding = state->binding_lru_head;
+         binding != NULL && binding->used;
+         binding = binding->global_lru_next) {
+        uint64_t deadline = binding->last_seen_ms + idle_ms;
+        if (deadline > now_ms || binding->downlink_pending_count == 0U) {
+            bpf2socks_note_deadline(&next, deadline);
+            break;
+        }
+    }
+    uint64_t dns_sent_at_ms = 0U;
+    if (bpf2socks_dns_table_oldest(&state->dns_table, &dns_sent_at_ms)) {
+        bpf2socks_note_deadline(&next, dns_sent_at_ms + config->dns_transaction_timeout_milliseconds);
+    }
+    for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
+        const struct dns_channel *channel = &state->dns_channels[i];
+        if (channel->stage == DNS_CHANNEL_IDLE || channel->stage == DNS_CHANNEL_READY ||
+            channel->stage_started_ms == 0U) {
+            continue;
+        }
+        bpf2socks_note_deadline(&next,
+            channel->stage_started_ms + BPF2SOCKS_DNS_HANDSHAKE_TIMEOUT_MILLISECONDS);
+    }
+    return next;
+}
+
+static bool udp_has_budget_waiters(const struct udp_state *state) {
+    if (bpf2socks_udp_downlink_waiter_tracker_has_waiters(&state->downlink_budget_waiters)) return true;
+    for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
+        if (state->dns_channels[i].relay_paused) return true;
+    }
+    return false;
+}
+
+static void udp_run_maintenance(
+    struct udp_state *state,
+    struct bpf2socks_bridge_worker *worker,
+    uint64_t *next_stats_publish_ms) {
+    free_retired_downlink_channels(state);
+    resume_budget_paused_sessions(state);
+    evict_idle_bindings(state, worker->config, worker);
+    expire_sessions(state, worker->config);
+    expire_dns_transactions(state, worker, monotonic_ms());
+    expire_dns_channel_handshake(state, monotonic_ms());
+    free_retired_downlink_channels(state);
+    if (udp_has_budget_waiters(state)) {
+        /* Register first, then re-check, so a release in between still wakes us. */
+        bpf2socks_pending_budget_wait(state->pending_budget, state->worker_id);
+        resume_budget_paused_sessions(state);
+    }
+    publish_udp_stats_if_due(worker, monotonic_ms(), next_stats_publish_ms, false);
+    state->next_deadline_ms = udp_next_deadline(state, worker->config, monotonic_ms());
 }
 
 int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
@@ -3438,6 +3526,18 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
         errno = saved;
         return -1;
     }
+    state.worker_id = worker->id;
+    state.budget_wake_fd = eventfd(0U, EFD_NONBLOCK | EFD_CLOEXEC);
+    state.budget_wake_ref.kind = UDP_FD_BUDGET_WAKE;
+    state.budget_wake_ref.fd = state.budget_wake_fd;
+    if (state.budget_wake_fd < 0 ||
+        add_udp_epoll_fd(&state, state.budget_wake_fd, &state.budget_wake_ref) < 0) {
+        free(client_payloads);
+        free(upstream_packets);
+        free_state(&state);
+        return -1;
+    }
+    bpf2socks_pending_budget_set_wake_fd(state.pending_budget, state.worker_id, state.budget_wake_fd);
     state.listener_ref.fd = worker->udp_listener_fd;
     if (add_udp_epoll_fd(&state, worker->udp_listener_fd, &state.listener_ref) < 0) {
         free(client_payloads);
@@ -3459,19 +3559,9 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
     int wait_errno = 0;
     uint64_t next_stats_publish_ms = 0U;
     while (!bpf2socks_stop_is_requested()) {
-        bool dns_handshake_in_progress = false;
-        for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
-            enum dns_channel_stage stage = state.dns_channels[i].stage;
-            if (stage != DNS_CHANNEL_IDLE && stage != DNS_CHANNEL_READY) {
-                dns_handshake_in_progress = true;
-                break;
-            }
-        }
         int timeout = bpf2socks_udp_worker_wait_timeout(
-            state.session_count,
-            state.binding_count,
-            state.dns_table.count,
-            dns_handshake_in_progress,
+            state.next_deadline_ms,
+            monotonic_ms(),
             worker->config->debug_stats);
         int ready = epoll_wait(state.epoll_fd, state.events, (int)state.event_cap, timeout);
         if (ready < 0 && errno == EINTR) {
@@ -3484,18 +3574,18 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
         }
         if (bpf2socks_stop_is_requested()) break;
         if (ready == 0) {
-            evict_idle_bindings(&state, worker->config, worker);
-            expire_sessions(&state, worker->config);
-            expire_dns_transactions(&state, worker, monotonic_ms());
-            expire_dns_channel_handshake(&state, monotonic_ms());
-            resume_budget_paused_sessions(&state);
-            publish_udp_stats_if_due(worker, monotonic_ms(), &next_stats_publish_ms, false);
+            udp_run_maintenance(&state, worker, &next_stats_publish_ms);
             continue;
         }
         for (int i = 0; i < ready; ++i) {
             struct udp_fd_ref *ref = state.events[i].data.ptr;
             if (ref == NULL) continue;
             uint32_t events = state.events[i].events;
+            if (ref->kind == UDP_FD_BUDGET_WAKE) {
+                uint64_t wakeups = 0U;
+                (void)read(state.budget_wake_fd, &wakeups, sizeof(wakeups));
+                continue;
+            }
             if ((events & EPOLLIN) != 0 && ref->kind == UDP_FD_LISTENER4) {
                 handle_udp_client_packets(&state, worker, worker->udp_listener_fd, client_payloads);
             } else if ((events & EPOLLIN) != 0 && ref->kind == UDP_FD_LISTENER6) {
@@ -3550,14 +3640,7 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
                 }
             }
         }
-        free_retired_downlink_channels(&state);
-        resume_budget_paused_sessions(&state);
-        evict_idle_bindings(&state, worker->config, worker);
-        expire_sessions(&state, worker->config);
-        expire_dns_transactions(&state, worker, monotonic_ms());
-        expire_dns_channel_handshake(&state, monotonic_ms());
-        free_retired_downlink_channels(&state);
-        publish_udp_stats_if_due(worker, monotonic_ms(), &next_stats_publish_ms, false);
+        udp_run_maintenance(&state, worker, &next_stats_publish_ms);
     }
 
     publish_udp_stats_if_due(worker, monotonic_ms(), &next_stats_publish_ms, true);
