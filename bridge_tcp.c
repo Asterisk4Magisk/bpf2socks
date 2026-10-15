@@ -294,7 +294,10 @@ static int build_socks5_connect_request(
     return 0;
 }
 
-static int fill_tcp_token_key(int client_fd, struct bpf2socks_token_key *key) {
+static int fill_tcp_token_key(
+    int client_fd,
+    const struct sockaddr_storage *peer,
+    struct bpf2socks_token_key *key) {
     struct sockaddr_storage local;
     socklen_t local_len = sizeof(local);
     if (getsockname(client_fd, (struct sockaddr *)&local, &local_len) != 0) return -1;
@@ -316,36 +319,46 @@ static int fill_tcp_token_key(int client_fd, struct bpf2socks_token_key *key) {
         return -1;
     }
 
-    struct sockaddr_storage peer;
-    socklen_t peer_len = sizeof(peer);
-    if (getpeername(client_fd, (struct sockaddr *)&peer, &peer_len) == 0) {
-        if (peer.ss_family == AF_INET) {
-            const struct sockaddr_in *peer_addr = (const struct sockaddr_in *)&peer;
-            key->client_port = ntohs(peer_addr->sin_port);
-            memcpy(key->client_addr, &peer_addr->sin_addr, 4U);
-        } else if (peer.ss_family == AF_INET6) {
-            const struct sockaddr_in6 *peer_addr = (const struct sockaddr_in6 *)&peer;
-            key->client_port = ntohs(peer_addr->sin6_port);
-            memcpy(key->client_addr, &peer_addr->sin6_addr, 16U);
-        }
+    if (peer->ss_family == AF_INET) {
+        const struct sockaddr_in *peer_addr = (const struct sockaddr_in *)peer;
+        key->client_port = ntohs(peer_addr->sin_port);
+        memcpy(key->client_addr, &peer_addr->sin_addr, 4U);
+    } else if (peer->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *peer_addr = (const struct sockaddr_in6 *)peer;
+        key->client_port = ntohs(peer_addr->sin6_port);
+        memcpy(key->client_addr, &peer_addr->sin6_addr, 16U);
     }
     return 0;
 }
 
+static bool token_key_client_is_loopback(const struct bpf2socks_token_key *key) {
+    if (key->family == AF_INET) return key->client_addr[0] == 127U;
+    static const uint8_t loopback6[16] = {[15] = 1U};
+    return key->family == AF_INET6 && memcmp(key->client_addr, loopback6, sizeof(loopback6)) == 0;
+}
+
+/*
+ * Cgroup CONNECT tokens are published without a client address, while TC
+ * hotspot tokens carry the client tuple. Local applications reach the bridge
+ * from loopback, so try the client-less key first for them and keep the full
+ * key first for everything else.
+ */
 static int lookup_original_with_client_fallback(
     int map_fd,
     const struct bpf2socks_token_key *key,
     struct bpf2socks_original_dst *original,
     struct bpf2socks_bridge_stats *stats) {
+    struct bpf2socks_token_key zero_client = *key;
+    zero_client.client_port = 0U;
+    memset(zero_client.client_addr, 0, sizeof(zero_client.client_addr));
+    bool zero_first = token_key_client_is_loopback(key);
+    const struct bpf2socks_token_key *first = zero_first ? &zero_client : key;
+    const struct bpf2socks_token_key *second = zero_first ? key : &zero_client;
     bool delete_failed = false;
-    if (bpf2socks_tcp_token_take(map_fd, key, original, &delete_failed) == 0) {
-        if (delete_failed) ++stats->tcp_token_delete_failures;
-        return 0;
+    if (bpf2socks_tcp_token_take(map_fd, first, original, &delete_failed) < 0 &&
+        bpf2socks_tcp_token_take(map_fd, second, original, &delete_failed) < 0) {
+        return -1;
     }
-    struct bpf2socks_token_key fallback = *key;
-    fallback.client_port = 0U;
-    memset(fallback.client_addr, 0, sizeof(fallback.client_addr));
-    if (bpf2socks_tcp_token_take(map_fd, &fallback, original, &delete_failed) < 0) return -1;
     if (delete_failed) ++stats->tcp_token_delete_failures;
     return 0;
 }
@@ -725,7 +738,7 @@ static void handle_accept_fd_exhaustion(struct tcp_worker_state *state, int list
     close_fd_if_open(&state->spare_fd);
     int client;
     do {
-        client = bpf2socks_bridge_accept4(listener_fd, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        client = bpf2socks_bridge_accept4(listener_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     } while (client < 0 && errno == EINTR);
     if (client >= 0) close(client);
     state->spare_fd = open_spare_fd();
@@ -985,12 +998,13 @@ static struct tcp_connection *create_connection(
 
 static int client_original_dst(
     int client_fd,
+    const struct sockaddr_storage *peer,
     struct bpf2socks_bridge_worker *worker,
     struct bpf2socks_sockaddr *dst) {
     const struct bpf2socks_runtime_config *config = worker->config;
     struct bpf2socks_token_key key;
     struct bpf2socks_original_dst original;
-    if (fill_tcp_token_key(client_fd, &key) < 0) return -1;
+    if (fill_tcp_token_key(client_fd, peer, &key) < 0) return -1;
     if (lookup_original_with_client_fallback(
             config->token_map_fd,
             &key,
@@ -1004,7 +1018,14 @@ static int client_original_dst(
 
 static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd) {
     while (!bpf2socks_stop_is_requested()) {
-        int client = bpf2socks_bridge_accept4(listener_fd, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        memset(&peer, 0, sizeof(peer));
+        int client = bpf2socks_bridge_accept4(
+            listener_fd,
+            (struct sockaddr *)&peer,
+            &peer_len,
+            SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (client < 0 && errno == EINTR) continue;
         if (client < 0) {
@@ -1019,7 +1040,7 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
         tune_tcp_socket(client, state->worker->config);
 
         struct bpf2socks_sockaddr dst;
-        if (client_original_dst(client, state->worker, &dst) < 0) {
+        if (client_original_dst(client, &peer, state->worker, &dst) < 0) {
             fprintf(stderr, "missing TCP original destination: errno=%d\n", errno);
             close(client);
             continue;

@@ -129,11 +129,11 @@ int bpf2socks_bridge_connect(int fd, const struct sockaddr *addr, socklen_t addr
  * from the bridge's accepted sockets route over loopback or the hotspot's
  * local network, neither of which depends on those bits.
  */
-int bpf2socks_bridge_accept4(int fd, int flags) {
+int bpf2socks_bridge_accept4(int fd, struct sockaddr *peer, socklen_t *peer_len, int flags) {
 #ifdef __NR_accept4
-    return (int)syscall(__NR_accept4, fd, NULL, NULL, flags);
+    return (int)syscall(__NR_accept4, fd, peer, peer_len, flags);
 #else
-    return accept4(fd, NULL, NULL, flags);
+    return accept4(fd, peer, peer_len, flags);
 #endif
 }
 

@@ -175,7 +175,7 @@ void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t s
 void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream);
 void bpf2socks_bridge_enable_tcp_fastopen_listener(int fd);
 int bpf2socks_bridge_connect(int fd, const struct sockaddr *addr, socklen_t addr_len);
-int bpf2socks_bridge_accept4(int fd, int flags);
+int bpf2socks_bridge_accept4(int fd, struct sockaddr *peer, socklen_t *peer_len, int flags);
 int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker);
 int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker);
 
