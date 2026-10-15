@@ -896,14 +896,12 @@ static int read_socks_response(struct tcp_connection *connection) {
     return -1;
 }
 
+/*
+ * EPOLLERR/EPOLLHUP are handled before this runs, and a failed connect also
+ * surfaces as the first send() error, so no SO_ERROR round trip is needed.
+ */
 static int advance_socks_state(struct tcp_connection *connection) {
     if (connection->stage == TCP_STAGE_CONNECTING) {
-        int error = 0;
-        socklen_t error_len = sizeof(error);
-        if (getsockopt(connection->upstream_fd, SOL_SOCKET, SO_ERROR, &error, &error_len) != 0 || error != 0) {
-            errno = error != 0 ? error : errno;
-            return -1;
-        }
         return start_hello_write(connection);
     }
     return 0;
@@ -986,7 +984,8 @@ static struct tcp_connection *create_connection(
     }
     connection->upstream_ref.fd = connection->upstream_fd;
     if (connection->stage == TCP_STAGE_HELLO_WRITE) {
-        if (start_hello_write(connection) < 0) {
+        /* Connected (or TFO-deferred) already: write the handshake now. */
+        if (start_hello_write(connection) < 0 || flush_handshake(connection) < 0) {
             int saved = errno;
             free_connection(connection);
             errno = saved;
