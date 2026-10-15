@@ -172,7 +172,6 @@ void bpf2socks_pending_budget_set_wake_fd(
 void bpf2socks_pending_budget_wait(struct bpf2socks_udp_pending_budget *budget, uint32_t worker_id);
 uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback);
 void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t send_size);
-void bpf2socks_bridge_record_socket_buffers(int fd);
 void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream);
 void bpf2socks_bridge_enable_tcp_fastopen_listener(int fd);
 int bpf2socks_bridge_connect(int fd, const struct sockaddr *addr, socklen_t addr_len);

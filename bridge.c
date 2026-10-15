@@ -67,17 +67,6 @@ uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallb
     return value;
 }
 
-void bpf2socks_bridge_record_socket_buffers(int fd) {
-    int recv_buffer = 0;
-    int send_buffer = 0;
-    socklen_t recv_len = sizeof(recv_buffer);
-    socklen_t send_len = sizeof(send_buffer);
-    (void)getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &recv_buffer, &recv_len);
-    (void)getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, &send_len);
-    (void)recv_buffer;
-    (void)send_buffer;
-}
-
 void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t send_size) {
     if (recv_size > 0U) {
         int value = (int)recv_size;
@@ -87,7 +76,6 @@ void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t s
         int value = (int)send_size;
         (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value));
     }
-    bpf2socks_bridge_record_socket_buffers(fd);
 }
 
 static int bind_tcp_listener(const struct bpf2socks_runtime_config *config) {
