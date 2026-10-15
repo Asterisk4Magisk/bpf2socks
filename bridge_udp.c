@@ -2905,9 +2905,7 @@ static void handle_udp_client_packets(
                         CMSG_SPACE(sizeof(struct in6_pktinfo)) +
                         CMSG_SPACE(sizeof(struct sockaddr_in)) +
                         CMSG_SPACE(sizeof(struct sockaddr_in6))];
-    memset(vec, 0, sizeof(vec));
-    memset(addrs, 0, sizeof(addrs));
-    memset(control, 0, sizeof(control));
+    /* Every field the kernel reads is set below; addresses and cmsgs are outputs. */
     for (uint32_t i = 0; i < batch; ++i) {
         iov[i].iov_base = client_payloads + (size_t)i * payload_stride;
         iov[i].iov_len = payload_stride;
@@ -2917,6 +2915,8 @@ static void handle_udp_client_packets(
         vec[i].msg_hdr.msg_iovlen = 1;
         vec[i].msg_hdr.msg_control = control[i];
         vec[i].msg_hdr.msg_controllen = sizeof(control[i]);
+        vec[i].msg_hdr.msg_flags = 0;
+        vec[i].msg_len = 0U;
     }
 
     int received = recvmmsg(listener_fd, vec, batch, MSG_DONTWAIT, NULL);
@@ -2934,12 +2934,8 @@ static void handle_udp_client_packets(
     uint32_t dns_channel_indices[batch];
     struct bpf2socks_udp_msg dns_messages[batch];
     unsigned int dns_count = 0U;
+    /* Only the first outgoing_count/dns_count entries are ever read. */
     uint64_t now_ms = monotonic_ms();
-    memset(outgoing_sessions, 0, sizeof(outgoing_sessions));
-    memset(outgoing_messages, 0, sizeof(outgoing_messages));
-    memset(dns_transactions, 0, sizeof(dns_transactions));
-    memset(dns_channel_indices, 0, sizeof(dns_channel_indices));
-    memset(dns_messages, 0, sizeof(dns_messages));
     expire_dns_transactions(state, worker, now_ms);
 
     for (int i = 0; i < received; ++i) {
@@ -3023,7 +3019,7 @@ static void handle_udp_client_packets(
                 set_binding_reply_fd(binding, reply_fd, reply_raw);
             }
             binding->connected_udp_token = packet.connected_udp_token;
-            binding->last_seen_ms = monotonic_ms();
+            binding->last_seen_ms = now_ms;
             binding_lru_touch(state, session, binding);
         }
 
@@ -3114,7 +3110,6 @@ static void handle_udp_upstream_packets(
     size_t stride = udp_payload_stride(worker->config) + BPF2SOCKS_MAX_SOCKS5_UDP_HEADER;
 
     struct bpf2socks_udp_msg messages[batch];
-    memset(messages, 0, sizeof(messages));
     int received = bpf2socks_socks5_udp_recvmmsg(session->udp_fd, messages, batch, upstream_packets, stride);
     if (received <= 0) {
         int receive_errno = errno;

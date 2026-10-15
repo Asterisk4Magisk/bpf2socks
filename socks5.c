@@ -537,12 +537,11 @@ int bpf2socks_socks5_udp_recvmmsg(
 
     struct mmsghdr vec[count];
     struct iovec iov[count];
-    memset(vec, 0, sizeof(vec));
     for (unsigned int i = 0; i < count; ++i) {
         iov[i].iov_base = packet_buffer + packet_stride * i;
         iov[i].iov_len = packet_stride;
-        vec[i].msg_hdr.msg_iov = &iov[i];
-        vec[i].msg_hdr.msg_iovlen = 1U;
+        vec[i].msg_hdr = (struct msghdr){.msg_iov = &iov[i], .msg_iovlen = 1U};
+        vec[i].msg_len = 0U;
     }
 
     int received = recvmmsg(udp_fd, vec, count, MSG_DONTWAIT, NULL);
