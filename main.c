@@ -446,7 +446,8 @@ static int current_open_fd_count(uint64_t *out_count) {
 }
 
 static uint64_t static_fd_reserve(const struct bpf2socks_runtime_config *config, uint32_t worker_count) {
-    uint64_t per_worker = BPF2SOCKS_FD_PER_WORKER_TCP + BPF2SOCKS_FD_PER_WORKER_UDP;
+    uint64_t per_worker = BPF2SOCKS_FD_PER_WORKER_TCP + BPF2SOCKS_FD_PER_WORKER_UDP +
+        4ULL * BPF2SOCKS_TCP_PIPE_POOL_CAP;
     if (config->enable_ipv6 || config->enable_dns_hijack) {
         per_worker += BPF2SOCKS_FD_PER_WORKER_TCP_IPV6;
         per_worker += BPF2SOCKS_FD_PER_WORKER_UDP_IPV6;

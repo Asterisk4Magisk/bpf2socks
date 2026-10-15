@@ -64,8 +64,6 @@ enum tcp_side {
 struct tcp_connection;
 
 /* Empty relay pipes kept per worker so new relays skip pipe2/F_SETPIPE_SZ. */
-#define BPF2SOCKS_TCP_PIPE_POOL_CAP 16U
-
 struct tcp_pipe_pool {
     int read_fds[BPF2SOCKS_TCP_PIPE_POOL_CAP];
     int write_fds[BPF2SOCKS_TCP_PIPE_POOL_CAP];
