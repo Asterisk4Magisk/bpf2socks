@@ -39,6 +39,10 @@
 /* Method reply (2) plus the largest CONNECT reply (4 + 1 + 255 + 2). */
 #define BPF2SOCKS_TCP_RESPONSE_CAP 264U
 #define BPF2SOCKS_TCP_SPLICE_CHUNK 65536U
+/* Requested relay pipe capacity; the kernel keeps the default when refused. */
+#ifndef BPF2SOCKS_TCP_PIPE_SIZE
+#define BPF2SOCKS_TCP_PIPE_SIZE 262144
+#endif
 #define BPF2SOCKS_TCP_RELAY_EVENTS (EPOLLERR | EPOLLHUP | EPOLLRDHUP)
 #define BPF2SOCKS_TCP_STATS_PUBLISH_MILLISECONDS 250U
 
@@ -69,6 +73,7 @@ struct tcp_fd_ref {
 struct tcp_splice_pipe {
     int read_fd;
     int write_fd;
+    size_t capacity;
     size_t queued;
     bool input_eof;
     bool input_paused;
@@ -432,6 +437,7 @@ static void closed_add(struct tcp_worker_state *state, struct tcp_connection *co
 static void init_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     pipe_state->read_fd = -1;
     pipe_state->write_fd = -1;
+    pipe_state->capacity = BPF2SOCKS_TCP_SPLICE_CHUNK;
     pipe_state->queued = 0U;
     pipe_state->input_eof = false;
     pipe_state->input_paused = false;
@@ -443,6 +449,13 @@ static int open_splice_pipe(struct tcp_splice_pipe *pipe_state) {
     if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
     pipe_state->read_fd = fds[0];
     pipe_state->write_fd = fds[1];
+    pipe_state->capacity = BPF2SOCKS_TCP_SPLICE_CHUNK;
+#ifdef F_SETPIPE_SZ
+    if (BPF2SOCKS_TCP_PIPE_SIZE > BPF2SOCKS_TCP_SPLICE_CHUNK) {
+        int capacity = fcntl(fds[1], F_SETPIPE_SZ, BPF2SOCKS_TCP_PIPE_SIZE);
+        if (capacity > 0) pipe_state->capacity = (size_t)capacity;
+    }
+#endif
     pipe_state->queued = 0U;
     pipe_state->input_eof = false;
     pipe_state->input_paused = false;
@@ -1182,12 +1195,12 @@ static int splice_socket_to_pipe(
             NULL,
             pipe_state->write_fd,
             NULL,
-            BPF2SOCKS_TCP_SPLICE_CHUNK,
+            pipe_state->capacity,
             SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (moved > 0) {
             pipe_state->queued += (size_t)moved;
             moved_data = true;
-            if ((size_t)moved < BPF2SOCKS_TCP_SPLICE_CHUNK) {
+            if ((size_t)moved < pipe_state->capacity) {
                 connection_touch(connection);
                 return 0;
             }
@@ -1219,7 +1232,7 @@ static int splice_pipe_to_socket(
     bool moved_data = false;
     while (pipe_state->queued > 0U) {
         size_t chunk = pipe_state->queued;
-        if (chunk > BPF2SOCKS_TCP_SPLICE_CHUNK) chunk = BPF2SOCKS_TCP_SPLICE_CHUNK;
+        if (chunk > pipe_state->capacity) chunk = pipe_state->capacity;
         ssize_t moved = splice(
             pipe_state->read_fd,
             NULL,
