@@ -487,7 +487,7 @@ int bpf2socks_socks5_udp_sendmmsg(
     socklen_t relay_addr_len,
     const struct bpf2socks_udp_msg *messages,
     unsigned int count) {
-    if (udp_fd < 0 || relay_addr == NULL || messages == NULL || count == 0U) return -1;
+    if (udp_fd < 0 || messages == NULL || count == 0U) return -1;
 
     struct mmsghdr vec[count];
     struct iovec iov[count * 2U];
@@ -515,7 +515,7 @@ int bpf2socks_socks5_udp_sendmmsg(
         iov[i * 2U + 1U].iov_len = messages[i].payload_len;
 
         vec[i].msg_hdr.msg_name = (void *)relay_addr;
-        vec[i].msg_hdr.msg_namelen = relay_addr_len;
+        vec[i].msg_hdr.msg_namelen = relay_addr != NULL ? relay_addr_len : 0U;
         vec[i].msg_hdr.msg_iov = &iov[i * 2U];
         vec[i].msg_hdr.msg_iovlen = 2U;
     }

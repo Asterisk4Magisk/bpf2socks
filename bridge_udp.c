@@ -124,6 +124,7 @@ struct dns_channel {
     bool relay_paused;
     struct sockaddr_storage relay_addr;
     socklen_t relay_addr_len;
+    bool relay_connected;
     struct udp_fd_ref control_ref;
     struct udp_fd_ref relay_ref;
 };
@@ -1501,6 +1502,22 @@ static int read_udp_associate_hello(struct bpf2socks_udp_client_session *session
     return 1;
 }
 
+/*
+ * A connected relay socket caches the route and skips per-datagram
+ * destination handling (including the cgroup UDP sendmsg hook). It also only
+ * accepts datagrams from the relay, which is where SOCKS5 replies come from.
+ * On failure the socket stays unconnected and sends name the relay.
+ */
+static bool connect_udp_relay(int udp_fd, const struct sockaddr_storage *relay_addr, socklen_t relay_addr_len) {
+    return bpf2socks_bridge_connect(udp_fd, (const struct sockaddr *)relay_addr, relay_addr_len) == 0;
+}
+
+static const struct sockaddr *relay_destination(
+    const struct sockaddr_storage *relay_addr,
+    bool relay_connected) {
+    return relay_connected ? NULL : (const struct sockaddr *)relay_addr;
+}
+
 static int create_udp_associate_relay_socket(
     struct bpf2socks_bridge_worker *worker,
     struct bpf2socks_udp_client_session *session) {
@@ -1522,6 +1539,7 @@ static int create_udp_associate_relay_socket(
     session->udp_fd = udp_fd;
     session->relay_addr = relay_addr;
     session->relay_addr_len = relay_addr_len;
+    session->relay_connected = connect_udp_relay(udp_fd, &relay_addr, relay_addr_len);
     return 0;
 }
 
@@ -1546,7 +1564,7 @@ static int flush_session_pending_packets(
         }
         int sent = bpf2socks_socks5_udp_sendmmsg(
             session->udp_fd,
-            (const struct sockaddr *)&session->relay_addr,
+            relay_destination(&session->relay_addr, session->relay_connected),
             session->relay_addr_len,
             messages,
             count);
@@ -2213,6 +2231,7 @@ static void reset_dns_channel_fds(struct udp_state *state, struct dns_channel *c
     channel->read_len = 0U;
     memset(&channel->relay_addr, 0, sizeof(channel->relay_addr));
     channel->relay_addr_len = 0U;
+    channel->relay_connected = false;
     memset(&channel->control_ref, 0, sizeof(channel->control_ref));
     channel->control_ref.kind = UDP_FD_DNS_CONTROL;
     channel->control_ref.fd = -1;
@@ -2499,6 +2518,7 @@ static int advance_dns_channel(
                 worker->config->udp_socket_buffer_size,
                 worker->config->udp_socket_buffer_size);
             channel->udp_fd = udp_fd;
+            channel->relay_connected = connect_udp_relay(udp_fd, &channel->relay_addr, channel->relay_addr_len);
             channel->relay_ref.kind = UDP_FD_DNS_RELAY;
             channel->relay_ref.fd = udp_fd;
             channel->relay_ref.session = NULL;
@@ -2669,7 +2689,7 @@ static void flush_dns_outgoing_packets(
         }
         int sent = bpf2socks_socks5_udp_sendmmsg(
             channel->udp_fd,
-            (const struct sockaddr *)&channel->relay_addr,
+            relay_destination(&channel->relay_addr, channel->relay_connected),
             channel->relay_addr_len,
             send_messages,
             send_count);
@@ -3054,7 +3074,7 @@ static void handle_udp_client_packets(
         }
         int sent = bpf2socks_socks5_udp_sendmmsg(
                 session->udp_fd,
-                (const struct sockaddr *)&session->relay_addr,
+                relay_destination(&session->relay_addr, session->relay_connected),
                 session->relay_addr_len,
                 send_batch.messages,
                 send_batch.count);

@@ -109,6 +109,8 @@ struct bpf2socks_udp_client_session {
     int udp_fd;
     struct sockaddr_storage relay_addr;
     socklen_t relay_addr_len;
+    /* udp_fd is connect()ed to relay_addr: send without a destination. */
+    bool relay_connected;
     uint64_t last_seen_ms;
     uint8_t associate_write_buf[32];
     size_t associate_write_len;
