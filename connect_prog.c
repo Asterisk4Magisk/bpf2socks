@@ -891,6 +891,120 @@ static void emit_ipv6_policy_checks(
     }
 }
 
+/* r9 = random IPv4 token in network order. */
+static void emit_random_token_v4(struct bpf_builder *builder, uint32_t token_prefix, uint32_t token_host_mask) {
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
+    emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_0));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_9, token_host_mask));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_OR, BPF_REG_9, token_prefix));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_9, 32));
+}
+
+/* dst = cookie ^ (cookie >> 32); clobbers r0-r5. */
+static void emit_socket_cookie_fold(struct bpf_builder *builder, int dst_reg) {
+    emit(builder, BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_socket_cookie));
+    emit(builder, BPF_MOV64_REG(dst_reg, BPF_REG_0));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_RSH, dst_reg, 32));
+    emit(builder, BPF_ALU64_REG_OP(BPF_XOR, dst_reg, BPF_REG_0));
+}
+
+/* dst = (dst ^ src) * multiplier, 32-bit. */
+static void emit_hash_mix(struct bpf_builder *builder, int dst_reg, int src_reg, uint32_t multiplier) {
+    emit(builder, BPF_ALU32_REG_OP(BPF_XOR, dst_reg, src_reg));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_MUL, dst_reg, multiplier));
+}
+
+/* dst ^= dst >> shift; clobbers r2. */
+static void emit_hash_finish(struct bpf_builder *builder, int dst_reg, uint32_t shift) {
+    emit(builder, BPF_MOV32_REG(BPF_REG_2, dst_reg));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_RSH, BPF_REG_2, shift));
+    emit(builder, BPF_ALU32_REG_OP(BPF_XOR, dst_reg, BPF_REG_2));
+}
+
+/*
+ * r9 = flow token for an unconnected sendmsg(): a hash of the socket cookie
+ * and the raw destination (r7 address, r8 port), so every datagram of a flow
+ * maps to the same token instead of a fresh random one.
+ */
+static void emit_flow_token_v4(struct bpf_builder *builder, uint32_t token_prefix, uint32_t token_host_mask) {
+    emit_socket_cookie_fold(builder, BPF_REG_9);
+    emit_hash_mix(builder, BPF_REG_9, BPF_REG_7, 0x9e3779b1U);
+    emit_hash_mix(builder, BPF_REG_9, BPF_REG_8, 0x85ebca6bU);
+    emit_hash_finish(builder, BPF_REG_9, 15U);
+    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_9, token_host_mask));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_OR, BPF_REG_9, token_prefix));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_9, 32));
+}
+
+/*
+ * Publishes the token key and value already on the stack. A flow token is
+ * reused when the map still holds the same original destination, and is
+ * inserted with BPF_NOEXIST otherwise. A hash collision or an insert race
+ * falls back to a random token, published like the non-flow path.
+ */
+static void emit_publish_token(
+    struct bpf_builder *builder,
+    int token_map_fd,
+    bool flow_token,
+    bool ipv6,
+    uint32_t token_prefix,
+    uint32_t token_host_mask,
+    size_t *drop_jumps,
+    size_t *drop_jump_count) {
+    size_t done_jumps[2];
+    size_t done_jump_count = 0U;
+    size_t collision_jumps[8];
+    size_t collision_jump_count = 0U;
+    if (flow_token) {
+        emit_ld_map_fd(builder, BPF_REG_1, token_map_fd);
+        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_TOKEN_KEY));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+        size_t missing = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+        for (int off = 0; off < (int)sizeof(struct bpf2socks_original_dst); off += 4) {
+            emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_0, off));
+            emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, STACK_ORIGINAL_DST + off));
+            collision_jumps[collision_jump_count++] =
+                emit_jump(builder, BPF_JMP_REG_OP(BPF_JNE, BPF_REG_2, BPF_REG_3, 0));
+        }
+        done_jumps[done_jump_count++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+        patch_jump(builder, missing, builder->count);
+        emit_ld_map_fd(builder, BPF_REG_1, token_map_fd);
+        emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_TOKEN_KEY));
+        emit(builder, BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+        emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_3, STACK_ORIGINAL_DST));
+        emit(builder, BPF_MOV64_IMM(BPF_REG_4, BPF_NOEXIST));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
+        done_jumps[done_jump_count++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+        for (size_t i = 0U; i < collision_jump_count; ++i) patch_jump(builder, collision_jumps[i], builder->count);
+        if (ipv6) {
+            emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
+            emit(builder, BPF_MOV32_REG(BPF_REG_8, BPF_REG_0));
+            emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
+            emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_0));
+            emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8,
+                STACK_TOKEN_KEY + (int)offsetof(struct bpf2socks_token_key, token_addr) + 8));
+            emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_9,
+                STACK_TOKEN_KEY + (int)offsetof(struct bpf2socks_token_key, token_addr) + 12));
+        } else {
+            emit_random_token_v4(builder, token_prefix, token_host_mask);
+            emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_9,
+                STACK_TOKEN_KEY + (int)offsetof(struct bpf2socks_token_key, token_addr)));
+        }
+    }
+    emit_ld_map_fd(builder, BPF_REG_1, token_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_TOKEN_KEY));
+    emit(builder, BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_3, STACK_ORIGINAL_DST));
+    emit(builder, BPF_MOV64_IMM(BPF_REG_4, BPF_ANY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
+    drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    for (size_t i = 0U; i < done_jump_count; ++i) patch_jump(builder, done_jumps[i], builder->count);
+}
+
 static void emit_token_update_and_rewrite(
     struct bpf_builder *builder,
     const struct bpf2socks_runtime_config *config,
@@ -898,17 +1012,18 @@ static void emit_token_update_and_rewrite(
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
+    bool flow_token,
     size_t *drop_jumps,
     size_t *drop_jump_count) {
     uint32_t token_prefix = bpf2socks_ipv4_token_prefix_imm(
         config->token_ipv4_prefix,
         config->token_ipv4_prefix_bits);
     uint32_t token_host_mask = bpf2socks_ipv4_token_host_mask(config->token_ipv4_prefix_bits);
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
-    emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_0));
-    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_9, token_host_mask));
-    emit(builder, BPF_ALU32_IMM_OP(BPF_OR, BPF_REG_9, token_prefix));
-    emit(builder, BPF_ENDIAN_OP(BPF_REG_9, 32));
+    if (flow_token) {
+        emit_flow_token_v4(builder, token_prefix, token_host_mask);
+    } else {
+        emit_random_token_v4(builder, token_prefix, token_host_mask);
+    }
     if (protocol_from_context) {
         emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
         emit(builder, BPF_MOV64_IMM(BPF_REG_5, BPF2SOCKS_PROTO_TCP));
@@ -933,15 +1048,15 @@ static void emit_token_update_and_rewrite(
     emit(builder, BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_8, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, port)));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, addr)));
     emit_connected_udp_original_flag(builder, protocol_from_context);
-
-    emit_ld_map_fd(builder, BPF_REG_1, token_map_fd);
-    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_TOKEN_KEY));
-    emit(builder, BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_3, STACK_ORIGINAL_DST));
-    emit(builder, BPF_MOV64_IMM(BPF_REG_4, BPF_ANY));
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
-    drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    emit_publish_token(
+        builder,
+        token_map_fd,
+        flow_token,
+        false,
+        token_prefix,
+        token_host_mask,
+        drop_jumps,
+        drop_jump_count);
 
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_9, offsetof(struct bpf_sock_addr, user_ip4)));
     emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_port), htons(bridge_port));
@@ -954,6 +1069,7 @@ static void emit_token_update_and_rewrite_v6(
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
+    bool flow_token,
     size_t *drop_jumps,
     size_t *drop_jump_count) {
     uint32_t prefix0 = bpf2socks_ipv6_token_word(config->token_ipv6_prefix, 0U);
@@ -964,10 +1080,28 @@ static void emit_token_update_and_rewrite_v6(
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_8, STACK_SAVED_V6_WORD1));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_9, STACK_SAVED_V6_WORD2));
 
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
-    emit(builder, BPF_MOV32_REG(BPF_REG_8, BPF_REG_0));
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
-    emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_0));
+    if (flow_token) {
+        /* r8/r9 = flow token words from the cookie and the saved destination. */
+        emit_socket_cookie_fold(builder, BPF_REG_8);
+        emit_hash_mix(builder, BPF_REG_8, BPF_REG_7, 0x9e3779b1U);
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, STACK_SAVED_V6_WORD1));
+        emit_hash_mix(builder, BPF_REG_8, BPF_REG_3, 0x85ebca6bU);
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, STACK_SAVED_V6_WORD2));
+        emit_hash_mix(builder, BPF_REG_8, BPF_REG_3, 0x9e3779b1U);
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, STACK_SAVED_V6_LAST_WORD));
+        emit_hash_mix(builder, BPF_REG_8, BPF_REG_3, 0x85ebca6bU);
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_10, STACK_SAVED_PORT));
+        emit_hash_mix(builder, BPF_REG_8, BPF_REG_3, 0x9e3779b1U);
+        emit_hash_finish(builder, BPF_REG_8, 15U);
+        emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_8));
+        emit(builder, BPF_ALU32_IMM_OP(BPF_MUL, BPF_REG_9, 0xc2b2ae35U));
+        emit_hash_finish(builder, BPF_REG_9, 13U);
+    } else {
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
+        emit(builder, BPF_MOV32_REG(BPF_REG_8, BPF_REG_0));
+        emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
+        emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_0));
+    }
 
     if (protocol_from_context) {
         emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
@@ -1003,15 +1137,15 @@ static void emit_token_update_and_rewrite_v6(
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, addr) + 8));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_4, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, addr) + 12));
     emit_connected_udp_original_flag(builder, protocol_from_context);
-
-    emit_ld_map_fd(builder, BPF_REG_1, token_map_fd);
-    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_TOKEN_KEY));
-    emit(builder, BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_3, STACK_ORIGINAL_DST));
-    emit(builder, BPF_MOV64_IMM(BPF_REG_4, BPF_ANY));
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
-    drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    emit_publish_token(
+        builder,
+        token_map_fd,
+        flow_token,
+        true,
+        0U,
+        0U,
+        drop_jumps,
+        drop_jump_count);
 
     emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6), prefix0);
     emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 4, prefix1);
@@ -1027,17 +1161,18 @@ static void emit_ipv4_mapped_token_update_and_rewrite(
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
+    bool flow_token,
     size_t *drop_jumps,
     size_t *drop_jump_count) {
     uint32_t token_prefix = bpf2socks_ipv4_token_prefix_imm(
         config->token_ipv4_prefix,
         config->token_ipv4_prefix_bits);
     uint32_t token_host_mask = bpf2socks_ipv4_token_host_mask(config->token_ipv4_prefix_bits);
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_prandom_u32));
-    emit(builder, BPF_MOV32_REG(BPF_REG_9, BPF_REG_0));
-    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_9, token_host_mask));
-    emit(builder, BPF_ALU32_IMM_OP(BPF_OR, BPF_REG_9, token_prefix));
-    emit(builder, BPF_ENDIAN_OP(BPF_REG_9, 32));
+    if (flow_token) {
+        emit_flow_token_v4(builder, token_prefix, token_host_mask);
+    } else {
+        emit_random_token_v4(builder, token_prefix, token_host_mask);
+    }
     if (protocol_from_context) {
         emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
         emit(builder, BPF_MOV64_IMM(BPF_REG_5, BPF2SOCKS_PROTO_TCP));
@@ -1062,15 +1197,15 @@ static void emit_ipv4_mapped_token_update_and_rewrite(
     emit(builder, BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_8, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, port)));
     emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_7, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, addr)));
     emit_connected_udp_original_flag(builder, protocol_from_context);
-
-    emit_ld_map_fd(builder, BPF_REG_1, token_map_fd);
-    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
-    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_TOKEN_KEY));
-    emit(builder, BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
-    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_3, STACK_ORIGINAL_DST));
-    emit(builder, BPF_MOV64_IMM(BPF_REG_4, BPF_ANY));
-    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
-    drop_jumps[(*drop_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_0, 0, 0));
+    emit_publish_token(
+        builder,
+        token_map_fd,
+        flow_token,
+        false,
+        token_prefix,
+        token_host_mask,
+        drop_jumps,
+        drop_jump_count);
 
     emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6), 0);
     emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 4, 0);
@@ -1094,6 +1229,7 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
+    bool flow_token,
     size_t *bypass_jumps,
     size_t *bypass_jump_count,
     size_t *drop_jumps,
@@ -1144,6 +1280,7 @@ static void emit_ipv4_mapped_ipv4_policy_and_token_from_regs(
         protocol,
         protocol_from_context,
         bridge_port,
+        flow_token,
         drop_jumps,
         drop_jump_count);
     allow_jumps[(*allow_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
@@ -1233,6 +1370,7 @@ static bool emit_ipv4_mapped_ipv6_branch(
         protocol,
         protocol_from_context,
         bridge_port,
+        attach_type == BPF_CGROUP_UDP6_SENDMSG && !protocol_from_context,
         bypass_jumps,
         bypass_jump_count,
         drop_jumps,
@@ -1407,6 +1545,7 @@ static int build_ipv4_sock_addr_prog(
         protocol,
         protocol_from_context,
         bridge_port,
+        attach_type == BPF_CGROUP_UDP4_SENDMSG && !protocol_from_context,
         drop_jumps,
         &drop_jump_count);
     size_t allow_label = emit_exit(&b, 1);
@@ -1596,6 +1735,7 @@ static int build_ipv6_sock_addr_prog(
         protocol,
         protocol_from_context,
         bridge_port,
+        attach_type == BPF_CGROUP_UDP6_SENDMSG && !protocol_from_context,
         drop_jumps,
         &drop_jump_count);
     size_t allow_label = emit_exit(&b, 1);
