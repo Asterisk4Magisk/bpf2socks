@@ -78,6 +78,15 @@ int bpf2socks_get_next_key(int map_fd, const void *key, void *next_key) {
     return (int)bpf2socks_bpf_sys(BPF_MAP_GET_NEXT_KEY, &attr, sizeof(attr));
 }
 
+int bpf2socks_lookup_and_delete_map(int map_fd, const void *key, void *value) {
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    attr.value = (uint64_t)(uintptr_t)value;
+    return (int)bpf2socks_bpf_sys(BPF_MAP_LOOKUP_AND_DELETE_ELEM, &attr, sizeof(attr));
+}
+
 int bpf2socks_delete_map(int map_fd, const void *key) {
     union bpf_attr attr;
     memset(&attr, 0, sizeof(attr));

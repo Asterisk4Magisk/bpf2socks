@@ -318,6 +318,7 @@ int bpf2socks_attach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attac
 int bpf2socks_detach_prog(int cgroup_fd, int prog_fd, enum bpf_attach_type attach_type);
 int bpf2socks_restore_cgroup(int cgroup_fd);
 int bpf2socks_delete_map(int map_fd, const void *key);
+int bpf2socks_lookup_and_delete_map(int map_fd, const void *key, void *value);
 int bpf2socks_pin_fd(int fd, const char *path);
 
 int bpf2socks_token_lookup(int map_fd, const struct bpf2socks_token_key *key, struct bpf2socks_original_dst *out);
