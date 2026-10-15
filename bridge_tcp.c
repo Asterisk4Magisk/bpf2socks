@@ -1164,6 +1164,12 @@ static int shutdown_splice_target(int target_fd, struct tcp_splice_pipe *pipe_st
     return 0;
 }
 
+/*
+ * Epoll is level-triggered, so a short splice ends the pass: any data left
+ * behind reports EPOLLIN again. Only an EAGAIN with bytes already queued can
+ * mean a full pipe, and only then is FIONREAD needed to decide whether to
+ * pause input.
+ */
 static int splice_socket_to_pipe(
     struct tcp_connection *connection,
     int source_fd,
@@ -1181,6 +1187,10 @@ static int splice_socket_to_pipe(
         if (moved > 0) {
             pipe_state->queued += (size_t)moved;
             moved_data = true;
+            if ((size_t)moved < BPF2SOCKS_TCP_SPLICE_CHUNK) {
+                connection_touch(connection);
+                return 0;
+            }
             continue;
         }
         if (moved == 0) {
