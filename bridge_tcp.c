@@ -44,6 +44,11 @@
 #define BPF2SOCKS_TCP_PIPE_SIZE 262144
 #endif
 #define BPF2SOCKS_TCP_RELAY_EVENTS (EPOLLERR | EPOLLHUP | EPOLLRDHUP)
+/*
+ * Before the relay starts, a client half-close is not fatal: its data and FIN
+ * stay queued until splicing begins, so only errors and full hangups matter.
+ */
+#define BPF2SOCKS_TCP_HANDSHAKE_CLIENT_EVENTS (EPOLLERR | EPOLLHUP)
 #define BPF2SOCKS_TCP_STATS_PUBLISH_MILLISECONDS 250U
 
 enum tcp_stage {
@@ -834,7 +839,7 @@ static bool socket_has_unread_bytes(int fd) {
 }
 
 static uint32_t client_events(const struct tcp_connection *connection) {
-    uint32_t events = BPF2SOCKS_TCP_RELAY_EVENTS;
+    uint32_t events = BPF2SOCKS_TCP_HANDSHAKE_CLIENT_EVENTS;
     if (connection->stage == TCP_STAGE_RELAY) {
         events = relay_side_events(
             splice_pipe_wants_input(&connection->client_to_upstream),
@@ -1332,7 +1337,7 @@ static int flush_relay_pipes(struct tcp_connection *connection) {
 }
 
 static void handle_client_event(struct tcp_worker_state *state, struct tcp_connection *connection, uint32_t events) {
-    if ((events & BPF2SOCKS_TCP_RELAY_EVENTS) != 0) {
+    if ((events & BPF2SOCKS_TCP_HANDSHAKE_CLIENT_EVENTS) != 0) {
         close_connection(state, connection);
     }
 }
@@ -1341,10 +1346,17 @@ static void handle_upstream_handshake(
     struct tcp_worker_state *state,
     struct tcp_connection *connection,
     uint32_t events) {
-    if ((events & BPF2SOCKS_TCP_RELAY_EVENTS) != 0) {
+    if ((events & EPOLLERR) != 0) {
         close_connection(state, connection);
         return;
     }
+    /*
+     * An upstream that sends its replies, early payload and FIN together
+     * reports a hangup along with them. Read what arrived first; the hangup
+     * only fails the connection if the replies are still incomplete.
+     */
+    bool hangup = (events & (EPOLLHUP | EPOLLRDHUP)) != 0;
+    bool readable = (events & EPOLLIN) != 0 || hangup;
     int result = 0;
     if (connection->stage == TCP_STAGE_CONNECTING && (events & EPOLLOUT) != 0) {
         result = advance_socks_state(connection);
@@ -1354,7 +1366,7 @@ static void handle_upstream_handshake(
         (events & EPOLLOUT) != 0) {
         result = flush_handshake(connection);
     }
-    if (result == 0 && connection->stage == TCP_STAGE_HELLO_READ && (events & EPOLLIN) != 0) {
+    if (result == 0 && connection->stage == TCP_STAGE_HELLO_READ && readable) {
         if (connection->request_pipelined) {
             result = read_pipelined_replies(connection);
             result = result > 0 ? finish_pipelined_replies(connection) : result;
@@ -1362,8 +1374,12 @@ static void handle_upstream_handshake(
             result = read_hello_and_build_request(connection, &connection->target);
         }
     }
-    if (result == 0 && connection->stage == TCP_STAGE_RESPONSE_READ && (events & EPOLLIN) != 0) {
+    if (result == 0 && connection->stage == TCP_STAGE_RESPONSE_READ && readable) {
         result = read_connect_response(connection);
+    }
+    if (result == 0 && hangup && connection->stage != TCP_STAGE_RELAY) {
+        errno = ECONNRESET;
+        result = -1;
     }
     if (result < 0) {
         ++state->worker->stats.tcp_connect_failures;
