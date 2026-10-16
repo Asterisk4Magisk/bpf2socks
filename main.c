@@ -96,7 +96,6 @@ static uint32_t auto_worker_count(void) {
 static void normalize_runtime_tunables(struct bpf2socks_runtime_config *config) {
     if (config->worker_count == 0U) config->worker_count = auto_worker_count();
     if (config->worker_count > BPF2SOCKS_MAX_WORKER_COUNT) config->worker_count = BPF2SOCKS_MAX_WORKER_COUNT;
-    if (config->tcp_buffer_size == 0U) config->tcp_buffer_size = BPF2SOCKS_DEFAULT_TCP_BUFFER_SIZE;
     if (config->max_tcp_sessions == 0U) config->max_tcp_sessions = BPF2SOCKS_DEFAULT_MAX_TCP_SESSIONS;
     if (config->max_tcp_sessions > BPF2SOCKS_MAX_TCP_SESSIONS) {
         config->max_tcp_sessions = BPF2SOCKS_MAX_TCP_SESSIONS;

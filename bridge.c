@@ -67,6 +67,18 @@ uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallb
     return value;
 }
 
+/*
+ * tcpBufferSize 0 leaves TCP buffers to kernel autotuning. An explicit size
+ * locks them (SOCK_RCVBUF_LOCK), which caps the window on high-RTT hotspot
+ * links; accepted sockets inherit the listener's lock, so listeners follow
+ * the same rule.
+ */
+void bpf2socks_bridge_tune_tcp_buffers(int fd, const struct bpf2socks_runtime_config *config) {
+    if (config == NULL || config->tcp_buffer_size == 0U) return;
+    uint32_t size = bpf2socks_bridge_clamp_socket_buffer(config->tcp_buffer_size, config->tcp_buffer_size);
+    bpf2socks_bridge_tune_socket_buffers(fd, size, size);
+}
+
 void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t send_size) {
     if (recv_size > 0U) {
         int value = (int)recv_size;
@@ -84,10 +96,7 @@ static int bind_tcp_listener(const struct bpf2socks_runtime_config *config) {
     int one = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-    uint32_t tcp_buffer = bpf2socks_bridge_clamp_socket_buffer(
-        config->tcp_buffer_size,
-        BPF2SOCKS_DEFAULT_TCP_BUFFER_SIZE);
-    bpf2socks_bridge_tune_socket_buffers(fd, tcp_buffer, tcp_buffer);
+    bpf2socks_bridge_tune_tcp_buffers(fd, config);
     bpf2socks_bridge_enable_tcp_fastopen_listener(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -114,10 +123,7 @@ static int bind_tcp6_listener(const struct bpf2socks_runtime_config *config) {
     int one = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-    uint32_t tcp_buffer = bpf2socks_bridge_clamp_socket_buffer(
-        config->tcp_buffer_size,
-        BPF2SOCKS_DEFAULT_TCP_BUFFER_SIZE);
-    bpf2socks_bridge_tune_socket_buffers(fd, tcp_buffer, tcp_buffer);
+    bpf2socks_bridge_tune_tcp_buffers(fd, config);
     bpf2socks_bridge_enable_tcp_fastopen_listener(fd);
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
     struct sockaddr_in6 addr;

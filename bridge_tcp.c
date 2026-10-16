@@ -674,21 +674,13 @@ static void release_tcp_session(struct tcp_connection *connection) {
     connection->session_reserved = false;
 }
 
-static uint32_t tcp_socket_buffer_size(const struct bpf2socks_runtime_config *config) {
-    return bpf2socks_bridge_clamp_socket_buffer(
-        config != NULL ? config->tcp_buffer_size : 0U,
-        BPF2SOCKS_DEFAULT_TCP_BUFFER_SIZE);
-}
-
 static void tune_tcp_socket(int fd, const struct bpf2socks_runtime_config *config) {
-    uint32_t buffer_size = tcp_socket_buffer_size(config);
-    bpf2socks_bridge_tune_socket_buffers(fd, buffer_size, buffer_size);
+    bpf2socks_bridge_tune_tcp_buffers(fd, config);
     bpf2socks_bridge_tune_tcp_advanced(fd, false);
 }
 
 static void tune_upstream_tcp_socket(int fd, const struct bpf2socks_runtime_config *config) {
-    uint32_t buffer_size = tcp_socket_buffer_size(config);
-    bpf2socks_bridge_tune_socket_buffers(fd, buffer_size, buffer_size);
+    bpf2socks_bridge_tune_tcp_buffers(fd, config);
     bpf2socks_bridge_tune_tcp_advanced(fd, true);
 }
 
