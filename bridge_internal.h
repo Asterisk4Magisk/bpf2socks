@@ -139,6 +139,11 @@ struct bpf2socks_udp_client_session {
     struct bpf2socks_udp_client_session *lru_prev;
     struct bpf2socks_udp_client_session *lru_next;
     struct bpf2socks_udp_client_session *free_next;
+    /* Sessions still in the SOCKS5 handshake, oldest first, for its deadline. */
+    uint64_t handshake_started_ms;
+    bool handshake_linked;
+    struct bpf2socks_udp_client_session *handshake_prev;
+    struct bpf2socks_udp_client_session *handshake_next;
 };
 
 uint32_t bpf2socks_hash_bytes(const void *data, size_t len);

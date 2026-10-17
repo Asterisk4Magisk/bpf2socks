@@ -344,6 +344,7 @@ static void copy_udp_stats(
     destination->dns_free_stack_allocations = source->dns_free_stack_allocations;
     destination->dns_full_table_evictions = source->dns_full_table_evictions;
     destination->udp_drops_send_busy = source->udp_drops_send_busy;
+    destination->udp_associate_timeouts = source->udp_associate_timeouts;
 }
 
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker) {
@@ -419,6 +420,7 @@ static void add_worker_stats(struct bpf2socks_bridge_stats *total, const struct 
     total->dns_free_stack_allocations += stats->dns_free_stack_allocations;
     total->dns_full_table_evictions += stats->dns_full_table_evictions;
     total->udp_drops_send_busy += stats->udp_drops_send_busy;
+    total->udp_associate_timeouts += stats->udp_associate_timeouts;
 }
 
 static int stats_path_from_pid_path(const char *pid_path, char *out, size_t out_size) {
@@ -716,8 +718,11 @@ int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_st
     size_t pre_send_busy_size = offsetof(
         struct bpf2socks_bridge_stats,
         udp_drops_send_busy);
+    size_t pre_associate_timeout_size = offsetof(
+        struct bpf2socks_bridge_stats,
+        udp_associate_timeouts);
     if ((bytes != legacy_size && bytes != previous_size && bytes != prior_full_size &&
-         bytes != pre_send_busy_size && bytes != sizeof(*out)) ||
+         bytes != pre_send_busy_size && bytes != pre_associate_timeout_size && bytes != sizeof(*out)) ||
         extra != EOF || read_error != 0 || close_result != 0) {
         memset(out, 0, sizeof(*out));
         errno = EIO;

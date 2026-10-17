@@ -192,6 +192,8 @@ struct udp_state {
     struct bpf2socks_udp_client_session **session_buckets;
     struct bpf2socks_udp_client_session *lru_head;
     struct bpf2socks_udp_client_session *lru_tail;
+    struct bpf2socks_udp_client_session *handshake_head;
+    struct bpf2socks_udp_client_session *handshake_tail;
     struct bpf2socks_udp_reply_binding *binding_lru_head;
     struct bpf2socks_udp_reply_binding *binding_lru_tail;
     struct bpf2socks_udp_binding_index binding_index;
@@ -306,6 +308,13 @@ static int original_to_sockaddr(const struct bpf2socks_original_dst *src, struct
 static bool packet_needs_original_reply_socket(const struct udp_client_packet *packet) {
     if (packet == NULL) return false;
     if (packet->connected_udp_token) return false;
+    /*
+     * A client-less token comes from the cgroup sendmsg hook of a local socket,
+     * whose recvmsg hook restores the original peer on replies the listener
+     * sends from the token address, so no per-destination socket is needed.
+     * TC hotspot tokens have no such hook on the client.
+     */
+    if (packet->token_lookup_mode == BPF2SOCKS_UDP_TOKEN_LOOKUP_ZERO_CLIENT) return false;
     // UDP sockets that kept the original peer need replies sourced from that original destination.
     return packet->original_dst.family == AF_INET || packet->original_dst.family == AF_INET6;
 }
@@ -617,6 +626,31 @@ static void lru_touch(struct udp_state *state, struct bpf2socks_udp_client_sessi
     if (state->lru_tail == session) return;
     lru_remove(state, session);
     lru_add_tail(state, session);
+}
+
+/* Sessions enter the handshake list in creation order, so its head expires first. */
+static void handshake_add_tail(
+    struct udp_state *state,
+    struct bpf2socks_udp_client_session *session,
+    uint64_t now_ms) {
+    session->handshake_started_ms = now_ms;
+    session->handshake_prev = state->handshake_tail;
+    session->handshake_next = NULL;
+    if (state->handshake_tail != NULL) state->handshake_tail->handshake_next = session;
+    state->handshake_tail = session;
+    if (state->handshake_head == NULL) state->handshake_head = session;
+    session->handshake_linked = true;
+}
+
+static void handshake_remove(struct udp_state *state, struct bpf2socks_udp_client_session *session) {
+    if (!session->handshake_linked) return;
+    if (session->handshake_prev != NULL) session->handshake_prev->handshake_next = session->handshake_next;
+    if (session->handshake_next != NULL) session->handshake_next->handshake_prev = session->handshake_prev;
+    if (state->handshake_head == session) state->handshake_head = session->handshake_next;
+    if (state->handshake_tail == session) state->handshake_tail = session->handshake_prev;
+    session->handshake_prev = NULL;
+    session->handshake_next = NULL;
+    session->handshake_linked = false;
 }
 
 static void binding_session_lru_remove(
@@ -1645,6 +1679,7 @@ static int complete_udp_associate(
         return -1;
     }
     session->stage = BPF2SOCKS_UDP_SESSION_READY;
+    handshake_remove(state, session);
     ++worker->udp_stats.udp_associate_creates;
     return flush_session_pending_packets(state, worker, session);
 }
@@ -1729,6 +1764,7 @@ static void drop_session(struct udp_state *state, struct bpf2socks_udp_client_se
     }
     unlink_session_from_hash(state, session);
     lru_remove(state, session);
+    handshake_remove(state, session);
     close_session(state, session);
     if (state->session_count > 0U) --state->session_count;
     session->free_next = state->free_sessions;
@@ -1752,10 +1788,22 @@ static struct bpf2socks_udp_client_session *alloc_session(struct udp_state *stat
         session->free_next = NULL;
         return session;
     }
-    struct bpf2socks_udp_client_session *victim = state->lru_head;
-    while (victim != NULL &&
-        (victim->downlink_pending_count > 0U || victim->downlink_waiting_budget)) {
-        victim = victim->lru_next;
+    /*
+     * Sessions that already exchanged datagrams move to the LRU tail, so the
+     * least recently seen ones are often still in the SOCKS5 handshake with
+     * their first datagram queued. Evict an established session first and a
+     * handshaking one only when nothing else can go.
+     */
+    struct bpf2socks_udp_client_session *victim = NULL;
+    for (int pass = 0; pass < 2 && victim == NULL; ++pass) {
+        for (struct bpf2socks_udp_client_session *candidate = state->lru_head;
+             candidate != NULL;
+             candidate = candidate->lru_next) {
+            if (candidate->downlink_pending_count > 0U || candidate->downlink_waiting_budget) continue;
+            if (pass == 0 && candidate->stage != BPF2SOCKS_UDP_SESSION_READY) continue;
+            victim = candidate;
+            break;
+        }
     }
     if (victim == NULL) {
         errno = ENOBUFS;
@@ -1914,6 +1962,7 @@ static struct bpf2socks_udp_client_session *get_session(
     session->next = state->session_buckets[bucket];
     state->session_buckets[bucket] = session;
     lru_add_tail(state, session);
+    handshake_add_tail(state, session, session->last_seen_ms);
     ++state->session_count;
     if (add_session_tcp_epoll_fd(state, session, EPOLLIN | EPOLLOUT) < 0) {
         drop_session(state, session);
@@ -3329,6 +3378,24 @@ done:
     }
 }
 
+/*
+ * A SOCKS5 server that never answers the UDP ASSOCIATE handshake would
+ * otherwise hold the session, and every datagram the client sends to it,
+ * until the idle timeout. The TCP connect timeout bounds the handshake, so
+ * the client's next datagram opens a fresh association.
+ */
+static void expire_session_handshakes(
+    struct udp_state *state,
+    struct bpf2socks_bridge_worker *worker,
+    uint64_t now_ms) {
+    uint64_t timeout_ms = worker->config->tcp_connect_timeout_milliseconds;
+    while (state->handshake_head != NULL && now_ms != 0U &&
+           now_ms - state->handshake_head->handshake_started_ms >= timeout_ms) {
+        ++worker->udp_stats.udp_associate_timeouts;
+        drop_session(state, state->handshake_head);
+    }
+}
+
 static void expire_sessions(struct udp_state *state, const struct bpf2socks_runtime_config *config) {
     uint64_t now_ms = monotonic_ms();
     if (now_ms == 0U) return;
@@ -3548,6 +3615,10 @@ static uint64_t udp_next_deadline(
         bpf2socks_note_deadline(&next,
             channel->stage_started_ms + BPF2SOCKS_DNS_HANDSHAKE_TIMEOUT_MILLISECONDS);
     }
+    if (state->handshake_head != NULL) {
+        bpf2socks_note_deadline(&next,
+            state->handshake_head->handshake_started_ms + config->tcp_connect_timeout_milliseconds);
+    }
     return next;
 }
 
@@ -3566,6 +3637,7 @@ static void udp_run_maintenance(
     free_retired_downlink_channels(state);
     resume_budget_paused_sessions(state);
     evict_idle_bindings(state, worker->config, worker);
+    expire_session_handshakes(state, worker, monotonic_ms());
     expire_sessions(state, worker->config);
     expire_dns_transactions(state, worker, monotonic_ms());
     expire_dns_channel_handshake(state, monotonic_ms());

@@ -238,6 +238,7 @@ struct bpf2socks_bridge_stats {
     uint64_t dns_full_table_evictions;
     uint64_t tcp_token_delete_failures;
     uint64_t udp_drops_send_busy;
+    uint64_t udp_associate_timeouts;
 };
 
 int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_stats *out);
