@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 
 #include "bridge_internal.h"
+#include "log_throttle.h"
 #include "tcp_active_list.h"
 
 #include <arpa/inet.h>
@@ -614,9 +615,9 @@ static void expire_tcp_connections(struct tcp_worker_state *state, uint64_t now_
                 config->tcp_connect_timeout_milliseconds,
                 config->tcp_idle_timeout_milliseconds)) {
             if (relay_established) {
-                ++state->worker->stats.tcp_idle_timeouts;
+                ++state->worker->tcp_stats.tcp_idle_timeouts;
             } else {
-                ++state->worker->stats.tcp_connect_timeouts;
+                ++state->worker->tcp_stats.tcp_connect_timeouts;
             }
             close_connection(state, connection);
         } else {
@@ -788,7 +789,7 @@ static void resume_tcp_listeners_if_due(struct tcp_worker_state *state) {
 
 static void handle_accept_fd_exhaustion(struct tcp_worker_state *state, int listener_fd) {
     if (state == NULL || state->worker == NULL) return;
-    ++state->worker->stats.tcp_fd_exhaustions;
+    ++state->worker->tcp_stats.tcp_fd_exhaustions;
     close_fd_if_open(&state->spare_fd);
     int client;
     do {
@@ -801,7 +802,7 @@ static void handle_accept_fd_exhaustion(struct tcp_worker_state *state, int list
 
 static void record_fd_exhaustion(struct tcp_worker_state *state) {
     if (state == NULL || state->worker == NULL) return;
-    ++state->worker->stats.tcp_fd_exhaustions;
+    ++state->worker->tcp_stats.tcp_fd_exhaustions;
     pause_tcp_listeners(state);
 }
 
@@ -1139,7 +1140,7 @@ static int client_original_dst(
             config->token_map_fd,
             &key,
             &original,
-            &worker->stats) < 0 &&
+            &worker->tcp_stats) < 0 &&
         lookup_tcp_original_from_socket(client_fd, config, &original) < 0) {
         return -1;
     }
@@ -1163,20 +1164,20 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
                 handle_accept_fd_exhaustion(state, listener_fd);
                 return;
             }
-            fprintf(stderr, "accept4 failed: errno=%d\n", errno);
+            BPF2SOCKS_LOG_THROTTLED("accept4 failed: errno=%d", errno);
             return;
         }
-        ++state->worker->stats.tcp_accepts;
+        ++state->worker->tcp_stats.tcp_accepts;
         tune_tcp_socket(client, state->worker->config);
 
         struct bpf2socks_sockaddr dst;
         if (client_original_dst(client, &peer, state->worker, &dst) < 0) {
-            fprintf(stderr, "missing TCP original destination: errno=%d\n", errno);
+            BPF2SOCKS_LOG_THROTTLED("missing TCP original destination: errno=%d", errno);
             close(client);
             continue;
         }
         if (!reserve_tcp_session(state->worker)) {
-            ++state->worker->stats.tcp_drops_capacity;
+            ++state->worker->tcp_stats.tcp_drops_capacity;
             close(client);
             continue;
         }
@@ -1189,8 +1190,8 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
                 record_fd_exhaustion(state);
                 return;
             }
-            ++state->worker->stats.tcp_connect_failures;
-            fprintf(stderr, "SOCKS5 TCP upstream connect failed: errno=%d\n", saved);
+            ++state->worker->tcp_stats.tcp_connect_failures;
+            BPF2SOCKS_LOG_THROTTLED("SOCKS5 TCP upstream connect failed: errno=%d", saved);
             continue;
         }
         connection->session_reserved = true;
@@ -1315,14 +1316,14 @@ static int flush_relay_pipes(struct tcp_connection *connection) {
             connection,
             connection->upstream_fd,
             &connection->client_to_upstream,
-            &connection->worker->stats.tcp_bytes_client_to_upstream) < 0) {
+            &connection->worker->tcp_stats.tcp_bytes_client_to_upstream) < 0) {
         return -1;
     }
     if (splice_pipe_to_socket(
             connection,
             connection->client_fd,
             &connection->upstream_to_client,
-            &connection->worker->stats.tcp_bytes_upstream_to_client) < 0) {
+            &connection->worker->tcp_stats.tcp_bytes_upstream_to_client) < 0) {
         return -1;
     }
     return 0;
@@ -1374,7 +1375,7 @@ static void handle_upstream_handshake(
         result = -1;
     }
     if (result < 0) {
-        ++state->worker->stats.tcp_connect_failures;
+        ++state->worker->tcp_stats.tcp_connect_failures;
         close_connection(state, connection);
     }
 }

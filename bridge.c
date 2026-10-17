@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -342,6 +343,7 @@ static void copy_udp_stats(
     destination->udp_binding_hash_collision_steps = source->udp_binding_hash_collision_steps;
     destination->dns_free_stack_allocations = source->dns_free_stack_allocations;
     destination->dns_full_table_evictions = source->dns_full_table_evictions;
+    destination->udp_drops_send_busy = source->udp_drops_send_busy;
 }
 
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker) {
@@ -350,7 +352,7 @@ void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker) 
         return;
     }
     if (pthread_mutex_lock(&worker->stats_snapshot_mutex) != 0) return;
-    copy_tcp_stats(&worker->stats_snapshot, &worker->stats);
+    copy_tcp_stats(&worker->stats_snapshot, &worker->tcp_stats);
     (void)pthread_mutex_unlock(&worker->stats_snapshot_mutex);
 }
 
@@ -360,7 +362,7 @@ void bpf2socks_bridge_publish_udp_stats(struct bpf2socks_bridge_worker *worker) 
         return;
     }
     if (pthread_mutex_lock(&worker->stats_snapshot_mutex) != 0) return;
-    copy_udp_stats(&worker->stats_snapshot, &worker->stats);
+    copy_udp_stats(&worker->stats_snapshot, &worker->udp_stats);
     (void)pthread_mutex_unlock(&worker->stats_snapshot_mutex);
 }
 
@@ -416,6 +418,7 @@ static void add_worker_stats(struct bpf2socks_bridge_stats *total, const struct 
     total->udp_binding_hash_collision_steps += stats->udp_binding_hash_collision_steps;
     total->dns_free_stack_allocations += stats->dns_free_stack_allocations;
     total->dns_full_table_evictions += stats->dns_full_table_evictions;
+    total->udp_drops_send_busy += stats->udp_drops_send_busy;
 }
 
 static int stats_path_from_pid_path(const char *pid_path, char *out, size_t out_size) {
@@ -497,7 +500,9 @@ static void *bridge_stats_thread(void *arg) {
         struct bpf2socks_bridge_stats stats;
         aggregate_worker_stats(args->workers, args->worker_count, &stats);
         (void)write_stats_snapshot(args->stats_path, &stats);
-        sleep(1U);
+        /* Sleep one second, but end at once when the stop event fires. */
+        struct pollfd stop_poll = {.fd = bpf2socks_stop_event_fd(), .events = POLLIN};
+        if (stop_poll.fd < 0 || poll(&stop_poll, 1U, 1000) < 0) sleep(1U);
     }
     struct bpf2socks_bridge_stats stats;
     aggregate_worker_stats(args->workers, args->worker_count, &stats);
@@ -528,6 +533,15 @@ static int start_stats_thread(
     return 0;
 }
 
+/* Zeroed and cache-line aligned, so per-thread statistics stay on their own lines. */
+static struct bpf2socks_bridge_worker *alloc_workers(uint32_t worker_count) {
+    void *memory = NULL;
+    size_t size = (size_t)worker_count * sizeof(struct bpf2socks_bridge_worker);
+    if (posix_memalign(&memory, _Alignof(struct bpf2socks_bridge_worker), size) != 0) return NULL;
+    memset(memory, 0, size);
+    return memory;
+}
+
 int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const char *pid_path) {
     if (config == NULL) return -1;
     uint32_t worker_count = normalized_worker_count(config);
@@ -541,7 +555,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
     if (bpf2socks_resolve_tcp_addr(config->socks_host, config->socks_port, &socks_addr, &socks_addr_len) < 0) {
         return -1;
     }
-    struct bpf2socks_bridge_worker *workers = calloc(worker_count, sizeof(*workers));
+    struct bpf2socks_bridge_worker *workers = alloc_workers(worker_count);
     struct bridge_worker_threads *threads = calloc(worker_count, sizeof(*threads));
     if (workers == NULL || threads == NULL) {
         free(workers);
@@ -620,7 +634,8 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
         }
     }
 
-    if (config->debug_stats && start_stats_thread(pid_path, workers, worker_count, &stats_thread) == 0) {
+    if (config->debug_stats && pid_file_enabled(pid_path) &&
+        start_stats_thread(pid_path, workers, worker_count, &stats_thread) == 0) {
         stats_started = true;
     }
 
@@ -698,8 +713,11 @@ int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_st
     size_t prior_full_size = offsetof(
         struct bpf2socks_bridge_stats,
         tcp_token_delete_failures);
+    size_t pre_send_busy_size = offsetof(
+        struct bpf2socks_bridge_stats,
+        udp_drops_send_busy);
     if ((bytes != legacy_size && bytes != previous_size && bytes != prior_full_size &&
-         bytes != sizeof(*out)) ||
+         bytes != pre_send_busy_size && bytes != sizeof(*out)) ||
         extra != EOF || read_error != 0 || close_result != 0) {
         memset(out, 0, sizeof(*out));
         errno = EIO;

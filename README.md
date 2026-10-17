@@ -18,6 +18,8 @@ make linux
 
 The output is `build/linux/bpf2socks`. Override standard Make variables such as `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, and `LDLIBS` when needed.
 
+`tc_redirect.bpf.c` is compiled for the BPF target and embedded into the executable. Linux builds need a BPF-capable Clang (`BPF_CLANG`, default `clang`) and the host UAPI headers (`BPF_INCLUDE_FLAGS`); Android builds use the NDK Clang and sysroot.
+
 ### Android
 
 Install the Android NDK, then expose it through `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_SDK_ROOT`, or `ANDROID_HOME`.
@@ -54,7 +56,9 @@ bpf2socks --stop --config FILE --pid FILE
 bpf2socks --stats --pid FILE
 ```
 
-`--probe` prints a JSON capability result and can use a configuration to probe its requested IPv6/policy features. `--start` loads BPF state and starts the bridge. `--stop` stops the PID and cleans resources described by the same configuration. `--stats` prints JSON bridge counters. Missing required arguments return `2`; runtime failures return `1`; success returns `0`.
+`--probe` prints a JSON capability result and can use a configuration to probe its requested IPv6/policy features. `--start` loads BPF state and starts the bridge; it holds `<pid>.lock` for its lifetime. `--stop` signals the PID only while that lock is held, so a stale PID file never signals an unrelated process, waits up to 10 seconds for the instance to finish its own cleanup, and then cleans resources described by the same configuration. `--pid /dev/null` disables the PID, lock, and statistics files for a caller that supervises the process itself. `--stats` prints JSON bridge counters (written only with `debugStats` and a real PID path). Missing required arguments return `2`; runtime failures return `1`; success returns `0`.
+
+Per-packet and per-connection failures are logged on the 1st, 2nd, 4th, 8th... occurrence of each message, so a persistent fault cannot flood the log.
 
 ## Configuration example
 
@@ -113,6 +117,8 @@ bpf2socks --stats --pid FILE
 
 `version` is accepted in generated configurations but is currently informational; the C parser does not branch on it.
 
+A present field must be well formed: numbers are unsigned decimals within their type (ports at most 65535, `policy.mode` at most 2), strings and list entries must fit their buffers, and lists must not exceed their documented limits. A violation rejects the configuration instead of truncating or wrapping the value.
+
 ### Optional runtime fields
 
 | Field | Default / normalization |
@@ -129,7 +135,7 @@ bpf2socks --stats --pid FILE
 | `tcpConnectTimeoutMilliseconds` | 10000; normalized to 1000–60000. |
 | `tcpIdleTimeoutMilliseconds` | 300000; non-zero values normalized to 1000–3600000. Zero disables the idle timeout. |
 | `udpSocketBufferSize` | 524288 bytes; zero resets to the default. |
-| `udpBatchSize` | 32; zero resets to the default. |
+| `udpBatchSize` | 32; zero resets to the default; capped at 64 datagrams per system call. |
 | `maxUdpSessions` | 4096; zero resets to the default. |
 | `maxUdpBindings` | 16384; raised to at least `maxUdpSessions`. |
 | `udpIdleTimeoutSeconds` | 60; zero resets to the default. |

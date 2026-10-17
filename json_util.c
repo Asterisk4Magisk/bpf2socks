@@ -59,13 +59,33 @@ const char *bpf2socks_json_object(const char *json, const char *key) {
     return strchr(value, '{');
 }
 
-uint32_t bpf2socks_json_uint(
+bool bpf2socks_json_has_key(const char *json, const char *key) {
+    return json_value_pos(json, key) != NULL;
+}
+
+/* Parses an unsigned decimal at pos; no sign, at most max_value. */
+static bool parse_json_uint(const char *pos, uint32_t max_value, uint32_t *value, const char **end_out) {
+    pos = skip_json_whitespace(pos);
+    if (*pos < '0' || *pos > '9') return false;
+    uint64_t parsed = 0U;
+    while (*pos >= '0' && *pos <= '9') {
+        parsed = parsed * 10U + (uint64_t)(*pos - '0');
+        if (parsed > max_value) return false;
+        ++pos;
+    }
+    *value = (uint32_t)parsed;
+    if (end_out != NULL) *end_out = pos;
+    return true;
+}
+
+bool bpf2socks_json_uint_field(
     const char *json,
     const char *key,
-    uint32_t fallback) {
+    uint32_t max_value,
+    uint32_t *value) {
     const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return fallback;
-    return (uint32_t)strtoul(pos, NULL, 10);
+    if (pos == NULL) return true;
+    return parse_json_uint(pos, max_value, value, NULL);
 }
 
 bool bpf2socks_json_bool(
@@ -94,13 +114,17 @@ bool bpf2socks_json_string(
     const char *end = strchr(pos, '"');
     if (end == NULL) return false;
     size_t length = (size_t)(end - pos);
-    if (length >= out_size) length = out_size - 1U;
+    /* A truncated path or address would silently name a different resource. */
+    if (length >= out_size) {
+        out[0] = '\0';
+        return false;
+    }
     memcpy(out, pos, length);
     out[length] = '\0';
     return true;
 }
 
-void bpf2socks_json_uint_array(
+bool bpf2socks_json_uint_array(
     const char *json,
     const char *key,
     uint32_t *out,
@@ -108,18 +132,19 @@ void bpf2socks_json_uint_array(
     size_t max_count) {
     *count = 0U;
     const char *pos = json_value_pos(json, key);
-    if (pos == NULL) return;
-    pos = strchr(pos, '[');
-    if (pos == NULL) return;
-    ++pos;
-    while (*pos != '\0' && *pos != ']' && *count < max_count) {
-        while (json_whitespace(*pos) || *pos == ',') ++pos;
-        if (*pos == ']') break;
-        char *end = NULL;
-        unsigned long value = strtoul(pos, &end, 10);
-        if (end == pos) break;
-        out[(*count)++] = (uint32_t)value;
-        pos = end;
+    if (pos == NULL) return true;
+    pos = skip_json_whitespace(pos);
+    if (*pos != '[') return false;
+    pos = skip_json_whitespace(pos + 1);
+    if (*pos == ']') return true;
+    for (;;) {
+        if (*count >= max_count) return false;
+        if (!parse_json_uint(pos, UINT32_MAX, &out[*count], &pos)) return false;
+        ++(*count);
+        pos = skip_json_whitespace(pos);
+        if (*pos == ']') return true;
+        if (*pos != ',') return false;
+        pos = skip_json_whitespace(pos + 1);
     }
 }
 
@@ -162,7 +187,7 @@ bool bpf2socks_json_string_array(
         const char *end = strchr(pos, '"');
         if (end == NULL) return false;
         size_t length = (size_t)(end - pos);
-        if (length >= row_size) length = row_size - 1U;
+        if (length >= row_size) return false;
         char *slot = out + (*count * row_size);
         memcpy(slot, pos, length);
         slot[length] = '\0';

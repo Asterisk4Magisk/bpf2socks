@@ -5,6 +5,7 @@
 
 #include "bridge_dns.h"
 #include "bridge_internal.h"
+#include "log_throttle.h"
 #include "udp_downlink_queue.h"
 
 #include <arpa/inet.h>
@@ -762,7 +763,7 @@ static int evict_binding(
         return -1;
     }
     destroy_binding(state, session, binding);
-    ++worker->stats.udp_binding_evictions;
+    ++worker->udp_stats.udp_binding_evictions;
     return 0;
 }
 
@@ -1560,6 +1561,46 @@ static int create_udp_associate_relay_socket(
     return 0;
 }
 
+static bool udp_send_errno_is_transient(int error) {
+    return error == EAGAIN || error == EWOULDBLOCK || error == ENOBUFS || error == ENOMEM;
+}
+
+/*
+ * Sends datagrams to the session's SOCKS5 relay. A full send buffer drops the
+ * datagrams it cannot take, as a congested link would, and keeps the session
+ * with every reply binding alive. Returns how many were sent, or -1 when the
+ * relay socket failed and the session must be dropped.
+ */
+static int send_udp_relay_batch(
+    struct bpf2socks_bridge_worker *worker,
+    struct bpf2socks_udp_client_session *session,
+    const struct bpf2socks_udp_msg *messages,
+    unsigned int count) {
+    unsigned int sent_total = 0U;
+    while (sent_total < count) {
+        int sent = bpf2socks_socks5_udp_sendmmsg(
+            session->udp_fd,
+            relay_destination(&session->relay_addr, session->relay_connected),
+            session->relay_addr_len,
+            messages + sent_total,
+            count - sent_total);
+        if (sent > 0) {
+            sent_total += (unsigned int)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && udp_send_errno_is_transient(errno)) {
+            worker->udp_stats.udp_drops_send_busy += (uint64_t)(count - sent_total);
+            break;
+        }
+        if (sent == 0) errno = EIO;
+        return -1;
+    }
+    worker->udp_stats.udp_packets_to_upstream += (uint64_t)sent_total;
+    worker->udp_stats.udp_copy_sends += (uint64_t)sent_total;
+    return (int)sent_total;
+}
+
 static int flush_session_pending_packets(
     struct udp_state *state,
     struct bpf2socks_bridge_worker *worker,
@@ -1579,27 +1620,16 @@ static int flush_session_pending_packets(
             packets[count] = packet;
             ++count;
         }
-        int sent = bpf2socks_socks5_udp_sendmmsg(
-            session->udp_fd,
-            relay_destination(&session->relay_addr, session->relay_connected),
-            session->relay_addr_len,
-            messages,
-            count);
-        if (sent <= 0) return -1;
-        worker->stats.udp_packets_to_upstream += (uint64_t)sent;
-        worker->stats.udp_copy_sends += (uint64_t)sent;
+        if (send_udp_relay_batch(worker, session, messages, count) < 0) return -1;
         session->last_seen_ms = monotonic_ms();
         lru_touch(state, session);
-        for (int i = 0; i < sent; ++i) {
+        /* Datagrams the relay socket could not take were counted and dropped. */
+        for (unsigned int i = 0U; i < count; ++i) {
             struct bpf2socks_udp_pending_packet *packet = packets[i];
             if (session->pending_head == packet) session->pending_head = packet->next;
             if (session->pending_tail == packet) session->pending_tail = NULL;
             if (session->pending_count > 0U) --session->pending_count;
             release_pending_packet(state, packet);
-        }
-        if ((unsigned int)sent < count) {
-            errno = EIO;
-            return -1;
         }
     }
     session->pending_tail = NULL;
@@ -1615,7 +1645,7 @@ static int complete_udp_associate(
         return -1;
     }
     session->stage = BPF2SOCKS_UDP_SESSION_READY;
-    ++worker->stats.udp_associate_creates;
+    ++worker->udp_stats.udp_associate_creates;
     return flush_session_pending_packets(state, worker, session);
 }
 
@@ -1732,7 +1762,7 @@ static struct bpf2socks_udp_client_session *alloc_session(struct udp_state *stat
         return NULL;
     }
     drop_session(state, victim);
-    ++worker->stats.udp_session_evictions;
+    ++worker->udp_stats.udp_session_evictions;
     return alloc_session(state, worker);
 }
 
@@ -1749,8 +1779,8 @@ static struct bpf2socks_udp_reply_binding *find_binding(
         original,
         &collision_steps);
     if (worker != NULL) {
-        ++worker->stats.udp_binding_hash_lookups;
-        worker->stats.udp_binding_hash_collision_steps += collision_steps;
+        ++worker->udp_stats.udp_binding_hash_lookups;
+        worker->udp_stats.udp_binding_hash_collision_steps += collision_steps;
     }
     return binding;
 }
@@ -1779,7 +1809,7 @@ static struct bpf2socks_udp_reply_binding *create_binding(
         bool reply_raw = false;
         int reply_fd = create_udp_client_reply_socket(original, &reply_raw);
         if (reply_fd < 0) {
-            fprintf(stderr, "failed to create UDP original reply socket: errno=%d\n", errno);
+            BPF2SOCKS_LOG_THROTTLED("failed to create UDP original reply socket: errno=%d", errno);
             release_binding(state, binding);
             return NULL;
         }
@@ -1797,8 +1827,8 @@ static struct bpf2socks_udp_reply_binding *create_binding(
     binding_global_lru_add_tail(state, binding);
     ++session->binding_count;
     ++state->binding_count;
-    ++worker->stats.udp_reply_binding_creates;
-    if (fullcone) ++worker->stats.udp_fullcone_binding_creates;
+    ++worker->udp_stats.udp_reply_binding_creates;
+    if (fullcone) ++worker->udp_stats.udp_fullcone_binding_creates;
     return binding;
 }
 
@@ -1848,12 +1878,12 @@ static struct bpf2socks_udp_client_session *get_session(
         if (packet->token_lookup_mode != BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN) {
             session->token_lookup_mode = packet->token_lookup_mode;
         }
-        ++worker->stats.udp_session_hits;
-        ++worker->stats.udp_associate_reuses;
+        ++worker->udp_stats.udp_session_hits;
+        ++worker->udp_stats.udp_associate_reuses;
         return session;
     }
 
-    ++worker->stats.udp_session_misses;
+    ++worker->udp_stats.udp_session_misses;
     session = alloc_session(state, worker);
     if (session == NULL) return NULL;
     memset(session, 0, sizeof(*session));
@@ -1941,15 +1971,15 @@ static int lookup_udp_original(
             preference,
             &original,
             &trace);
-    worker->stats.udp_token_lookup_full_attempts += trace.full_client_attempts;
-    worker->stats.udp_token_lookup_zero_attempts += trace.zero_client_attempts;
+    worker->udp_stats.udp_token_lookup_full_attempts += trace.full_client_attempts;
+    worker->udp_stats.udp_token_lookup_zero_attempts += trace.zero_client_attempts;
     if (trace.matched_mode == BPF2SOCKS_UDP_TOKEN_LOOKUP_FULL_CLIENT) {
-        ++worker->stats.udp_token_lookup_full_hits;
+        ++worker->udp_stats.udp_token_lookup_full_hits;
     } else if (trace.matched_mode == BPF2SOCKS_UDP_TOKEN_LOOKUP_ZERO_CLIENT) {
-        ++worker->stats.udp_token_lookup_zero_hits;
+        ++worker->udp_stats.udp_token_lookup_zero_hits;
     }
     if (trace.full_client_attempts != 0U && trace.zero_client_attempts != 0U) {
-        ++worker->stats.udp_token_lookup_fallbacks;
+        ++worker->udp_stats.udp_token_lookup_fallbacks;
     }
     if (lookup_result < 0) {
         if (packet->has_original_dst) {
@@ -2117,8 +2147,8 @@ static int flush_downlink_channel(
         uint64_t now_ms = monotonic_ms();
         session->last_seen_ms = now_ms;
         packet->binding->last_seen_ms = now_ms;
-        ++worker->stats.udp_packets_to_client;
-        ++worker->stats.udp_copy_sends;
+        ++worker->udp_stats.udp_packets_to_client;
+        ++worker->udp_stats.udp_copy_sends;
         (void)bpf2socks_udp_downlink_queue_pop(&channel->queue);
         release_downlink_packet(state, session, packet);
     }
@@ -2171,8 +2201,8 @@ static int flush_udp_downlink_batch(
     int accepted = sent > 0 ? sent : 0;
     for (int i = 0; i < accepted; ++i) {
         batch->bindings[i]->last_seen_ms = now_ms;
-        ++worker->stats.udp_packets_to_client;
-        ++worker->stats.udp_copy_sends;
+        ++worker->udp_stats.udp_packets_to_client;
+        ++worker->udp_stats.udp_copy_sends;
     }
     if (result == BPF2SOCKS_UDP_DOWNLINK_SEND_RETRY) {
         if (state == NULL || batch->session->udp_fd < 0) {
@@ -2307,10 +2337,10 @@ static void expire_dns_transactions(
         BPF2SOCKS_DNS_MAX_EXPIRE_PER_LOOP,
         stale_channels,
         BPF2SOCKS_DNS_CHANNELS_PER_WORKER);
-    worker->stats.dns_transaction_timeouts += (uint64_t)expired;
+    worker->udp_stats.dns_transaction_timeouts += (uint64_t)expired;
     for (uint32_t i = 0U; i < BPF2SOCKS_DNS_CHANNELS_PER_WORKER; ++i) {
         if (!stale_channels[i]) continue;
-        ++worker->stats.dns_channel_timeout_rebuilds;
+        ++worker->udp_stats.dns_channel_timeout_rebuilds;
         close_dns_channel(state, &state->dns_channels[i], now_ms);
     }
 }
@@ -2580,7 +2610,7 @@ static int advance_dns_channel(
             channel->stage_started_ms = 0U;
             if (mod_udp_epoll_fd_events(
                     state, channel->tcp_fd, &channel->control_ref, EPOLLIN | EPOLLRDHUP) < 0) return -1;
-            ++worker->stats.udp_associate_creates;
+            ++worker->udp_stats.udp_associate_creates;
             return 0;
 
         default:
@@ -2610,7 +2640,7 @@ static int ensure_dns_channel(
         channel->tcp_fd >= 0 &&
         channel->udp_fd >= 0 &&
         udp_control_fd_is_healthy(channel->tcp_fd)) {
-        ++worker->stats.udp_associate_reuses;
+        ++worker->udp_stats.udp_associate_reuses;
         return 0;
     }
     if (channel != NULL && channel->stage != DNS_CHANNEL_IDLE &&
@@ -2668,9 +2698,9 @@ static int prepare_dns_client_packet(
         now_ms);
     if (tx == NULL) return -1;
     if (allocate_from_free_stack) {
-        ++worker->stats.dns_free_stack_allocations;
+        ++worker->udp_stats.dns_free_stack_allocations;
     } else {
-        ++worker->stats.dns_full_table_evictions;
+        ++worker->udp_stats.dns_full_table_evictions;
     }
 
     channel = &state->dns_channels[tx->channel_index];
@@ -2738,7 +2768,7 @@ static void flush_dns_outgoing_packets(
             send_messages,
             send_count);
         if (sent <= 0) {
-            ++worker->stats.udp_send_errors;
+            ++worker->udp_stats.udp_send_errors;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
                 for (unsigned int j = 0U; j < send_count; ++j) {
                     bpf2socks_dns_table_release(&state->dns_table, send_transactions[j]);
@@ -2748,10 +2778,10 @@ static void flush_dns_outgoing_packets(
             }
             continue;
         }
-        worker->stats.udp_packets_to_upstream += (uint64_t)sent;
-        worker->stats.udp_copy_sends += (uint64_t)sent;
+        worker->udp_stats.udp_packets_to_upstream += (uint64_t)sent;
+        worker->udp_stats.udp_copy_sends += (uint64_t)sent;
         if ((unsigned int)sent < send_count) {
-            ++worker->stats.udp_send_errors;
+            ++worker->udp_stats.udp_send_errors;
             for (unsigned int j = (unsigned int)sent; j < send_count; ++j) {
                 bpf2socks_dns_table_release(&state->dns_table, send_transactions[j]);
             }
@@ -2798,8 +2828,8 @@ static int send_dns_response_with_binding(
                 ? send_raw_udp6_to_client(binding->reply_fd, session, binding, message->payload, message->payload_len)
                 : send_raw_udp_to_client(binding->reply_fd, session, binding, message->payload, message->payload_len);
             if (send_result < 0) return -1;
-            ++worker->stats.udp_packets_to_client;
-            ++worker->stats.udp_copy_sends;
+            ++worker->udp_stats.udp_packets_to_client;
+            ++worker->udp_stats.udp_copy_sends;
             return 0;
         }
         struct udp_downlink_batch batch;
@@ -2869,6 +2899,19 @@ static int send_dns_response_to_client(
     return send_dns_response_with_binding(worker, &session, &binding, message);
 }
 
+/* Counts a relay datagram that recvmmsg could not decode; true means skip it. */
+static bool skip_unusable_relay_datagram(
+    struct bpf2socks_bridge_worker *worker,
+    const struct bpf2socks_udp_msg *message) {
+    if (message->error == 0) return false;
+    if (message->error == EMSGSIZE) {
+        ++worker->udp_stats.udp_drops_oversized;
+    } else {
+        ++worker->udp_stats.udp_drops_malformed_socks5;
+    }
+    return true;
+}
+
 static void handle_dns_upstream_packets(
     struct udp_state *state,
     struct bpf2socks_bridge_worker *worker,
@@ -2885,7 +2928,7 @@ static void handle_dns_upstream_packets(
         channel->relay_paused = true;
         if (mod_udp_epoll_fd_events(
                 state, channel->udp_fd, &channel->relay_ref, 0U) < 0) {
-            ++worker->stats.udp_send_errors;
+            ++worker->udp_stats.udp_send_errors;
         }
         return;
     }
@@ -2897,7 +2940,7 @@ static void handle_dns_upstream_packets(
     if (received <= 0) {
         if (state->pending_budget != NULL) release_downlink_read_reservation(state);
         if (received < 0 && errno == EMSGSIZE) {
-            ++worker->stats.udp_drops_oversized;
+            ++worker->udp_stats.udp_drops_oversized;
             return;
         }
         if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -2908,10 +2951,11 @@ static void handle_dns_upstream_packets(
     release_downlink_read_reservation(state);
 
     for (int i = 0; i < received; ++i) {
-        ++worker->stats.udp_packets_from_upstream;
+        ++worker->udp_stats.udp_packets_from_upstream;
+        if (skip_unusable_relay_datagram(worker, &messages[i])) continue;
         struct bpf2socks_dns_packet_info info;
         if (bpf2socks_dns_parse_response(messages[i].payload, messages[i].payload_len, &info) < 0) {
-            ++worker->stats.udp_drops_malformed_socks5;
+            ++worker->udp_stats.udp_drops_malformed_socks5;
             continue;
         }
         struct bpf2socks_dns_transaction *tx =
@@ -2919,12 +2963,12 @@ static void handle_dns_upstream_packets(
         if (tx == NULL) continue;
         if (info.has_question && info.question_fingerprint != tx->question_fingerprint) continue;
         bpf2socks_dns_table_note_response(&state->dns_table, channel->index);
-        ++worker->stats.dns_valid_responses;
+        ++worker->udp_stats.dns_valid_responses;
 
         bpf2socks_dns_set_id(messages[i].payload, messages[i].payload_len, tx->original_id);
         if (send_dns_response_to_client(state, worker, tx, &messages[i]) < 0) {
-            ++worker->stats.udp_send_errors;
-            fprintf(stderr, "failed to send DNS response to client: errno=%d\n", errno);
+            ++worker->udp_stats.udp_send_errors;
+            BPF2SOCKS_LOG_THROTTLED("failed to send DNS response to client: errno=%d", errno);
             bpf2socks_dns_table_release(&state->dns_table, tx);
             continue;
         }
@@ -2966,7 +3010,7 @@ static void handle_udp_client_packets(
     int received = recvmmsg(listener_fd, vec, batch, MSG_DONTWAIT, NULL);
     if (received < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            fprintf(stderr, "failed to receive UDP client packet batch: errno=%d\n", errno);
+            BPF2SOCKS_LOG_THROTTLED("failed to receive UDP client packet batch: errno=%d", errno);
         }
         return;
     }
@@ -2986,8 +3030,8 @@ static void handle_udp_client_packets(
         struct udp_client_packet packet;
         memset(&packet, 0, sizeof(packet));
         if ((vec[i].msg_hdr.msg_flags & MSG_TRUNC) != 0 || vec[i].msg_len > payload_stride) {
-            ++worker->stats.udp_drops_oversized;
-            fprintf(stderr, "dropping truncated UDP client packet: len=%u flags=0x%x\n",
+            ++worker->udp_stats.udp_drops_oversized;
+            BPF2SOCKS_LOG_THROTTLED("dropping truncated UDP client packet: len=%u flags=0x%x",
                 vec[i].msg_len,
                 vec[i].msg_hdr.msg_flags);
             continue;
@@ -2996,7 +3040,7 @@ static void handle_udp_client_packets(
         packet.client_addr_len = vec[i].msg_hdr.msg_namelen;
         packet.payload = client_payloads + (size_t)i * payload_stride;
         packet.payload_len = vec[i].msg_len;
-        ++worker->stats.udp_packets_from_client;
+        ++worker->udp_stats.udp_packets_from_client;
 
         struct bpf2socks_udp_client_session *existing_session = NULL;
         int parse_result = parse_udp_client_packet_cmsgs(&vec[i].msg_hdr, worker->config, &packet);
@@ -3007,8 +3051,8 @@ static void handle_udp_client_packets(
             ? existing_session->token_lookup_mode
             : BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN;
         if (parse_result < 0 || lookup_udp_original(state, worker, &packet, preference, now_ms) < 0) {
-            ++worker->stats.udp_token_misses;
-            fprintf(stderr, "missing UDP original destination: errno=%d\n", errno);
+            ++worker->udp_stats.udp_token_misses;
+            BPF2SOCKS_LOG_THROTTLED("missing UDP original destination: errno=%d", errno);
             continue;
         }
         if (existing_session != NULL && packet.token_lookup_mode != BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN) {
@@ -3037,7 +3081,7 @@ static void handle_udp_client_packets(
 
         struct bpf2socks_udp_client_session *session = get_session(state, &packet, worker, existing_session);
         if (session == NULL) {
-            fprintf(stderr, "SOCKS5 UDP ASSOCIATE failed: errno=%d\n", errno);
+            BPF2SOCKS_LOG_THROTTLED("SOCKS5 UDP ASSOCIATE failed: errno=%d", errno);
             continue;
         }
         struct bpf2socks_udp_reply_binding *binding = find_binding(
@@ -3046,7 +3090,7 @@ static void handle_udp_client_packets(
             binding = create_packet_binding(state, session, &packet, worker);
             if (binding == NULL) continue;
         } else {
-            ++worker->stats.udp_reply_binding_hits;
+            ++worker->udp_stats.udp_reply_binding_hits;
             memcpy(binding->token_addr, packet.token_addr, packet.token_family == AF_INET6 ? 16U : 4U);
             bool needs_original_reply_socket =
                 !original_uses_connected_udp_token(&packet) &&
@@ -3057,7 +3101,7 @@ static void handle_udp_client_packets(
                 bool reply_raw = false;
                 int reply_fd = create_udp_client_reply_socket(&binding->original_dst, &reply_raw);
                 if (reply_fd < 0) {
-                    fprintf(stderr, "failed to create UDP original reply socket: errno=%d\n", errno);
+                    BPF2SOCKS_LOG_THROTTLED("failed to create UDP original reply socket: errno=%d", errno);
                     continue;
                 }
                 set_binding_reply_fd(binding, reply_fd, reply_raw);
@@ -3076,15 +3120,15 @@ static void handle_udp_client_packets(
                     packet.payload_len,
                     payload_stride) < 0) {
                 if (errno == ENOBUFS) {
-                    ++worker->stats.udp_drops_pending_budget;
-                    uint64_t drops = worker->stats.udp_drops_pending_budget;
+                    ++worker->udp_stats.udp_drops_pending_budget;
+                    uint64_t drops = worker->udp_stats.udp_drops_pending_budget;
                     if ((drops & (drops - 1U)) == 0U) {
                         fprintf(stderr,
                             "dropping UDP pending packet: pending budget exhausted (drops=%llu)\n",
                             (unsigned long long)drops);
                     }
                 } else {
-                    ++worker->stats.udp_send_errors;
+                    ++worker->udp_stats.udp_send_errors;
                 }
             }
             continue;
@@ -3112,22 +3156,9 @@ static void handle_udp_client_packets(
             send_batch.messages[send_batch.count++] = outgoing_messages[j];
             outgoing_sessions[j] = NULL;
         }
-        int sent = bpf2socks_socks5_udp_sendmmsg(
-                session->udp_fd,
-                relay_destination(&session->relay_addr, session->relay_connected),
-                session->relay_addr_len,
-                send_batch.messages,
-                send_batch.count);
-        if (sent <= 0) {
-            ++worker->stats.udp_send_errors;
-            fprintf(stderr, "SOCKS5 UDP send failed: errno=%d\n", errno);
-            drop_session(state, session);
-            continue;
-        }
-        worker->stats.udp_packets_to_upstream += (uint64_t)sent;
-        worker->stats.udp_copy_sends += (uint64_t)sent;
-        if ((unsigned int)sent < send_batch.count) {
-            ++worker->stats.udp_send_errors;
+        if (send_udp_relay_batch(worker, session, send_batch.messages, send_batch.count) < 0) {
+            ++worker->udp_stats.udp_send_errors;
+            BPF2SOCKS_LOG_THROTTLED("SOCKS5 UDP send failed: errno=%d", errno);
             drop_session(state, session);
         }
     }
@@ -3146,7 +3177,7 @@ static void handle_udp_upstream_packets(
             &state->downlink_budget_waiters,
             &session->downlink_waiting_budget);
         if (set_session_downlink_pause(state, session, true) < 0) {
-            ++worker->stats.udp_send_errors;
+            ++worker->udp_stats.udp_send_errors;
             drop_session(state, session);
         }
         return;
@@ -3160,7 +3191,7 @@ static void handle_udp_upstream_packets(
         release_downlink_read_reservation(state);
         errno = receive_errno;
         if (received < 0 && errno == EMSGSIZE) {
-            ++worker->stats.udp_drops_oversized;
+            ++worker->udp_stats.udp_drops_oversized;
             return;
         }
         if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) drop_session(state, session);
@@ -3172,24 +3203,25 @@ static void handle_udp_upstream_packets(
     bool drop_session_after_reservation = false;
 
     for (int i = 0; i < received; ++i) {
-        ++worker->stats.udp_packets_from_upstream;
+        ++worker->udp_stats.udp_packets_from_upstream;
+        if (skip_unusable_relay_datagram(worker, &messages[i])) continue;
         struct bpf2socks_udp_reply_binding *binding = find_binding(
             state, session, &messages[i].addr, worker);
         if (binding == NULL) {
             binding = create_fullcone_binding(state, session, &messages[i].addr, worker);
             if (binding == NULL) {
-                ++worker->stats.udp_drops_malformed_socks5;
+                ++worker->udp_stats.udp_drops_malformed_socks5;
                 continue;
             }
         } else {
-            ++worker->stats.udp_reply_binding_hits;
+            ++worker->udp_stats.udp_reply_binding_hits;
             binding_lru_touch(state, session, binding);
         }
         if (binding->reply_fd >= 0) {
             if (binding->reply_raw) {
                 if (flush_udp_downlink_batch(state, &downlink_batch, worker) < 0) {
-                    ++worker->stats.udp_send_errors;
-                    fprintf(stderr, "failed to send UDP response batch to client: errno=%d\n", errno);
+                    ++worker->udp_stats.udp_send_errors;
+                    BPF2SOCKS_LOG_THROTTLED("failed to send UDP response batch to client: errno=%d", errno);
                     drop_session_after_reservation = true;
                     goto done;
                 }
@@ -3202,8 +3234,8 @@ static void handle_udp_upstream_packets(
                             binding->reply_fd,
                             false,
                             true) < 0) {
-                        ++worker->stats.udp_send_errors;
-                        fprintf(stderr, "failed to queue UDP raw response to client: errno=%d\n", errno);
+                        ++worker->udp_stats.udp_send_errors;
+                        BPF2SOCKS_LOG_THROTTLED("failed to queue UDP raw response to client: errno=%d", errno);
                         drop_session_after_reservation = true;
                         goto done;
                     }
@@ -3237,16 +3269,16 @@ static void handle_udp_upstream_packets(
                             continue;
                         }
                     }
-                    ++worker->stats.udp_send_errors;
-                    fprintf(stderr, "failed to send UDP response to client: errno=%d\n", errno);
+                    ++worker->udp_stats.udp_send_errors;
+                    BPF2SOCKS_LOG_THROTTLED("failed to send UDP response to client: errno=%d", errno);
                     drop_session_after_reservation = true;
                     goto done;
                 }
                 uint64_t now_ms = monotonic_ms();
                 session->last_seen_ms = now_ms;
                 binding->last_seen_ms = now_ms;
-                ++worker->stats.udp_packets_to_client;
-                ++worker->stats.udp_copy_sends;
+                ++worker->udp_stats.udp_packets_to_client;
+                ++worker->udp_stats.udp_copy_sends;
             } else {
                 if (queue_udp_downlink_batch(
                         state,
@@ -3257,8 +3289,8 @@ static void handle_udp_upstream_packets(
                         &messages[i],
                         binding->reply_fd,
                         false) < 0) {
-                    ++worker->stats.udp_send_errors;
-                    fprintf(stderr, "failed to send UDP response batch to client: errno=%d\n", errno);
+                    ++worker->udp_stats.udp_send_errors;
+                    BPF2SOCKS_LOG_THROTTLED("failed to send UDP response batch to client: errno=%d", errno);
                     drop_session_after_reservation = true;
                     goto done;
                 }
@@ -3276,8 +3308,8 @@ static void handle_udp_upstream_packets(
                     &messages[i],
                     reply_listener_fd,
                     true) < 0) {
-                ++worker->stats.udp_send_errors;
-                fprintf(stderr, "failed to send UDP response batch to client: errno=%d\n", errno);
+                ++worker->udp_stats.udp_send_errors;
+                BPF2SOCKS_LOG_THROTTLED("failed to send UDP response batch to client: errno=%d", errno);
                 drop_session_after_reservation = true;
                 goto done;
             }
@@ -3285,8 +3317,8 @@ static void handle_udp_upstream_packets(
     }
 
     if (flush_udp_downlink_batch(state, &downlink_batch, worker) < 0) {
-        ++worker->stats.udp_send_errors;
-        fprintf(stderr, "failed to send UDP response batch to client: errno=%d\n", errno);
+        ++worker->udp_stats.udp_send_errors;
+        BPF2SOCKS_LOG_THROTTLED("failed to send UDP response batch to client: errno=%d", errno);
         drop_session_after_reservation = true;
     }
 
@@ -3337,7 +3369,7 @@ static void evict_idle_bindings(
         }
         struct bpf2socks_udp_client_session *session = binding->owner;
         destroy_binding(state, session, binding);
-        ++worker->stats.udp_binding_evictions;
+        ++worker->udp_stats.udp_binding_evictions;
         binding = next;
     }
 }
@@ -3655,7 +3687,7 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
                 ref->session->used) {
                 if (ref->session->stage != BPF2SOCKS_UDP_SESSION_READY) {
                     if (advance_udp_associate(&state, worker, ref->session, events) < 0) {
-                        ++worker->stats.udp_send_errors;
+                        ++worker->udp_stats.udp_send_errors;
                         drop_session(&state, ref->session);
                     }
                 } else {
@@ -3675,12 +3707,12 @@ int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker) {
                 ref->session != NULL &&
                 ref->session->used) {
                 if ((events & (EPOLLERR | EPOLLHUP)) != 0) {
-                    ++worker->stats.udp_send_errors;
+                    ++worker->udp_stats.udp_send_errors;
                     drop_session(&state, ref->session);
                 } else if ((events & EPOLLOUT) != 0 &&
                     flush_downlink_channel(&state, worker, ref->downlink) < 0) {
-                    ++worker->stats.udp_send_errors;
-                    fprintf(stderr, "failed to retry UDP response to client: errno=%d\n", errno);
+                    ++worker->udp_stats.udp_send_errors;
+                    BPF2SOCKS_LOG_THROTTLED("failed to retry UDP response to client: errno=%d", errno);
                     drop_session(&state, ref->session);
                 }
             } else if (ref->kind == UDP_FD_DNS_CONTROL &&

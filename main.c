@@ -24,6 +24,9 @@
 #define BPF2SOCKS_FD_PER_WORKER_TCP_IPV6 1ULL
 #define BPF2SOCKS_FD_PER_WORKER_UDP 7ULL
 #define BPF2SOCKS_FD_PER_WORKER_UDP_IPV6 2ULL
+/* --stop waits up to 10 s for the instance to finish its own cleanup. */
+#define BPF2SOCKS_STOP_WAIT_ATTEMPTS 200U
+#define BPF2SOCKS_STOP_WAIT_STEP_MICROSECONDS 50000U
 
 static bool dns_enhancement_requested;
 
@@ -151,6 +154,22 @@ static void normalize_runtime_tunables(struct bpf2socks_runtime_config *config) 
     if (config->max_udp_bindings < config->worker_count) config->worker_count = config->max_udp_bindings;
 }
 
+static bool check_field(bool valid, const char *key) {
+    if (!valid) fprintf(stderr, "invalid bpf2socks config field: %s\n", key);
+    return valid;
+}
+
+/* An absent optional field keeps its default; a malformed or out-of-range one fails the config. */
+static bool read_uint_field(const char *json, const char *key, uint32_t max_value, uint32_t *value) {
+    return check_field(bpf2socks_json_uint_field(json, key, max_value, value), key);
+}
+
+/* A value that does not fit is rejected rather than truncated into another path or address. */
+static bool read_string_field(const char *json, const char *key, bool required, char *out, size_t out_size) {
+    if (!required && !bpf2socks_json_has_key(json, key)) return true;
+    return check_field(bpf2socks_json_string(json, key, out, out_size), key);
+}
+
 static int load_runtime_config(
     const char *path,
     struct bpf2socks_runtime_config *config,
@@ -164,20 +183,24 @@ static int load_runtime_config(
     }
 
     bool ok = true;
-    ok = bpf2socks_json_string(json, "socksHost", config->socks_host, sizeof(config->socks_host)) && ok;
-    config->socks_port = (uint16_t)bpf2socks_json_uint(json, "socksPort", 0U);
-    ok = bpf2socks_json_string(json, "bridgeListenAddress", config->listen_host, sizeof(config->listen_host)) && ok;
-    config->listen_port = (uint16_t)bpf2socks_json_uint(json, "bridgePort", 0U);
-    ok = bpf2socks_json_string(json, "pinnedObjectDir", config->pinned_object_dir, sizeof(config->pinned_object_dir)) && ok;
-    if (!bpf2socks_json_string(json, "cgroupPath", config->cgroup_path, sizeof(config->cgroup_path))) {
-        snprintf(config->cgroup_path, sizeof(config->cgroup_path), "%s", BPF2SOCKS_DEFAULT_CGROUP_PATH);
-    }
+    ok = read_string_field(json, "socksHost", true, config->socks_host, sizeof(config->socks_host)) && ok;
+    uint32_t socks_port = 0U;
+    ok = read_uint_field(json, "socksPort", UINT16_MAX, &socks_port) && ok;
+    config->socks_port = (uint16_t)socks_port;
+    ok = read_string_field(json, "bridgeListenAddress", true, config->listen_host, sizeof(config->listen_host)) && ok;
+    uint32_t listen_port = 0U;
+    ok = read_uint_field(json, "bridgePort", UINT16_MAX, &listen_port) && ok;
+    config->listen_port = (uint16_t)listen_port;
+    ok = read_string_field(
+        json, "pinnedObjectDir", true, config->pinned_object_dir, sizeof(config->pinned_object_dir)) && ok;
+    ok = read_string_field(json, "cgroupPath", false, config->cgroup_path, sizeof(config->cgroup_path)) && ok;
     config->enable_ipv6 = bpf2socks_json_bool(json, "enableIpv6", false);
     config->enable_dns_hijack = bpf2socks_json_bool(json, "enableDnsHijack", false);
     config->debug_stats =
         bpf2socks_json_bool(json, "debugStats", false) || env_bool_enabled("BPF2SOCKS_DEBUG_STATS");
-    char token_ipv4_prefix[INET_ADDRSTRLEN + 4U];
-    if (bpf2socks_json_string(json, "tokenIpv4Prefix", token_ipv4_prefix, sizeof(token_ipv4_prefix)) &&
+    char token_ipv4_prefix[INET_ADDRSTRLEN + 4U] = "";
+    ok = read_string_field(json, "tokenIpv4Prefix", false, token_ipv4_prefix, sizeof(token_ipv4_prefix)) && ok;
+    if (bpf2socks_json_has_key(json, "tokenIpv4Prefix") &&
         bpf2socks_parse_token_ipv4_prefix(
             token_ipv4_prefix,
             config->token_ipv4_prefix,
@@ -185,8 +208,9 @@ static int load_runtime_config(
         fprintf(stderr, "invalid bpf2socks IPv4 token prefix: %s\n", token_ipv4_prefix);
         ok = false;
     }
-    char token_ipv6_prefix[128];
-    if (bpf2socks_json_string(json, "tokenIpv6Prefix", token_ipv6_prefix, sizeof(token_ipv6_prefix)) &&
+    char token_ipv6_prefix[128] = "";
+    ok = read_string_field(json, "tokenIpv6Prefix", false, token_ipv6_prefix, sizeof(token_ipv6_prefix)) && ok;
+    if (bpf2socks_json_has_key(json, "tokenIpv6Prefix") &&
         bpf2socks_parse_token_ipv6_prefix(
             token_ipv6_prefix,
             config->token_ipv6_prefix,
@@ -194,41 +218,29 @@ static int load_runtime_config(
         fprintf(stderr, "invalid bpf2socks IPv6 token prefix: %s\n", token_ipv6_prefix);
         ok = false;
     }
-    config->worker_count = bpf2socks_json_uint(json, "workerCount", config->worker_count);
-    config->tcp_buffer_size = bpf2socks_json_uint(json, "tcpBufferSize", config->tcp_buffer_size);
-    config->max_tcp_sessions = bpf2socks_json_uint(json, "maxTcpSessions", config->max_tcp_sessions);
-    config->tcp_connect_timeout_milliseconds = bpf2socks_json_uint(
-        json,
-        "tcpConnectTimeoutMilliseconds",
-        config->tcp_connect_timeout_milliseconds);
-    config->tcp_idle_timeout_milliseconds = bpf2socks_json_uint(
-        json,
-        "tcpIdleTimeoutMilliseconds",
-        config->tcp_idle_timeout_milliseconds);
-    config->udp_socket_buffer_size = bpf2socks_json_uint(
-        json,
-        "udpSocketBufferSize",
-        config->udp_socket_buffer_size);
-    config->udp_batch_size = bpf2socks_json_uint(json, "udpBatchSize", config->udp_batch_size);
-    config->max_udp_sessions = bpf2socks_json_uint(json, "maxUdpSessions", config->max_udp_sessions);
-    config->max_udp_bindings = bpf2socks_json_uint(json, "maxUdpBindings", config->max_udp_bindings);
-    config->udp_idle_timeout_seconds = bpf2socks_json_uint(
-        json,
-        "udpIdleTimeoutSeconds",
-        config->udp_idle_timeout_seconds);
-    config->max_udp_pending_bytes = bpf2socks_json_uint(
-        json,
-        "maxUdpPendingBytes",
-        config->max_udp_pending_bytes);
-    config->dns_transaction_timeout_milliseconds = bpf2socks_json_uint(
+    ok = read_uint_field(json, "workerCount", UINT32_MAX, &config->worker_count) && ok;
+    ok = read_uint_field(json, "tcpBufferSize", UINT32_MAX, &config->tcp_buffer_size) && ok;
+    ok = read_uint_field(json, "maxTcpSessions", UINT32_MAX, &config->max_tcp_sessions) && ok;
+    ok = read_uint_field(
+        json, "tcpConnectTimeoutMilliseconds", UINT32_MAX, &config->tcp_connect_timeout_milliseconds) && ok;
+    ok = read_uint_field(
+        json, "tcpIdleTimeoutMilliseconds", UINT32_MAX, &config->tcp_idle_timeout_milliseconds) && ok;
+    ok = read_uint_field(json, "udpSocketBufferSize", UINT32_MAX, &config->udp_socket_buffer_size) && ok;
+    ok = read_uint_field(json, "udpBatchSize", UINT32_MAX, &config->udp_batch_size) && ok;
+    ok = read_uint_field(json, "maxUdpSessions", UINT32_MAX, &config->max_udp_sessions) && ok;
+    ok = read_uint_field(json, "maxUdpBindings", UINT32_MAX, &config->max_udp_bindings) && ok;
+    ok = read_uint_field(json, "udpIdleTimeoutSeconds", UINT32_MAX, &config->udp_idle_timeout_seconds) && ok;
+    ok = read_uint_field(json, "maxUdpPendingBytes", UINT32_MAX, &config->max_udp_pending_bytes) && ok;
+    ok = read_uint_field(
         json,
         "dnsTransactionTimeoutMilliseconds",
-        config->dns_transaction_timeout_milliseconds);
+        UINT32_MAX,
+        &config->dns_transaction_timeout_milliseconds) && ok;
     normalize_runtime_tunables(config);
 
     const char *policy_object = bpf2socks_json_object(json, "policy");
     const char *policy_json = policy_object != NULL ? policy_object : json;
-    policy->mode = bpf2socks_json_uint(policy_json, "mode", BPF2SOCKS_MODE_GLOBAL);
+    ok = read_uint_field(policy_json, "mode", BPF2SOCKS_MODE_GLOBAL, &policy->mode) && ok;
     policy->bypass_direct_cidrs = bpf2socks_json_bool(policy_json, "bypassDirectCidrs", false);
     policy->enable_ipv6 = config->enable_ipv6;
     policy->enable_dns_hijack = config->enable_dns_hijack;
@@ -237,44 +249,52 @@ static int load_runtime_config(
         fprintf(stderr, "DNS enhancement requires DNS interception\n");
         ok = false;
     }
-    (void)bpf2socks_json_string(
+    ok = read_string_field(
         policy_json,
         "directCidrPathV4",
+        false,
         policy->direct_cidr_path_v4,
-        sizeof(policy->direct_cidr_path_v4));
-    (void)bpf2socks_json_string(
+        sizeof(policy->direct_cidr_path_v4)) && ok;
+    ok = read_string_field(
         policy_json,
         "directCidrPathV6",
+        false,
         policy->direct_cidr_path_v6,
-        sizeof(policy->direct_cidr_path_v6));
-    bpf2socks_json_uint_array(
-        policy_json,
-        "uids",
-        policy->uids,
-        &policy->uid_count,
-        BPF2SOCKS_MAX_UIDS);
-    bpf2socks_json_uint_array(
-        policy_json,
-        "bypassUids",
-        policy->bypass_uids,
-        &policy->bypass_uid_count,
-        BPF2SOCKS_MAX_UIDS);
-    (void)bpf2socks_json_string_array(
-        json,
-        "hotspotInterfacePrefixes",
-        (char *)policy->hotspot_interface_prefixes,
-        BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
-        &policy->hotspot_interface_prefix_count,
-        BPF2SOCKS_MAX_INTERFACES);
-    if (!bpf2socks_json_string_array(
+        sizeof(policy->direct_cidr_path_v6)) && ok;
+    ok = check_field(
+        bpf2socks_json_uint_array(
+            policy_json,
+            "uids",
+            policy->uids,
+            &policy->uid_count,
+            BPF2SOCKS_MAX_UIDS),
+        "uids") && ok;
+    ok = check_field(
+        bpf2socks_json_uint_array(
+            policy_json,
+            "bypassUids",
+            policy->bypass_uids,
+            &policy->bypass_uid_count,
+            BPF2SOCKS_MAX_UIDS),
+        "bypassUids") && ok;
+    ok = check_field(
+        bpf2socks_json_string_array(
+            json,
+            "hotspotInterfacePrefixes",
+            (char *)policy->hotspot_interface_prefixes,
+            BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
+            &policy->hotspot_interface_prefix_count,
+            BPF2SOCKS_MAX_INTERFACES),
+        "hotspotInterfacePrefixes") && ok;
+    ok = check_field(
+        bpf2socks_json_string_array(
             json,
             "ignoredInterfaces",
             (char *)policy->ignored_interfaces,
             BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
             &policy->ignored_interface_count,
-            BPF2SOCKS_MAX_INTERFACES)) {
-        ok = false;
-    }
+            BPF2SOCKS_MAX_INTERFACES),
+        "ignoredInterfaces") && ok;
     for (size_t index = 0U; index < policy->ignored_interface_count; ++index) {
         if (!bpf2socks_interface_selector_valid(policy->ignored_interfaces[index])) {
             fprintf(
@@ -284,34 +304,42 @@ static int load_runtime_config(
             ok = false;
         }
     }
-    (void)bpf2socks_json_string_array(
-        json,
-        "proxyPrivateCidrsV4",
-        (char *)policy->proxy_private_cidrs_v4,
-        BPF2SOCKS_MAX_CIDR_TEXT_LEN,
-        &policy->proxy_private_cidr_v4_count,
-        BPF2SOCKS_MAX_POLICY_CIDRS);
-    (void)bpf2socks_json_string_array(
-        json,
-        "bypassPrivateCidrsV4",
-        (char *)policy->bypass_private_cidrs_v4,
-        BPF2SOCKS_MAX_CIDR_TEXT_LEN,
-        &policy->bypass_private_cidr_v4_count,
-        BPF2SOCKS_MAX_POLICY_CIDRS);
-    (void)bpf2socks_json_string_array(
-        json,
-        "proxyPrivateCidrsV6",
-        (char *)policy->proxy_private_cidrs_v6,
-        BPF2SOCKS_MAX_CIDR_TEXT_LEN,
-        &policy->proxy_private_cidr_v6_count,
-        BPF2SOCKS_MAX_POLICY_CIDRS);
-    (void)bpf2socks_json_string_array(
-        json,
-        "bypassPrivateCidrsV6",
-        (char *)policy->bypass_private_cidrs_v6,
-        BPF2SOCKS_MAX_CIDR_TEXT_LEN,
-        &policy->bypass_private_cidr_v6_count,
-        BPF2SOCKS_MAX_POLICY_CIDRS);
+    ok = check_field(
+        bpf2socks_json_string_array(
+            json,
+            "proxyPrivateCidrsV4",
+            (char *)policy->proxy_private_cidrs_v4,
+            BPF2SOCKS_MAX_CIDR_TEXT_LEN,
+            &policy->proxy_private_cidr_v4_count,
+            BPF2SOCKS_MAX_POLICY_CIDRS),
+        "proxyPrivateCidrsV4") && ok;
+    ok = check_field(
+        bpf2socks_json_string_array(
+            json,
+            "bypassPrivateCidrsV4",
+            (char *)policy->bypass_private_cidrs_v4,
+            BPF2SOCKS_MAX_CIDR_TEXT_LEN,
+            &policy->bypass_private_cidr_v4_count,
+            BPF2SOCKS_MAX_POLICY_CIDRS),
+        "bypassPrivateCidrsV4") && ok;
+    ok = check_field(
+        bpf2socks_json_string_array(
+            json,
+            "proxyPrivateCidrsV6",
+            (char *)policy->proxy_private_cidrs_v6,
+            BPF2SOCKS_MAX_CIDR_TEXT_LEN,
+            &policy->proxy_private_cidr_v6_count,
+            BPF2SOCKS_MAX_POLICY_CIDRS),
+        "proxyPrivateCidrsV6") && ok;
+    ok = check_field(
+        bpf2socks_json_string_array(
+            json,
+            "bypassPrivateCidrsV6",
+            (char *)policy->bypass_private_cidrs_v6,
+            BPF2SOCKS_MAX_CIDR_TEXT_LEN,
+            &policy->bypass_private_cidr_v6_count,
+            BPF2SOCKS_MAX_POLICY_CIDRS),
+        "bypassPrivateCidrsV6") && ok;
 
     free(json);
     if (!ok || config->socks_port == 0U || config->listen_port == 0U) {
@@ -563,7 +591,16 @@ static int start_with_config_unlocked(const char *path, const char *pid_path) {
     return result == 0 ? 0 : 1;
 }
 
+static bool pid_path_disabled(const char *pid_path) {
+    return strcmp(pid_path, "/dev/null") == 0;
+}
+
 static int start_with_config(const char *path, const char *pid_path) {
+    /*
+     * "--pid /dev/null" means the caller supervises this process and owns
+     * single-instance exclusion, so no "/dev/null.lock" is created in /dev.
+     */
+    if (pid_path_disabled(pid_path)) return start_with_config_unlocked(path, pid_path);
     char lock_path[BPF2SOCKS_MAX_PATH_LEN];
     int written = snprintf(lock_path, sizeof(lock_path), "%s.lock", pid_path);
     if (written < 0 || (size_t)written >= sizeof(lock_path)) {
@@ -592,10 +629,22 @@ static int start_with_config(const char *path, const char *pid_path) {
     return result;
 }
 
-static int stop_with_config(const char *path, const char *pid_path) {
-    struct bpf2socks_runtime_config config;
-    struct bpf2socks_policy_config policy;
-    if (load_runtime_config(path, &config, &policy) < 0) return 0;
+/*
+ * A running instance holds "<pid>.lock" for its whole life. A free lock means
+ * the PID file is stale and its PID may belong to another process, so nothing
+ * is signalled. Otherwise wait until the instance releases the lock, so the
+ * caller's cleanup never races the instance's own BPF restoration.
+ */
+static void stop_running_instance(const char *pid_path) {
+    char lock_path[BPF2SOCKS_MAX_PATH_LEN];
+    int written = snprintf(lock_path, sizeof(lock_path), "%s.lock", pid_path);
+    if (written < 0 || (size_t)written >= sizeof(lock_path)) return;
+    int lock_fd = open(lock_path, O_RDWR | O_CLOEXEC);
+    if (lock_fd < 0) return;
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
+        close(lock_fd);
+        return;
+    }
     FILE *file = fopen(pid_path, "r");
     if (file != NULL) {
         long pid = 0;
@@ -604,6 +653,18 @@ static int stop_with_config(const char *path, const char *pid_path) {
         }
         fclose(file);
     }
+    for (unsigned int attempt = 0U; attempt < BPF2SOCKS_STOP_WAIT_ATTEMPTS; ++attempt) {
+        if (flock(lock_fd, LOCK_EX | LOCK_NB) == 0) break;
+        (void)usleep(BPF2SOCKS_STOP_WAIT_STEP_MICROSECONDS);
+    }
+    close(lock_fd);
+}
+
+static int stop_with_config(const char *path, const char *pid_path) {
+    struct bpf2socks_runtime_config config;
+    struct bpf2socks_policy_config policy;
+    if (load_runtime_config(path, &config, &policy) < 0) return 0;
+    if (!pid_path_disabled(pid_path)) stop_running_instance(pid_path);
     if (asterisk_cgroup_reconcile(config.cgroup_path, config.pinned_object_dir) != 0) return 1;
     bpf2socks_udp6_recovery_cleanup();
     cleanup_fixed_bpf_pins(&config);
@@ -653,7 +714,8 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         "\"udpBindingHashLookups\":%" PRIu64 ","
         "\"udpBindingHashCollisionSteps\":%" PRIu64 ","
         "\"dnsFreeStackAllocations\":%" PRIu64 ","
-        "\"dnsFullTableEvictions\":%" PRIu64
+        "\"dnsFullTableEvictions\":%" PRIu64 ","
+        "\"udpDropsSendBusy\":%" PRIu64
         "}\n",
         stats->tcp_accepts,
         stats->tcp_connect_failures,
@@ -695,7 +757,8 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         stats->udp_binding_hash_lookups,
         stats->udp_binding_hash_collision_steps,
         stats->dns_free_stack_allocations,
-        stats->dns_full_table_evictions);
+        stats->dns_full_table_evictions,
+        stats->udp_drops_send_busy);
 }
 
 static int stats_with_pid(const char *pid_path) {

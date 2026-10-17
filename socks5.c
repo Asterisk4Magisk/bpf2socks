@@ -472,6 +472,10 @@ ssize_t bpf2socks_socks5_udp_recv(
     memset(&message, 0, sizeof(message));
     int count = bpf2socks_socks5_udp_recvmmsg(udp_fd, &message, 1U, packet, sizeof(packet));
     if (count <= 0) return count;
+    if (message.error != 0) {
+        errno = message.error;
+        return -1;
+    }
     if (message.payload_len > payload_cap) {
         errno = EMSGSIZE;
         return -1;
@@ -523,6 +527,32 @@ int bpf2socks_socks5_udp_sendmmsg(
     return sendmmsg(udp_fd, vec, count, 0);
 }
 
+/* Returns 0, or the errno-style reason the SOCKS5 UDP datagram is unusable. */
+static int parse_socks5_udp_datagram(uint8_t *packet, size_t len, struct bpf2socks_udp_msg *message) {
+    if (len < 4U || packet[0] != 0x00 || packet[1] != 0x00 || packet[2] != 0x00) return EPROTO;
+    size_t pos = 3U;
+    if (packet[pos] == 0x01) {
+        if (len < pos + 1U + 4U + 2U) return EPROTO;
+        message->addr.family = AF_INET;
+        ++pos;
+        memcpy(message->addr.addr, packet + pos, 4);
+        pos += 4U;
+    } else if (packet[pos] == 0x04) {
+        if (len < pos + 1U + 16U + 2U) return EPROTO;
+        message->addr.family = AF_INET6;
+        ++pos;
+        memcpy(message->addr.addr, packet + pos, 16);
+        pos += 16U;
+    } else {
+        return EAFNOSUPPORT;
+    }
+    message->addr.port = ((uint16_t)packet[pos] << 8) | packet[pos + 1U];
+    pos += 2U;
+    message->payload = packet + pos;
+    message->payload_len = len - pos;
+    return 0;
+}
+
 int bpf2socks_socks5_udp_recvmmsg(
     int udp_fd,
     struct bpf2socks_udp_msg *messages,
@@ -548,44 +578,15 @@ int bpf2socks_socks5_udp_recvmmsg(
     if (received <= 0) return received;
 
     for (int i = 0; i < received; ++i) {
-        uint8_t *packet = packet_buffer + packet_stride * (size_t)i;
-        size_t len = vec[i].msg_len;
-        if ((vec[i].msg_hdr.msg_flags & MSG_TRUNC) != 0 || len > packet_stride) {
-            errno = EMSGSIZE;
-            return -1;
-        }
-        if (len < 4U || packet[0] != 0x00 || packet[1] != 0x00 || packet[2] != 0x00) {
-            errno = EPROTO;
-            return -1;
-        }
-        size_t pos = 3U;
         memset(&messages[i], 0, sizeof(messages[i]));
-        if (packet[pos] == 0x01) {
-            if (len < pos + 1U + 4U + 2U) {
-                errno = EPROTO;
-                return -1;
-            }
-            messages[i].addr.family = AF_INET;
-            ++pos;
-            memcpy(messages[i].addr.addr, packet + pos, 4);
-            pos += 4U;
-        } else if (packet[pos] == 0x04) {
-            if (len < pos + 1U + 16U + 2U) {
-                errno = EPROTO;
-                return -1;
-            }
-            messages[i].addr.family = AF_INET6;
-            ++pos;
-            memcpy(messages[i].addr.addr, packet + pos, 16);
-            pos += 16U;
-        } else {
-            errno = EAFNOSUPPORT;
-            return -1;
+        if ((vec[i].msg_hdr.msg_flags & MSG_TRUNC) != 0 || vec[i].msg_len > packet_stride) {
+            messages[i].error = EMSGSIZE;
+            continue;
         }
-        messages[i].addr.port = ((uint16_t)packet[pos] << 8) | packet[pos + 1U];
-        pos += 2U;
-        messages[i].payload = packet + pos;
-        messages[i].payload_len = len - pos;
+        messages[i].error = parse_socks5_udp_datagram(
+            packet_buffer + packet_stride * (size_t)i,
+            vec[i].msg_len,
+            &messages[i]);
     }
     return received;
 }

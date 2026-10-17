@@ -25,6 +25,7 @@
 /* Fallback retry while descriptors held by other processes keep accept() failing. */
 #define BPF2SOCKS_TCP_FD_BACKOFF_MILLISECONDS 1000
 #define BPF2SOCKS_NO_DEADLINE UINT64_MAX
+#define BPF2SOCKS_CACHE_LINE_SIZE 64
 
 struct bpf2socks_udp_pending_budget {
     size_t cap_bytes;
@@ -56,8 +57,13 @@ struct bpf2socks_bridge_worker {
     size_t udp_session_cap;
     size_t udp_binding_cap;
     struct bpf2socks_udp_pending_budget *udp_pending_budget;
-    struct bpf2socks_bridge_stats stats;
-    struct bpf2socks_bridge_stats stats_snapshot;
+    /*
+     * Each worker's TCP and UDP threads count into their own copy, kept on
+     * separate cache lines so hot counters never bounce between the two.
+     */
+    _Alignas(BPF2SOCKS_CACHE_LINE_SIZE) struct bpf2socks_bridge_stats tcp_stats;
+    _Alignas(BPF2SOCKS_CACHE_LINE_SIZE) struct bpf2socks_bridge_stats udp_stats;
+    _Alignas(BPF2SOCKS_CACHE_LINE_SIZE) struct bpf2socks_bridge_stats stats_snapshot;
     pthread_mutex_t stats_snapshot_mutex;
     bool stats_snapshot_mutex_initialized;
 };

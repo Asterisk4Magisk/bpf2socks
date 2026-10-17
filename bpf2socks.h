@@ -125,6 +125,8 @@ struct bpf2socks_udp_msg {
     struct bpf2socks_sockaddr addr;
     uint8_t *payload;
     size_t payload_len;
+    /* Receive only: errno-style reason this datagram is unusable, or 0. */
+    int error;
 };
 
 struct bpf2socks_token_key {
@@ -235,6 +237,7 @@ struct bpf2socks_bridge_stats {
     uint64_t dns_free_stack_allocations;
     uint64_t dns_full_table_evictions;
     uint64_t tcp_token_delete_failures;
+    uint64_t udp_drops_send_busy;
 };
 
 int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_stats *out);
@@ -397,6 +400,10 @@ int bpf2socks_socks5_udp_sendmmsg(
     socklen_t relay_addr_len,
     const struct bpf2socks_udp_msg *messages,
     unsigned int count);
+/*
+ * Returns the number of datagrams dequeued. A truncated or malformed datagram
+ * only sets that message's error, so one bad reply never discards the batch.
+ */
 int bpf2socks_socks5_udp_recvmmsg(
     int udp_fd,
     struct bpf2socks_udp_msg *messages,
