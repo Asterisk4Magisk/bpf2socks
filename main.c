@@ -72,7 +72,7 @@ static void init_runtime_config_defaults(struct bpf2socks_runtime_config *config
     config->worker_count = 0U;
     config->tcp_buffer_size = BPF2SOCKS_DEFAULT_TCP_BUFFER_SIZE;
     config->max_tcp_sessions = BPF2SOCKS_DEFAULT_MAX_TCP_SESSIONS;
-    config->tcp_connect_timeout_milliseconds = BPF2SOCKS_DEFAULT_TCP_CONNECT_TIMEOUT_MILLISECONDS;
+    config->connect_timeout_milliseconds = BPF2SOCKS_DEFAULT_CONNECT_TIMEOUT_MILLISECONDS;
     config->tcp_idle_timeout_milliseconds = BPF2SOCKS_DEFAULT_TCP_IDLE_TIMEOUT_MILLISECONDS;
     config->udp_socket_buffer_size = BPF2SOCKS_DEFAULT_UDP_SOCKET_BUFFER_SIZE;
     config->udp_batch_size = BPF2SOCKS_DEFAULT_UDP_BATCH_SIZE;
@@ -103,14 +103,14 @@ static void normalize_runtime_tunables(struct bpf2socks_runtime_config *config) 
     if (config->max_tcp_sessions > BPF2SOCKS_MAX_TCP_SESSIONS) {
         config->max_tcp_sessions = BPF2SOCKS_MAX_TCP_SESSIONS;
     }
-    if (config->tcp_connect_timeout_milliseconds == 0U) {
-        config->tcp_connect_timeout_milliseconds = BPF2SOCKS_DEFAULT_TCP_CONNECT_TIMEOUT_MILLISECONDS;
+    if (config->connect_timeout_milliseconds == 0U) {
+        config->connect_timeout_milliseconds = BPF2SOCKS_DEFAULT_CONNECT_TIMEOUT_MILLISECONDS;
     }
-    if (config->tcp_connect_timeout_milliseconds < BPF2SOCKS_MIN_TCP_CONNECT_TIMEOUT_MILLISECONDS) {
-        config->tcp_connect_timeout_milliseconds = BPF2SOCKS_MIN_TCP_CONNECT_TIMEOUT_MILLISECONDS;
+    if (config->connect_timeout_milliseconds < BPF2SOCKS_MIN_CONNECT_TIMEOUT_MILLISECONDS) {
+        config->connect_timeout_milliseconds = BPF2SOCKS_MIN_CONNECT_TIMEOUT_MILLISECONDS;
     }
-    if (config->tcp_connect_timeout_milliseconds > BPF2SOCKS_MAX_TCP_CONNECT_TIMEOUT_MILLISECONDS) {
-        config->tcp_connect_timeout_milliseconds = BPF2SOCKS_MAX_TCP_CONNECT_TIMEOUT_MILLISECONDS;
+    if (config->connect_timeout_milliseconds > BPF2SOCKS_MAX_CONNECT_TIMEOUT_MILLISECONDS) {
+        config->connect_timeout_milliseconds = BPF2SOCKS_MAX_CONNECT_TIMEOUT_MILLISECONDS;
     }
     if (config->tcp_idle_timeout_milliseconds != 0U &&
         config->tcp_idle_timeout_milliseconds < BPF2SOCKS_MIN_TCP_IDLE_TIMEOUT_MILLISECONDS) {
@@ -222,7 +222,7 @@ static int load_runtime_config(
     ok = read_uint_field(json, "tcpBufferSize", UINT32_MAX, &config->tcp_buffer_size) && ok;
     ok = read_uint_field(json, "maxTcpSessions", UINT32_MAX, &config->max_tcp_sessions) && ok;
     ok = read_uint_field(
-        json, "tcpConnectTimeoutMilliseconds", UINT32_MAX, &config->tcp_connect_timeout_milliseconds) && ok;
+        json, "connectTimeoutMilliseconds", UINT32_MAX, &config->connect_timeout_milliseconds) && ok;
     ok = read_uint_field(
         json, "tcpIdleTimeoutMilliseconds", UINT32_MAX, &config->tcp_idle_timeout_milliseconds) && ok;
     ok = read_uint_field(json, "udpSocketBufferSize", UINT32_MAX, &config->udp_socket_buffer_size) && ok;

@@ -571,10 +571,10 @@ static uint64_t connection_deadline(
     const struct bpf2socks_runtime_config *config,
     const struct tcp_connection *connection) {
     if (connection->stage != TCP_STAGE_RELAY) {
-        if (connection->created_at_ms == 0U || config->tcp_connect_timeout_milliseconds == 0U) {
+        if (connection->created_at_ms == 0U || config->connect_timeout_milliseconds == 0U) {
             return BPF2SOCKS_NO_DEADLINE;
         }
-        return connection->created_at_ms + config->tcp_connect_timeout_milliseconds;
+        return connection->created_at_ms + config->connect_timeout_milliseconds;
     }
     if (connection->last_activity_ms == 0U || config->tcp_idle_timeout_milliseconds == 0U) {
         return BPF2SOCKS_NO_DEADLINE;
@@ -601,7 +601,7 @@ static void expire_tcp_connections(struct tcp_worker_state *state, uint64_t now_
                 connection->created_at_ms,
                 connection->last_activity_ms,
                 relay_established,
-                config->tcp_connect_timeout_milliseconds,
+                config->connect_timeout_milliseconds,
                 config->tcp_idle_timeout_milliseconds)) {
             if (relay_established) {
                 ++state->worker->tcp_stats.tcp_idle_timeouts;

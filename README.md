@@ -79,7 +79,7 @@ Per-packet and per-connection failures are logged on the 1st, 2nd, 4th, 8th... o
   "workerCount": 0,
   "tcpBufferSize": 0,
   "maxTcpSessions": 4096,
-  "tcpConnectTimeoutMilliseconds": 10000,
+  "connectTimeoutMilliseconds": 10000,
   "tcpIdleTimeoutMilliseconds": 300000,
   "udpSocketBufferSize": 524288,
   "udpBatchSize": 32,
@@ -132,7 +132,7 @@ A present field must be well formed: numbers are unsigned decimals within their 
 | `workerCount` | `0` selects 4 workers on systems with at least 8 online CPUs, otherwise 2; capped at 8 and by session capacities. |
 | `tcpBufferSize` | `0`, which leaves TCP socket buffers to kernel autotuning. A non-zero value fixes both buffers of every bridge TCP socket, clamped to 4096–4194304 bytes; fixed buffers disable autotuning and cap throughput on high-latency hotspot links. |
 | `maxTcpSessions` | 4096; zero resets to the default, maximum 8192. |
-| `tcpConnectTimeoutMilliseconds` | 10000; normalized to 1000–60000. Also bounds the SOCKS5 UDP ASSOCIATE handshake of a new UDP session. |
+| `connectTimeoutMilliseconds` | 10000; normalized to 1000–60000. Bounds connecting to the SOCKS5 server and completing its handshake, for TCP relays and for the UDP ASSOCIATE of a new UDP session. |
 | `tcpIdleTimeoutMilliseconds` | 300000; non-zero values normalized to 1000–3600000. Zero disables the idle timeout. |
 | `udpSocketBufferSize` | 524288 bytes; zero resets to the default. |
 | `udpBatchSize` | 32; zero resets to the default; capped at 64 datagrams per system call. |

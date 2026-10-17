@@ -3381,14 +3381,14 @@ done:
 /*
  * A SOCKS5 server that never answers the UDP ASSOCIATE handshake would
  * otherwise hold the session, and every datagram the client sends to it,
- * until the idle timeout. The TCP connect timeout bounds the handshake, so
+ * until the idle timeout. The connect timeout bounds the handshake, so
  * the client's next datagram opens a fresh association.
  */
 static void expire_session_handshakes(
     struct udp_state *state,
     struct bpf2socks_bridge_worker *worker,
     uint64_t now_ms) {
-    uint64_t timeout_ms = worker->config->tcp_connect_timeout_milliseconds;
+    uint64_t timeout_ms = worker->config->connect_timeout_milliseconds;
     while (state->handshake_head != NULL && now_ms != 0U &&
            now_ms - state->handshake_head->handshake_started_ms >= timeout_ms) {
         ++worker->udp_stats.udp_associate_timeouts;
@@ -3617,7 +3617,7 @@ static uint64_t udp_next_deadline(
     }
     if (state->handshake_head != NULL) {
         bpf2socks_note_deadline(&next,
-            state->handshake_head->handshake_started_ms + config->tcp_connect_timeout_milliseconds);
+            state->handshake_head->handshake_started_ms + config->connect_timeout_milliseconds);
     }
     return next;
 }
