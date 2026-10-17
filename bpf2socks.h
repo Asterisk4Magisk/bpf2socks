@@ -327,6 +327,12 @@ int bpf2socks_delete_map(int map_fd, const void *key);
 int bpf2socks_lookup_and_delete_map(int map_fd, const void *key, void *value);
 int bpf2socks_pin_fd(int fd, const char *path);
 
+/*
+ * Cgroup tokens are published without a client address, while TC hotspot
+ * tokens carry the client tuple. Local applications reach the bridge from
+ * loopback, so their client-less key is the one to try first.
+ */
+bool bpf2socks_token_key_client_is_loopback(const struct bpf2socks_token_key *key);
 int bpf2socks_token_lookup(int map_fd, const struct bpf2socks_token_key *key, struct bpf2socks_original_dst *out);
 int bpf2socks_tcp_token_take(
     int map_fd,

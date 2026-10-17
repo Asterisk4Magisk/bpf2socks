@@ -353,18 +353,7 @@ static int fill_tcp_token_key(
     return 0;
 }
 
-static bool token_key_client_is_loopback(const struct bpf2socks_token_key *key) {
-    if (key->family == AF_INET) return key->client_addr[0] == 127U;
-    static const uint8_t loopback6[16] = {[15] = 1U};
-    return key->family == AF_INET6 && memcmp(key->client_addr, loopback6, sizeof(loopback6)) == 0;
-}
-
-/*
- * Cgroup CONNECT tokens are published without a client address, while TC
- * hotspot tokens carry the client tuple. Local applications reach the bridge
- * from loopback, so try the client-less key first for them and keep the full
- * key first for everything else.
- */
+/* Loopback clients try the client-less key first; see bpf2socks_token_key_client_is_loopback. */
 static int lookup_original_with_client_fallback(
     int map_fd,
     const struct bpf2socks_token_key *key,
@@ -373,7 +362,7 @@ static int lookup_original_with_client_fallback(
     struct bpf2socks_token_key zero_client = *key;
     zero_client.client_port = 0U;
     memset(zero_client.client_addr, 0, sizeof(zero_client.client_addr));
-    bool zero_first = token_key_client_is_loopback(key);
+    bool zero_first = bpf2socks_token_key_client_is_loopback(key);
     const struct bpf2socks_token_key *first = zero_first ? &zero_client : key;
     const struct bpf2socks_token_key *second = zero_first ? key : &zero_client;
     bool delete_failed = false;

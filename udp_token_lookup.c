@@ -44,6 +44,11 @@ int bpf2socks_udp_token_lookup_adaptive(
     memset(original, 0, sizeof(*original));
     memset(trace, 0, sizeof(*trace));
 
+    /* A new local session would otherwise always miss the full key first. */
+    if (preference == BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN &&
+        bpf2socks_token_key_client_is_loopback(full_key)) {
+        preference = BPF2SOCKS_UDP_TOKEN_LOOKUP_ZERO_CLIENT;
+    }
     if (preference == BPF2SOCKS_UDP_TOKEN_LOOKUP_ZERO_CLIENT) {
         if (lookup_zero_client(map_fd, full_key, original, trace) == 0) return 0;
         return lookup_full_client(map_fd, full_key, original, trace);

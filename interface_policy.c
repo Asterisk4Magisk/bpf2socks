@@ -18,7 +18,24 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+
+/*
+ * Network changes arrive as bursts of netlink messages. After the first one,
+ * keep reading until the socket stays quiet for this long, bounded by the
+ * window, and refresh the maps once for the whole burst.
+ */
+#define BPF2SOCKS_INTERFACE_QUIET_MILLISECONDS 20
+#define BPF2SOCKS_INTERFACE_BATCH_WINDOW_MILLISECONDS 100
+
+/* A growable set of fixed-size map keys. */
+struct key_set {
+    uint8_t *keys;
+    size_t key_size;
+    size_t count;
+    size_t capacity;
+};
 
 struct bpf2socks_interface_runtime {
     pthread_t thread;
@@ -27,6 +44,14 @@ struct bpf2socks_interface_runtime {
     _Atomic bool stop_requested;
     const struct bpf2socks_policy_config *policy;
     struct bpf2socks_bpf_runtime *bpf_runtime;
+    /* Ignored ifindices as last written to the map; read only by the policy thread. */
+    struct key_set ignored_ifindices;
+};
+
+/* Work collected from one burst of netlink messages. */
+struct interface_policy_changes {
+    bool links;
+    bool routes;
 };
 
 static int open_route_netlink(uint32_t groups) {
@@ -52,67 +77,124 @@ static bool nlmsg_ok_policy(const struct nlmsghdr *nh, int remaining) {
         (int)nh->nlmsg_len <= remaining;
 }
 
-static void clear_ifindex_map(int map_fd) {
-    uint32_t key;
-    while (bpf2socks_get_next_key(map_fd, NULL, &key) == 0) {
-        if (bpf2socks_delete_map(map_fd, &key) != 0) break;
-    }
+static void key_set_init(struct key_set *set, size_t key_size) {
+    memset(set, 0, sizeof(*set));
+    set->key_size = key_size;
 }
 
-static void clear_lpm4_map(int map_fd) {
-    struct bpf2socks_lpm4_key key;
-    while (bpf2socks_get_next_key(map_fd, NULL, &key) == 0) {
-        if (bpf2socks_delete_map(map_fd, &key) != 0) break;
-    }
+static void key_set_free(struct key_set *set) {
+    free(set->keys);
+    set->keys = NULL;
+    set->count = 0U;
+    set->capacity = 0U;
 }
 
-static void clear_lpm6_map(int map_fd) {
-    struct bpf2socks_lpm6_key key;
-    while (bpf2socks_get_next_key(map_fd, NULL, &key) == 0) {
-        if (bpf2socks_delete_map(map_fd, &key) != 0) break;
+static bool key_set_contains(const struct key_set *set, const void *key) {
+    for (size_t index = 0U; index < set->count; ++index) {
+        if (memcmp(set->keys + index * set->key_size, key, set->key_size) == 0) return true;
     }
+    return false;
 }
 
-static int refresh_ignored_ifindices(const struct bpf2socks_interface_runtime *interfaces) {
-    clear_ifindex_map(interfaces->bpf_runtime->ignored_ifindex_map_fd);
-
-    struct if_nameindex *system_interfaces = if_nameindex();
-    if (system_interfaces == NULL) return -1;
-
-    uint8_t value = 1U;
-    for (const struct if_nameindex *entry = system_interfaces;
-         entry->if_index != 0U && entry->if_name != NULL;
-         ++entry) {
-        bool ignored = false;
-        for (size_t selector_index = 0U;
-             selector_index < interfaces->policy->ignored_interface_count &&
-             selector_index < BPF2SOCKS_MAX_INTERFACES;
-             ++selector_index) {
-            if (bpf2socks_interface_matches_selector(
-                    entry->if_name,
-                    interfaces->policy->ignored_interfaces[selector_index])) {
-                ignored = true;
-                break;
-            }
-        }
-        if (!ignored) continue;
-        uint32_t key = entry->if_index;
-        if (bpf2socks_update_map(interfaces->bpf_runtime->ignored_ifindex_map_fd, &key, &value) < 0) {
-            int saved = errno;
-            if_freenameindex(system_interfaces);
-            errno = saved;
-            return -1;
-        }
+static int key_set_add(struct key_set *set, const void *key) {
+    if (key_set_contains(set, key)) return 0;
+    if (set->count == set->capacity) {
+        size_t capacity = set->capacity == 0U ? 16U : set->capacity * 2U;
+        uint8_t *keys = realloc(set->keys, capacity * set->key_size);
+        if (keys == NULL) return -1;
+        set->keys = keys;
+        set->capacity = capacity;
     }
-    if_freenameindex(system_interfaces);
+    memcpy(set->keys + set->count * set->key_size, key, set->key_size);
+    ++set->count;
     return 0;
+}
+
+/*
+ * Makes the map hold exactly the desired keys. Missing keys are written before
+ * stale ones are removed, so a lookup never sees a transiently emptied map.
+ */
+static int sync_map_keys(int map_fd, const struct key_set *desired) {
+    uint8_t value = 1U;
+    for (size_t index = 0U; index < desired->count; ++index) {
+        if (bpf2socks_update_map(map_fd, desired->keys + index * desired->key_size, &value) < 0) return -1;
+    }
+
+    struct key_set stale;
+    key_set_init(&stale, desired->key_size);
+    uint8_t key[sizeof(struct bpf2socks_lpm6_key)];
+    uint8_t next[sizeof(struct bpf2socks_lpm6_key)];
+    if (desired->key_size > sizeof(key)) {
+        errno = EINVAL;
+        return -1;
+    }
+    const void *cursor = NULL;
+    int result = 0;
+    while (bpf2socks_get_next_key(map_fd, cursor, next) == 0) {
+        if (!key_set_contains(desired, next) && key_set_add(&stale, next) < 0) {
+            result = -1;
+            break;
+        }
+        memcpy(key, next, desired->key_size);
+        cursor = key;
+    }
+    for (size_t index = 0U; result == 0 && index < stale.count; ++index) {
+        if (bpf2socks_delete_map(map_fd, stale.keys + index * stale.key_size) < 0 && errno != ENOENT) {
+            result = -1;
+        }
+    }
+    int saved = errno;
+    key_set_free(&stale);
+    errno = saved;
+    return result;
+}
+
+static bool interface_name_ignored(const struct bpf2socks_interface_runtime *interfaces, const char *name) {
+    for (size_t selector_index = 0U;
+         selector_index < interfaces->policy->ignored_interface_count &&
+         selector_index < BPF2SOCKS_MAX_INTERFACES;
+         ++selector_index) {
+        if (bpf2socks_interface_matches_selector(name, interfaces->policy->ignored_interfaces[selector_index])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool ifindex_ignored(const struct bpf2socks_interface_runtime *interfaces, int ifindex) {
     if (ifindex <= 0) return false;
     uint32_t key = (uint32_t)ifindex;
-    uint8_t value = 0U;
-    return bpf2socks_lookup_map(interfaces->bpf_runtime->ignored_ifindex_map_fd, &key, &value) == 0;
+    return key_set_contains(&interfaces->ignored_ifindices, &key);
+}
+
+static int refresh_ignored_ifindices(struct bpf2socks_interface_runtime *interfaces) {
+    struct if_nameindex *system_interfaces = if_nameindex();
+    if (system_interfaces == NULL) return -1;
+
+    struct key_set desired;
+    key_set_init(&desired, sizeof(uint32_t));
+    int result = 0;
+    for (const struct if_nameindex *entry = system_interfaces;
+         entry->if_index != 0U && entry->if_name != NULL;
+         ++entry) {
+        if (!interface_name_ignored(interfaces, entry->if_name)) continue;
+        uint32_t key = entry->if_index;
+        if (key_set_add(&desired, &key) < 0) {
+            result = -1;
+            break;
+        }
+    }
+    if_freenameindex(system_interfaces);
+    if (result == 0) result = sync_map_keys(interfaces->bpf_runtime->ignored_ifindex_map_fd, &desired);
+    if (result < 0) {
+        int saved = errno;
+        key_set_free(&desired);
+        errno = saved;
+        return -1;
+    }
+    key_set_free(&interfaces->ignored_ifindices);
+    interfaces->ignored_ifindices = desired;
+    return 0;
 }
 
 static uint32_t mask_ipv4_route_addr(uint32_t addr, uint8_t prefixlen) {
@@ -135,7 +217,22 @@ static void mask_ipv6_route_addr(uint8_t addr[16], uint8_t prefixlen) {
     memset(addr + full_bytes + 1U, 0, 16U - full_bytes - 1U);
 }
 
-static int add_ignored_route(const struct bpf2socks_interface_runtime *interfaces, const struct nlmsghdr *nh) {
+static int route_output_ifindex(const struct nlmsghdr *nh) {
+    const struct rtmsg *rtm = (const struct rtmsg *)NLMSG_DATA(nh);
+    int len = RTM_PAYLOAD(nh);
+    int oif = 0;
+    for (const struct rtattr *attr = RTM_RTA(rtm); RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+        if (attr->rta_type == RTA_OIF && RTA_PAYLOAD(attr) >= (int)sizeof(oif)) {
+            memcpy(&oif, RTA_DATA(attr), sizeof(oif));
+        }
+    }
+    return oif;
+}
+
+static int collect_ignored_route(
+    const struct bpf2socks_interface_runtime *interfaces,
+    const struct nlmsghdr *nh,
+    struct key_set *routes) {
     const struct rtmsg *rtm = (const struct rtmsg *)NLMSG_DATA(nh);
     if (rtm->rtm_type != RTN_UNICAST) {
         return 0;
@@ -164,24 +261,25 @@ static int add_ignored_route(const struct bpf2socks_interface_runtime *interface
 
     if (!ifindex_ignored(interfaces, oif)) return 0;
 
-    uint8_t value = 1U;
     if (rtm->rtm_family == AF_INET) {
         struct bpf2socks_lpm4_key key;
         memset(&key, 0, sizeof(key));
         key.prefixlen = rtm->rtm_dst_len;
         key.addr = mask_ipv4_route_addr(dst, rtm->rtm_dst_len);
-        return bpf2socks_update_map(interfaces->bpf_runtime->ignored_route_cidr4_map_fd, &key, &value);
+        return key_set_add(routes, &key);
     }
-    if (interfaces->bpf_runtime->ignored_route_cidr6_map_fd < 0) return 0;
     struct bpf2socks_lpm6_key key;
     memset(&key, 0, sizeof(key));
     key.prefixlen = rtm->rtm_dst_len;
     memcpy(key.addr, dst6, sizeof(key.addr));
     mask_ipv6_route_addr(key.addr, rtm->rtm_dst_len);
-    return bpf2socks_update_map(interfaces->bpf_runtime->ignored_route_cidr6_map_fd, &key, &value);
+    return key_set_add(routes, &key);
 }
 
-static int dump_ignored_routes_family(const struct bpf2socks_interface_runtime *interfaces, int family) {
+static int dump_ignored_routes_family(
+    const struct bpf2socks_interface_runtime *interfaces,
+    int family,
+    struct key_set *routes) {
     int fd = open_route_netlink(0U);
     if (fd < 0) return -1;
 
@@ -228,7 +326,7 @@ static int dump_ignored_routes_family(const struct bpf2socks_interface_runtime *
                 result = -1;
                 break;
             }
-            if (nh->nlmsg_type == RTM_NEWROUTE && add_ignored_route(interfaces, nh) < 0) {
+            if (nh->nlmsg_type == RTM_NEWROUTE && collect_ignored_route(interfaces, nh, routes) < 0) {
                 result = -1;
                 break;
             }
@@ -241,45 +339,113 @@ static int dump_ignored_routes_family(const struct bpf2socks_interface_runtime *
     return result;
 }
 
-static int dump_ignored_routes4(const struct bpf2socks_interface_runtime *interfaces) {
-    clear_lpm4_map(interfaces->bpf_runtime->ignored_route_cidr4_map_fd);
-    return dump_ignored_routes_family(interfaces, AF_INET);
-}
-
-static int dump_ignored_routes6(const struct bpf2socks_interface_runtime *interfaces) {
-    if (interfaces->bpf_runtime->ignored_route_cidr6_map_fd < 0) return 0;
-    clear_lpm6_map(interfaces->bpf_runtime->ignored_route_cidr6_map_fd);
-    return dump_ignored_routes_family(interfaces, AF_INET6);
+static int sync_ignored_routes_family(
+    const struct bpf2socks_interface_runtime *interfaces,
+    int family,
+    int map_fd,
+    size_t key_size) {
+    if (map_fd < 0) return 0;
+    struct key_set routes;
+    key_set_init(&routes, key_size);
+    int result = dump_ignored_routes_family(interfaces, family, &routes);
+    if (result == 0) result = sync_map_keys(map_fd, &routes);
+    int saved = errno;
+    key_set_free(&routes);
+    errno = saved;
+    return result;
 }
 
 static int dump_ignored_routes(const struct bpf2socks_interface_runtime *interfaces) {
-    if (dump_ignored_routes4(interfaces) < 0) return -1;
-    return dump_ignored_routes6(interfaces);
+    if (sync_ignored_routes_family(
+            interfaces,
+            AF_INET,
+            interfaces->bpf_runtime->ignored_route_cidr4_map_fd,
+            sizeof(struct bpf2socks_lpm4_key)) < 0) {
+        return -1;
+    }
+    return sync_ignored_routes_family(
+        interfaces,
+        AF_INET6,
+        interfaces->bpf_runtime->ignored_route_cidr6_map_fd,
+        sizeof(struct bpf2socks_lpm6_key));
 }
 
-static int refresh_interface_policy(const struct bpf2socks_interface_runtime *interfaces) {
+static int refresh_interface_policy(struct bpf2socks_interface_runtime *interfaces) {
     if (refresh_ignored_ifindices(interfaces) < 0) return -1;
     return dump_ignored_routes(interfaces);
 }
 
-static void handle_interface_policy_message(
+static const char *link_message_name(const struct nlmsghdr *nh) {
+    const struct ifinfomsg *ifi = (const struct ifinfomsg *)NLMSG_DATA(nh);
+    int len = (int)nh->nlmsg_len - (int)NLMSG_LENGTH(sizeof(*ifi));
+    for (const struct rtattr *attr = IFLA_RTA(ifi); RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+        if (attr->rta_type == IFLA_IFNAME && RTA_PAYLOAD(attr) > 0 &&
+            memchr(RTA_DATA(attr), '\0', RTA_PAYLOAD(attr)) != NULL) {
+            return (const char *)RTA_DATA(attr);
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Only events that can change the ignored sets count: links that match a
+ * selector or are currently ignored, and routes through an ignored interface.
+ */
+static void note_interface_policy_message(
     const struct bpf2socks_interface_runtime *interfaces,
-    const struct nlmsghdr *nh) {
+    const struct nlmsghdr *nh,
+    struct interface_policy_changes *changes) {
     if (nh->nlmsg_type == RTM_NEWLINK || nh->nlmsg_type == RTM_DELLINK) {
-        if (refresh_interface_policy(interfaces) < 0) {
-            fprintf(stderr, "failed to refresh bpf2socks ignored interface policy: errno=%d\n", errno);
+        if (nh->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg))) return;
+        const struct ifinfomsg *ifi = (const struct ifinfomsg *)NLMSG_DATA(nh);
+        const char *name = link_message_name(nh);
+        if (ifindex_ignored(interfaces, ifi->ifi_index) ||
+            (name != NULL && interface_name_ignored(interfaces, name))) {
+            changes->links = true;
         }
     } else if (nh->nlmsg_type == RTM_NEWROUTE || nh->nlmsg_type == RTM_DELROUTE) {
-        if (dump_ignored_routes(interfaces) < 0) {
-            fprintf(stderr, "failed to refresh bpf2socks ignored interface routes: errno=%d\n", errno);
+        if (nh->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg))) return;
+        if (ifindex_ignored(interfaces, route_output_ifindex(nh))) changes->routes = true;
+    }
+}
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0U;
+    return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
+/*
+ * Reads every queued netlink message. Returns 1 when the stop event fired,
+ * -1 on a fatal socket error and 0 otherwise. A receive-buffer overflow
+ * (ENOBUFS) loses events, so it forces a full refresh.
+ */
+static int drain_interface_policy_messages(
+    const struct bpf2socks_interface_runtime *interfaces,
+    struct interface_policy_changes *changes) {
+    char buf[8192];
+    for (;;) {
+        ssize_t len = recv(interfaces->netlink_fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (len < 0 && errno == EINTR) continue;
+        if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        if (len < 0 && errno == ENOBUFS) {
+            changes->links = true;
+            changes->routes = true;
+            continue;
+        }
+        if (len <= 0) return -1;
+        int remaining = (int)len;
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; nlmsg_ok_policy(nh, remaining); nh = NLMSG_NEXT(nh, remaining)) {
+            if (nh->nlmsg_type == NLMSG_DONE) break;
+            if (nh->nlmsg_type == NLMSG_ERROR) continue;
+            note_interface_policy_message(interfaces, nh, changes);
         }
     }
 }
 
-static void *interface_policy_thread(void *arg) {
-    struct bpf2socks_interface_runtime *interfaces = arg;
-    char buf[8192];
-    while (!atomic_load_explicit(&interfaces->stop_requested, memory_order_acquire)) {
+/* Waits for netlink input or stop: 1 readable, 0 timeout, -1 stop or error. */
+static int wait_interface_policy_input(const struct bpf2socks_interface_runtime *interfaces, int timeout_ms) {
+    for (;;) {
         struct pollfd pfds[2] = {
             {
                 .fd = interfaces->netlink_fd,
@@ -290,22 +456,54 @@ static void *interface_policy_thread(void *arg) {
                 .events = POLLIN,
             },
         };
-        int ready = poll(pfds, 2U, -1);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            break;
+        int ready = poll(pfds, 2U, timeout_ms);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return -1;
+        if (ready == 0) return 0;
+        if ((pfds[1].revents & POLLIN) != 0) return -1;
+        if ((pfds[0].revents & (POLLIN | POLLERR)) != 0) return 1;
+        return -1;
+    }
+}
+
+static void apply_interface_policy_changes(
+    struct bpf2socks_interface_runtime *interfaces,
+    const struct interface_policy_changes *changes) {
+    if (changes->links) {
+        if (refresh_interface_policy(interfaces) < 0) {
+            fprintf(stderr, "failed to refresh bpf2socks ignored interface policy: errno=%d\n", errno);
         }
-        if ((pfds[1].revents & POLLIN) != 0) break;
-        if ((pfds[0].revents & POLLIN) == 0) break;
-        ssize_t len = recv(interfaces->netlink_fd, buf, sizeof(buf), 0);
-        if (len < 0 && errno == EINTR) continue;
-        if (len <= 0) break;
-        int remaining = (int)len;
-        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; nlmsg_ok_policy(nh, remaining); nh = NLMSG_NEXT(nh, remaining)) {
-            if (nh->nlmsg_type == NLMSG_DONE) break;
-            if (nh->nlmsg_type == NLMSG_ERROR) continue;
-            handle_interface_policy_message(interfaces, nh);
+    } else if (changes->routes) {
+        if (dump_ignored_routes(interfaces) < 0) {
+            fprintf(stderr, "failed to refresh bpf2socks ignored interface routes: errno=%d\n", errno);
         }
+    }
+}
+
+static void *interface_policy_thread(void *arg) {
+    struct bpf2socks_interface_runtime *interfaces = arg;
+    while (!atomic_load_explicit(&interfaces->stop_requested, memory_order_acquire)) {
+        if (wait_interface_policy_input(interfaces, -1) <= 0) break;
+        struct interface_policy_changes changes = {0};
+        if (drain_interface_policy_messages(interfaces, &changes) < 0) break;
+        uint64_t batch_end_ms = monotonic_ms() + BPF2SOCKS_INTERFACE_BATCH_WINDOW_MILLISECONDS;
+        bool stopping = false;
+        for (;;) {
+            uint64_t now_ms = monotonic_ms();
+            if (now_ms >= batch_end_ms) break;
+            uint64_t remaining_ms = batch_end_ms - now_ms;
+            int quiet_ms = remaining_ms < BPF2SOCKS_INTERFACE_QUIET_MILLISECONDS
+                ? (int)remaining_ms
+                : BPF2SOCKS_INTERFACE_QUIET_MILLISECONDS;
+            int waited = wait_interface_policy_input(interfaces, quiet_ms);
+            if (waited == 0) break;
+            if (waited < 0 || drain_interface_policy_messages(interfaces, &changes) < 0) {
+                stopping = true;
+                break;
+            }
+        }
+        if (stopping) break;
+        apply_interface_policy_changes(interfaces, &changes);
     }
     return NULL;
 }
@@ -332,6 +530,7 @@ int bpf2socks_interface_policy_start(
     atomic_init(&interfaces->stop_requested, false);
     interfaces->policy = policy;
     interfaces->bpf_runtime = runtime;
+    key_set_init(&interfaces->ignored_ifindices, sizeof(uint32_t));
 
     interfaces->netlink_fd = open_route_netlink(RTMGRP_LINK | RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE);
     if (interfaces->netlink_fd < 0) {
@@ -354,6 +553,7 @@ int bpf2socks_interface_policy_start(
         int saved = errno;
         close(interfaces->stop_fd);
         close(interfaces->netlink_fd);
+        key_set_free(&interfaces->ignored_ifindices);
         free(interfaces);
         errno = saved;
         return -1;
@@ -363,6 +563,7 @@ int bpf2socks_interface_policy_start(
     if (thread_result != 0) {
         close(interfaces->stop_fd);
         close(interfaces->netlink_fd);
+        key_set_free(&interfaces->ignored_ifindices);
         free(interfaces);
         errno = thread_result;
         return -1;
@@ -386,5 +587,6 @@ void bpf2socks_interface_policy_stop(struct bpf2socks_bpf_runtime *runtime) {
     (void)pthread_join(interfaces->thread, NULL);
     if (interfaces->stop_fd >= 0) close(interfaces->stop_fd);
     if (interfaces->netlink_fd >= 0) close(interfaces->netlink_fd);
+    key_set_free(&interfaces->ignored_ifindices);
     free(interfaces);
 }

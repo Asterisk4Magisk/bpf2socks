@@ -10,6 +10,12 @@
 /* Hash maps gained LOOKUP_AND_DELETE in Linux 5.14; GKI 5.10 rejects it. */
 static atomic_bool lookup_and_delete_unsupported;
 
+bool bpf2socks_token_key_client_is_loopback(const struct bpf2socks_token_key *key) {
+    if (key->family == AF_INET) return key->client_addr[0] == 127U;
+    static const uint8_t loopback6[16] = {[15] = 1U};
+    return key->family == AF_INET6 && memcmp(key->client_addr, loopback6, sizeof(loopback6)) == 0;
+}
+
 int bpf2socks_token_lookup(int map_fd, const struct bpf2socks_token_key *key, struct bpf2socks_original_dst *out) {
     if (map_fd < 0 || key == NULL || out == NULL) return -1;
     memset(out, 0, sizeof(*out));
