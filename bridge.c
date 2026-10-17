@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "bridge_internal.h"
+#include "udp_relay_registry.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -345,6 +346,8 @@ static void copy_udp_stats(
     destination->dns_full_table_evictions = source->dns_full_table_evictions;
     destination->udp_drops_send_busy = source->udp_drops_send_busy;
     destination->udp_associate_timeouts = source->udp_associate_timeouts;
+    destination->udp_closed_client_releases = source->udp_closed_client_releases;
+    destination->udp_relay_port_collisions = source->udp_relay_port_collisions;
 }
 
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker) {
@@ -421,6 +424,8 @@ static void add_worker_stats(struct bpf2socks_bridge_stats *total, const struct 
     total->dns_full_table_evictions += stats->dns_full_table_evictions;
     total->udp_drops_send_busy += stats->udp_drops_send_busy;
     total->udp_associate_timeouts += stats->udp_associate_timeouts;
+    total->udp_closed_client_releases += stats->udp_closed_client_releases;
+    total->udp_relay_port_collisions += stats->udp_relay_port_collisions;
 }
 
 static int stats_path_from_pid_path(const char *pid_path, char *out, size_t out_size) {
@@ -559,9 +564,11 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
     }
     struct bpf2socks_bridge_worker *workers = alloc_workers(worker_count);
     struct bridge_worker_threads *threads = calloc(worker_count, sizeof(*threads));
-    if (workers == NULL || threads == NULL) {
+    struct bpf2socks_udp_relay_registry *udp_relay_registry = calloc(1U, sizeof(*udp_relay_registry));
+    if (workers == NULL || threads == NULL || udp_relay_registry == NULL) {
         free(workers);
         free(threads);
+        free(udp_relay_registry);
         return -1;
     }
 
@@ -583,6 +590,7 @@ int bpf2socks_bridge_run(const struct bpf2socks_runtime_config *config, const ch
         workers[i].udp_session_cap = bpf2socks_worker_quota(config->max_udp_sessions, i, worker_count);
         workers[i].udp_binding_cap = bpf2socks_worker_quota(config->max_udp_bindings, i, worker_count);
         workers[i].udp_pending_budget = &udp_pending_budget;
+        workers[i].udp_relay_registry = udp_relay_registry;
         int mutex_result = pthread_mutex_init(&workers[i].stats_snapshot_mutex, NULL);
         if (mutex_result != 0) {
             errno = mutex_result;
@@ -690,6 +698,7 @@ done:
     destroy_worker_stats_snapshot_mutexes(workers, worker_count);
     free(threads);
     free(workers);
+    free(udp_relay_registry);
     if (pid_file_written) (void)unlink(pid_path);
     return result;
 }
@@ -721,8 +730,12 @@ int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_st
     size_t pre_associate_timeout_size = offsetof(
         struct bpf2socks_bridge_stats,
         udp_associate_timeouts);
+    size_t pre_closed_client_size = offsetof(
+        struct bpf2socks_bridge_stats,
+        udp_closed_client_releases);
     if ((bytes != legacy_size && bytes != previous_size && bytes != prior_full_size &&
-         bytes != pre_send_busy_size && bytes != pre_associate_timeout_size && bytes != sizeof(*out)) ||
+         bytes != pre_send_busy_size && bytes != pre_associate_timeout_size &&
+         bytes != pre_closed_client_size && bytes != sizeof(*out)) ||
         extra != EOF || read_error != 0 || close_result != 0) {
         memset(out, 0, sizeof(*out));
         errno = EIO;

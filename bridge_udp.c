@@ -6,7 +6,9 @@
 #include "bridge_dns.h"
 #include "bridge_internal.h"
 #include "log_throttle.h"
+#include "udp_client_sweep.h"
 #include "udp_downlink_queue.h"
+#include "udp_relay_registry.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -122,6 +124,8 @@ struct dns_channel {
     size_t write_offset;
     uint8_t read_buf[4 + 1 + 255 + 2];
     size_t read_len;
+    uint16_t relay_port;
+    bool relay_port_claimed;
     bool relay_paused;
     struct sockaddr_storage relay_addr;
     socklen_t relay_addr_len;
@@ -219,6 +223,13 @@ struct udp_state {
     uint32_t worker_id;
     size_t event_cap;
     uint32_t next_dns_channel;
+    /* Local ports of live UDP sockets, refreshed by the closed-client sweep. */
+    uint8_t *client_port_bitmap;
+    struct bpf2socks_udp_relay_registry *relay_registry;
+    uint64_t next_client_sweep_ms;
+    /* Earliest time a local session becomes old enough to check; NO_DEADLINE when none. */
+    uint64_t client_sweep_due_ms;
+    bool client_sweep_disabled;
 };
 
 static bool udp_control_fd_is_healthy(int fd) {
@@ -1455,6 +1466,9 @@ static int update_udp_associate_response_expected(struct bpf2socks_udp_client_se
 
 static void close_session(struct udp_state *state, struct bpf2socks_udp_client_session *session) {
     if (session == NULL || !session->used) return;
+    if (session->relay_port_claimed) {
+        bpf2socks_udp_relay_port_release(state->relay_registry, session->relay_port);
+    }
     release_session_pending_packets(state, session);
     release_session_downlink_channels(state, session);
     if (session->tcp_fd >= 0) close(session->tcp_fd);
@@ -1670,14 +1684,62 @@ static int flush_session_pending_packets(
     return 0;
 }
 
+static uint16_t sockaddr_storage_port(const struct sockaddr_storage *addr) {
+    if (addr->ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)addr)->sin6_port);
+    return ntohs(((const struct sockaddr_in *)addr)->sin_port);
+}
+
+/*
+ * Servers with one shared UDP relay (Mihomo answers every ASSOCIATE with its
+ * own port) are not per-association and are never checked for collisions.
+ */
+static bool relay_port_needs_claim(const struct bpf2socks_bridge_worker *worker, uint16_t relay_port) {
+    return relay_port != 0U && relay_port != sockaddr_storage_port(&worker->socks_addr);
+}
+
+/* Drops the association that came back on a taken relay port and asks again. */
+static int restart_udp_associate(
+    struct udp_state *state,
+    struct bpf2socks_bridge_worker *worker,
+    struct bpf2socks_udp_client_session *session) {
+    remove_udp_epoll_fd(state, session->tcp_fd);
+    if (session->tcp_fd >= 0) close(session->tcp_fd);
+    if (session->udp_fd >= 0) close(session->udp_fd);
+    session->tcp_fd = -1;
+    session->udp_fd = -1;
+    memset(&session->relay_addr, 0, sizeof(session->relay_addr));
+    session->relay_addr_len = 0U;
+    session->relay_connected = false;
+    if (build_udp_associate_pipeline_request(session) < 0) return -1;
+    session->tcp_fd = open_udp_associate_tcp_fd(
+        (const struct sockaddr *)&worker->socks_addr,
+        worker->socks_addr_len,
+        &session->stage);
+    if (session->tcp_fd < 0) return -1;
+    handshake_remove(state, session);
+    handshake_add_tail(state, session, monotonic_ms());
+    return add_session_tcp_epoll_fd(state, session, EPOLLIN | EPOLLOUT);
+}
+
 static int complete_udp_associate(
     struct udp_state *state,
     struct bpf2socks_bridge_worker *worker,
     struct bpf2socks_udp_client_session *session) {
-    if (create_udp_associate_relay_socket(worker, session) < 0 ||
-        switch_session_epoll_to_udp(state, session) < 0) {
-        return -1;
+    if (create_udp_associate_relay_socket(worker, session) < 0) return -1;
+    uint16_t relay_port = sockaddr_storage_port(&session->relay_addr);
+    if (relay_port_needs_claim(worker, relay_port)) {
+        if (bpf2socks_udp_relay_port_claim(worker->udp_relay_registry, relay_port)) {
+            session->relay_port = relay_port;
+            session->relay_port_claimed = true;
+        } else {
+            ++worker->udp_stats.udp_relay_port_collisions;
+            if (session->associate_retries < BPF2SOCKS_UDP_RELAY_PORT_MAX_RETRIES) {
+                ++session->associate_retries;
+                return restart_udp_associate(state, worker, session);
+            }
+        }
     }
+    if (switch_session_epoll_to_udp(state, session) < 0) return -1;
     session->stage = BPF2SOCKS_UDP_SESSION_READY;
     handshake_remove(state, session);
     ++worker->udp_stats.udp_associate_creates;
@@ -1915,6 +1977,8 @@ static struct bpf2socks_udp_reply_binding *create_fullcone_binding(
         worker);
 }
 
+static void note_client_sweep_due(struct udp_state *state, const struct bpf2socks_udp_client_session *session);
+
 static struct bpf2socks_udp_client_session *get_session(
     struct udp_state *state,
     const struct udp_client_packet *packet,
@@ -1968,6 +2032,7 @@ static struct bpf2socks_udp_client_session *get_session(
         drop_session(state, session);
         return NULL;
     }
+    note_client_sweep_due(state, session);
     return session;
 }
 
@@ -2339,6 +2404,10 @@ static void release_dns_channel_transactions(struct udp_state *state, uint32_t c
 
 static void reset_dns_channel_fds(struct udp_state *state, struct dns_channel *channel) {
     if (channel == NULL) return;
+    if (channel->relay_port_claimed) {
+        bpf2socks_udp_relay_port_release(state->relay_registry, channel->relay_port);
+        channel->relay_port_claimed = false;
+    }
     if (channel->tcp_fd >= 0) remove_udp_epoll_fd(state, channel->tcp_fd);
     if (channel->udp_fd >= 0) remove_udp_epoll_fd(state, channel->udp_fd);
     if (channel->tcp_fd >= 0) close(channel->tcp_fd);
@@ -2632,6 +2701,16 @@ static int advance_dns_channel(
                     worker->socks_addr_len,
                     &channel->relay_addr,
                     &channel->relay_addr_len) < 0) return -1;
+            uint16_t relay_port = sockaddr_storage_port(&channel->relay_addr);
+            if (relay_port_needs_claim(worker, relay_port)) {
+                if (!bpf2socks_udp_relay_port_claim(worker->udp_relay_registry, relay_port)) {
+                    /* Rebuilt after the usual delay; queries use the session path meanwhile. */
+                    ++worker->udp_stats.udp_relay_port_collisions;
+                    return -1;
+                }
+                channel->relay_port = relay_port;
+                channel->relay_port_claimed = true;
+            }
             int udp_fd = socket(
                 channel->relay_addr.ss_family,
                 SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -3417,6 +3496,108 @@ static void expire_sessions(struct udp_state *state, const struct bpf2socks_runt
     }
 }
 
+/* A local client reaches the bridge from the loopback address of its own socket. */
+static bool session_client_is_local(const struct bpf2socks_udp_client_session *session) {
+    if (session->client_addr.ss_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)&session->client_addr;
+        return (ntohl(in->sin_addr.s_addr) >> 24U) == 127U;
+    }
+    if (session->client_addr.ss_family == AF_INET6) {
+        const struct in6_addr *addr = &((const struct sockaddr_in6 *)&session->client_addr)->sin6_addr;
+        return IN6_IS_ADDR_LOOPBACK(addr) || (IN6_IS_ADDR_V4MAPPED(addr) && addr->s6_addr[12] == 127U);
+    }
+    return false;
+}
+
+static uint16_t session_client_port(const struct bpf2socks_udp_client_session *session) {
+    if (session->client_addr.ss_family == AF_INET6) {
+        return ntohs(((const struct sockaddr_in6 *)&session->client_addr)->sin6_port);
+    }
+    return ntohs(((const struct sockaddr_in *)&session->client_addr)->sin_port);
+}
+
+/* A local session not yet found open since its last activity, with nothing left to deliver. */
+static bool session_needs_client_check(const struct bpf2socks_udp_client_session *session) {
+    return session->client_open_seen_ms != session->last_seen_ms &&
+        session->downlink_pending_count == 0U && !session->downlink_waiting_budget &&
+        session_client_is_local(session);
+}
+
+static void note_client_sweep_due(struct udp_state *state, const struct bpf2socks_udp_client_session *session) {
+    if (state->client_sweep_disabled || !session_client_is_local(session)) return;
+    bpf2socks_note_deadline(
+        &state->client_sweep_due_ms,
+        session->last_seen_ms + BPF2SOCKS_UDP_CLIENT_SWEEP_MIN_IDLE_MILLISECONDS);
+}
+
+/*
+ * A local client's session otherwise outlives its socket by the whole idle
+ * timeout, and every one of them keeps a live UDP association in the SOCKS5
+ * server. Short request/response sockets (STUN, NTP, resolvers that bypass the
+ * DNS fast path) pile up thousands of them, and cores degrade with that count:
+ * Xray already loses about 1% of datagrams on new associations with a few
+ * hundred alive. Release sessions whose client socket no longer exists. TC
+ * hotspot clients are remote and keep the idle timeout.
+ *
+ * The pass runs at most once per interval and only when client_sweep_due_ms
+ * (set when a local session is created, recomputed here) has passed. A session
+ * found open is not checked again until a later pass sees new activity on it.
+ */
+static void release_closed_client_sessions(
+    struct udp_state *state,
+    struct bpf2socks_bridge_worker *worker,
+    uint64_t now_ms) {
+    if (state->client_sweep_disabled || now_ms == 0U || now_ms < state->client_sweep_due_ms ||
+        now_ms < state->next_client_sweep_ms) {
+        return;
+    }
+    state->next_client_sweep_ms = now_ms + BPF2SOCKS_UDP_CLIENT_SWEEP_INTERVAL_MILLISECONDS;
+    uint64_t due = BPF2SOCKS_NO_DEADLINE;
+    uint64_t dump_started_ms = 0U;
+    bool dumped = false;
+    struct bpf2socks_udp_client_session *session = state->lru_head;
+    while (session != NULL && session->used) {
+        struct bpf2socks_udp_client_session *next = session->lru_next;
+        if (session_needs_client_check(session)) {
+            if (now_ms - session->last_seen_ms < BPF2SOCKS_UDP_CLIENT_SWEEP_MIN_IDLE_MILLISECONDS) {
+                /* The LRU is ordered by last_seen_ms, so every later session is newer. */
+                due = session->last_seen_ms + BPF2SOCKS_UDP_CLIENT_SWEEP_MIN_IDLE_MILLISECONDS;
+                break;
+            }
+            if (!dumped) {
+                if (state->client_port_bitmap == NULL) {
+                    state->client_port_bitmap = malloc(BPF2SOCKS_UDP_PORT_BITMAP_BYTES);
+                }
+                dump_started_ms = monotonic_ms();
+                if (state->client_port_bitmap == NULL ||
+                    bpf2socks_udp_collect_local_ports(state->client_port_bitmap) < 0) {
+                    /* Without a complete socket list a live client could look closed. */
+                    fprintf(stderr, "UDP closed-client release disabled: socket dump failed: errno=%d\n", errno);
+                    state->client_sweep_disabled = true;
+                    state->client_sweep_due_ms = BPF2SOCKS_NO_DEADLINE;
+                    return;
+                }
+                dumped = true;
+                /*
+                 * The dump walks every UDP socket in the namespace, the server's
+                 * own included; space passes so it stays near 1% of this thread.
+                 */
+                uint64_t dump_ms = monotonic_ms() - dump_started_ms;
+                uint64_t spaced_ms = now_ms + dump_ms * BPF2SOCKS_UDP_CLIENT_SWEEP_COST_FACTOR;
+                if (spaced_ms > state->next_client_sweep_ms) state->next_client_sweep_ms = spaced_ms;
+            }
+            if (bpf2socks_udp_port_bitmap_has(state->client_port_bitmap, session_client_port(session))) {
+                session->client_open_seen_ms = session->last_seen_ms;
+            } else {
+                drop_session(state, session);
+                ++worker->udp_stats.udp_closed_client_releases;
+            }
+        }
+        session = next;
+    }
+    state->client_sweep_due_ms = due;
+}
+
 static void evict_idle_bindings(
     struct udp_state *state,
     const struct bpf2socks_runtime_config *config,
@@ -3454,6 +3635,8 @@ static int init_state(struct udp_state *state, struct bpf2socks_bridge_worker *w
     state->dns_raw6_fd = -1;
     state->budget_wake_fd = -1;
     state->next_deadline_ms = BPF2SOCKS_NO_DEADLINE;
+    state->relay_registry = worker->udp_relay_registry;
+    state->client_sweep_due_ms = BPF2SOCKS_NO_DEADLINE;
     size_t max_sessions = worker->udp_session_cap;
     state->binding_cap = worker->udp_binding_cap;
     state->pending_budget = worker->udp_pending_budget;
@@ -3567,6 +3750,7 @@ static void free_state(struct udp_state *state) {
     free(state->sessions);
     bpf2socks_dns_table_free(&state->dns_table);
     free(state->token_cache);
+    free(state->client_port_bitmap);
     memset(state, 0, sizeof(*state));
 }
 
@@ -3592,6 +3776,11 @@ static uint64_t udp_next_deadline(
             bpf2socks_note_deadline(&next, deadline);
             break;
         }
+    }
+    if (!state->client_sweep_disabled && state->client_sweep_due_ms != BPF2SOCKS_NO_DEADLINE) {
+        uint64_t deadline = state->client_sweep_due_ms;
+        if (deadline < state->next_client_sweep_ms) deadline = state->next_client_sweep_ms;
+        bpf2socks_note_deadline(&next, deadline);
     }
     for (const struct bpf2socks_udp_reply_binding *binding = state->binding_lru_head;
          binding != NULL && binding->used;
@@ -3639,6 +3828,7 @@ static void udp_run_maintenance(
     evict_idle_bindings(state, worker->config, worker);
     expire_session_handshakes(state, worker, monotonic_ms());
     expire_sessions(state, worker->config);
+    release_closed_client_sessions(state, worker, monotonic_ms());
     expire_dns_transactions(state, worker, monotonic_ms());
     expire_dns_channel_handshake(state, monotonic_ms());
     free_retired_downlink_channels(state);

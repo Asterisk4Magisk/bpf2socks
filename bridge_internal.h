@@ -27,6 +27,8 @@
 #define BPF2SOCKS_NO_DEADLINE UINT64_MAX
 #define BPF2SOCKS_CACHE_LINE_SIZE 64
 
+struct bpf2socks_udp_relay_registry;
+
 struct bpf2socks_udp_pending_budget {
     size_t cap_bytes;
     atomic_size_t used_bytes;
@@ -57,6 +59,7 @@ struct bpf2socks_bridge_worker {
     size_t udp_session_cap;
     size_t udp_binding_cap;
     struct bpf2socks_udp_pending_budget *udp_pending_budget;
+    struct bpf2socks_udp_relay_registry *udp_relay_registry;
     /*
      * Each worker's TCP and UDP threads count into their own copy, kept on
      * separate cache lines so hot counters never bounce between the two.
@@ -118,6 +121,12 @@ struct bpf2socks_udp_client_session {
     /* udp_fd is connect()ed to relay_addr: send without a destination. */
     bool relay_connected;
     uint64_t last_seen_ms;
+    /* Relay port owned in the registry while relay_port_claimed. */
+    uint16_t relay_port;
+    bool relay_port_claimed;
+    uint8_t associate_retries;
+    /* last_seen_ms when the client socket was last found open; equal means no recheck. */
+    uint64_t client_open_seen_ms;
     uint8_t associate_write_buf[32];
     size_t associate_write_len;
     size_t associate_write_offset;

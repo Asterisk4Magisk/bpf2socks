@@ -716,7 +716,9 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         "\"dnsFreeStackAllocations\":%" PRIu64 ","
         "\"dnsFullTableEvictions\":%" PRIu64 ","
         "\"udpDropsSendBusy\":%" PRIu64 ","
-        "\"udpAssociateTimeouts\":%" PRIu64
+        "\"udpAssociateTimeouts\":%" PRIu64 ","
+        "\"udpClosedClientReleases\":%" PRIu64 ","
+        "\"udpRelayPortCollisions\":%" PRIu64
         "}\n",
         stats->tcp_accepts,
         stats->tcp_connect_failures,
@@ -760,7 +762,9 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         stats->dns_free_stack_allocations,
         stats->dns_full_table_evictions,
         stats->udp_drops_send_busy,
-        stats->udp_associate_timeouts);
+        stats->udp_associate_timeouts,
+        stats->udp_closed_client_releases,
+        stats->udp_relay_port_collisions);
 }
 
 static int stats_with_pid(const char *pid_path) {

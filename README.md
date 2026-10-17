@@ -138,7 +138,7 @@ A present field must be well formed: numbers are unsigned decimals within their 
 | `udpBatchSize` | 32; zero resets to the default; capped at 64 datagrams per system call. |
 | `maxUdpSessions` | 4096; zero resets to the default. |
 | `maxUdpBindings` | 16384; raised to at least `maxUdpSessions`. |
-| `udpIdleTimeoutSeconds` | 60; zero resets to the default. |
+| `udpIdleTimeoutSeconds` | 60; zero resets to the default. A session of a local client whose UDP socket is gone is released after about 0.5 s idle instead (found with a `sock_diag` dump; disabled for the run if the dump fails). TC hotspot sessions keep the full timeout. |
 | `maxUdpPendingBytes` | 67108864; normalized to 131072–134217728. |
 | `dnsTransactionTimeoutMilliseconds` | 60000; normalized to 1000–600000. |
 
@@ -166,6 +166,8 @@ Run as root with a mounted BPF filesystem, a usable cgroup hierarchy, the requir
 Cgroup hooks prefer multi-program attachment. If an exclusive attachment blocks it, the six connect/sendmsg/recvmsg hooks may temporarily replace an existing program only when its translated instructions are exactly `r0 = 1; exit`. Unknown programs, unreadable instructions, and other attachment modes remain conflicts. This behavior applies with or without DNS enhancement.
 
 Original program file descriptors remain open for restoration during probe cleanup, failed startup, and graceful shutdown. Restoration attempts to reinstate the original program ID and exclusive flags, and refuses to overwrite an observed external change. Exclusive attachment has no atomic compare-and-replace operation on the supported older kernels, so concurrent external attachment changes cannot be fully excluded. Restoration is best-effort: failures produce warnings and cleanup continues. They do not invalidate a successful capability probe or replace an earlier startup failure. Final cleanup retries pending restoration once and releases saved references even if it fails. Process termination without cleanup cannot restore the original attachment.
+
+Each UDP session or DNS channel owns its UDP ASSOCIATE relay port among all workers. Some servers (Xray) bind every association's relay socket to port 0 with `SO_REUSEPORT`, which can return a port another live association still holds; datagrams then reach the wrong association. An association answered with a port that is in use is replaced (up to three retries for a session; a DNS channel is rebuilt). A relay port equal to the SOCKS5 server port is a shared relay and is not checked.
 
 The configuration controls pinned objects, cgroup attachment, PID signaling, and traffic interception. Generate it from trusted application state and use an application-specific `pinnedObjectDir`.
 
