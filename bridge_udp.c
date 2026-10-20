@@ -177,6 +177,7 @@ struct bpf2socks_udp_downlink_channel {
  */
 #define BPF2SOCKS_UDP_TOKEN_CACHE_SIZE 4096U
 #define BPF2SOCKS_UDP_TOKEN_CACHE_TTL_MS 1000U
+#define BPF2SOCKS_UDP_TOKEN_NOTICES_PER_SECOND 64U
 
 struct udp_token_cache_entry {
     struct bpf2socks_token_key key;
@@ -209,6 +210,11 @@ struct udp_state {
     struct bpf2socks_dns_table dns_table;
     int dns_raw4_fd;
     int dns_raw6_fd;
+    /* Raw ICMP sockets that tell a local client its token is unknown. */
+    int token_notice4_fd;
+    int token_notice6_fd;
+    uint64_t token_notice_window_ms;
+    uint32_t token_notice_count;
     int epoll_fd;
     int budget_wake_fd;
     /* Earliest session/binding/DNS deadline found by the last maintenance pass. */
@@ -1625,6 +1631,7 @@ static int send_udp_relay_batch(
     const struct bpf2socks_udp_msg *messages,
     unsigned int count) {
     unsigned int sent_total = 0U;
+    unsigned int oversized = 0U;
     while (sent_total < count) {
         int sent = bpf2socks_socks5_udp_sendmmsg(
             session->udp_fd,
@@ -1637,6 +1644,12 @@ static int send_udp_relay_batch(
             continue;
         }
         if (sent < 0 && errno == EINTR) continue;
+        /* A datagram too large once the SOCKS5 header is added: drop it, not the session. */
+        if (sent < 0 && errno == EMSGSIZE) {
+            ++oversized;
+            ++sent_total;
+            continue;
+        }
         if (sent < 0 && udp_send_errno_is_transient(errno)) {
             worker->udp_stats.udp_drops_send_busy += (uint64_t)(count - sent_total);
             break;
@@ -1644,6 +1657,8 @@ static int send_udp_relay_batch(
         if (sent == 0) errno = EIO;
         return -1;
     }
+    worker->udp_stats.udp_drops_oversized += (uint64_t)oversized;
+    sent_total -= oversized;
     worker->udp_stats.udp_packets_to_upstream += (uint64_t)sent_total;
     worker->udp_stats.udp_copy_sends += (uint64_t)sent_total;
     return (int)sent_total;
@@ -1977,6 +1992,31 @@ static struct bpf2socks_udp_reply_binding *create_fullcone_binding(
         worker);
 }
 
+static bool binding_has_token(const struct bpf2socks_udp_reply_binding *binding) {
+    static const uint8_t no_token[16];
+    return memcmp(binding->token_addr, no_token, sizeof(no_token)) != 0;
+}
+
+/*
+ * A reply addressed by domain (SOCKS5 ATYP 3) answers a datagram the client
+ * sent to an address the server mapped to that domain, such as a FakeIP.
+ * Take the most recently used client-created binding with the same port.
+ */
+static struct bpf2socks_udp_reply_binding *find_domain_reply_binding(
+    struct bpf2socks_udp_client_session *session,
+    uint16_t port) {
+    struct bpf2socks_udp_reply_binding *best = NULL;
+    for (struct bpf2socks_udp_reply_binding *binding = session->bindings;
+         binding != NULL;
+         binding = binding->next) {
+        if (!binding->used || binding->original_dst.port != port || !binding_has_token(binding)) {
+            continue;
+        }
+        if (best == NULL || binding->last_seen_ms > best->last_seen_ms) best = binding;
+    }
+    return best;
+}
+
 static void note_client_sweep_due(struct udp_state *state, const struct bpf2socks_udp_client_session *session);
 
 static struct bpf2socks_udp_client_session *get_session(
@@ -2112,6 +2152,157 @@ static int lookup_udp_original(
         cached->expires_ms = now_ms + BPF2SOCKS_UDP_TOKEN_CACHE_TTL_MS;
     }
     return original_to_sockaddr(&original, &packet->original_dst);
+}
+
+static void fill_client_less_udp_token_key(
+    struct bpf2socks_token_key *key,
+    int family,
+    const uint8_t *token_addr,
+    uint16_t listen_port) {
+    memset(key, 0, sizeof(*key));
+    key->family = (uint8_t)family;
+    key->protocol = BPF2SOCKS_PROTO_UDP;
+    key->token_port = listen_port;
+    memcpy(key->token_addr, token_addr, family == AF_INET6 ? 16U : 4U);
+}
+
+/*
+ * The token map is an LRU shared by every flow, and a connected socket that
+ * sends and receives without addresses never refreshes its entry, so heavy
+ * churn can evict it. When this client's session still holds the connected
+ * binding for the token, take the original destination from it and publish
+ * the token again so the recvmsg and getpeername hooks keep translating it.
+ */
+static int recover_connected_udp_token(
+    struct bpf2socks_bridge_worker *worker,
+    const struct bpf2socks_udp_client_session *session,
+    struct udp_client_packet *packet) {
+    if (session == NULL) return -1;
+    size_t token_len = packet->token_family == AF_INET6 ? 16U : 4U;
+    for (const struct bpf2socks_udp_reply_binding *binding = session->bindings;
+         binding != NULL;
+         binding = binding->next) {
+        if (!binding->used || !binding->connected_udp_token ||
+            memcmp(binding->token_addr, packet->token_addr, token_len) != 0) {
+            continue;
+        }
+        packet->original_dst = binding->original_dst;
+        packet->connected_udp_token = true;
+        packet->token_lookup_mode = session->token_lookup_mode;
+        struct bpf2socks_token_key key;
+        fill_client_less_udp_token_key(&key, packet->token_family, packet->token_addr, worker->config->listen_port);
+        struct bpf2socks_original_dst original;
+        memset(&original, 0, sizeof(original));
+        original.family = binding->original_dst.family;
+        original.protocol = BPF2SOCKS_PROTO_UDP;
+        original.port = binding->original_dst.port;
+        memcpy(original.addr, binding->original_dst.addr, sizeof(original.addr));
+        original.flags = BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP;
+        if (bpf2socks_update_map(worker->config->token_map_fd, &key, &original) != 0) {
+            BPF2SOCKS_LOG_THROTTLED("failed to republish connected UDP token: errno=%d", errno);
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/*
+ * A local datagram whose token is unknown cannot be forwarded: its token was
+ * evicted with its session, or it predates this bridge instance. Answer it
+ * with an ICMP port unreachable that quotes the datagram, which the kernel
+ * maps back to the sending socket: a connected socket then fails with
+ * ECONNREFUSED and its application reconnects instead of waiting on a
+ * silent black hole. Unconnected sockets ignore the error.
+ */
+static void notify_unknown_udp_token(
+    struct udp_state *state,
+    const struct bpf2socks_runtime_config *config,
+    const struct udp_client_packet *packet,
+    uint64_t now_ms) {
+    if (!bpf2socks_sockaddr_storage_is_loopback(&packet->client_addr) ||
+        packet->client_addr.ss_family != packet->token_family) {
+        return;
+    }
+    if (now_ms - state->token_notice_window_ms >= 1000U) {
+        state->token_notice_window_ms = now_ms;
+        state->token_notice_count = 0U;
+    }
+    if (state->token_notice_count >= BPF2SOCKS_UDP_TOKEN_NOTICES_PER_SECOND) return;
+    ++state->token_notice_count;
+    size_t quoted_len = packet->payload_len;
+    if (quoted_len > UINT16_MAX - 48U) quoted_len = UINT16_MAX - 48U;
+
+    if (packet->client_addr.ss_family == AF_INET) {
+        if (state->token_notice4_fd < 0) {
+            state->token_notice4_fd = socket(AF_INET, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP);
+            if (state->token_notice4_fd < 0) return;
+        }
+        const struct sockaddr_in *client = (const struct sockaddr_in *)&packet->client_addr;
+        uint8_t message[8U + sizeof(struct iphdr) + sizeof(struct bpf2socks_udp_header)];
+        memset(message, 0, sizeof(message));
+        message[0] = 3U; /* destination unreachable */
+        message[1] = 3U; /* port unreachable */
+        struct iphdr *ip = (struct iphdr *)(message + 8U);
+        ip->version = 4;
+        ip->ihl = sizeof(*ip) / 4U;
+        ip->ttl = 64;
+        ip->protocol = IPPROTO_UDP;
+        ip->tot_len = htons((uint16_t)(sizeof(*ip) + sizeof(struct bpf2socks_udp_header) + quoted_len));
+        ip->saddr = client->sin_addr.s_addr;
+        memcpy(&ip->daddr, packet->token_addr, 4U);
+        ip->check = htons(checksum_fold(checksum_add_bytes(0, ip, sizeof(*ip))));
+        struct bpf2socks_udp_header *udp = (struct bpf2socks_udp_header *)(message + 8U + sizeof(*ip));
+        udp->source = client->sin_port;
+        udp->dest = htons(config->listen_port);
+        udp->len = htons((uint16_t)(sizeof(*udp) + quoted_len));
+        uint16_t checksum = htons(checksum_fold(checksum_add_bytes(0, message, sizeof(message))));
+        memcpy(message + 2U, &checksum, sizeof(checksum));
+        (void)sendto(state->token_notice4_fd, message, sizeof(message), 0,
+            (const struct sockaddr *)client, sizeof(*client));
+        return;
+    }
+
+    if (state->token_notice6_fd < 0) {
+        state->token_notice6_fd = socket(AF_INET6, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMPV6);
+        if (state->token_notice6_fd < 0) return;
+    }
+    struct sockaddr_in6 client = *(const struct sockaddr_in6 *)&packet->client_addr;
+    uint8_t message[8U + sizeof(struct ipv6hdr) + sizeof(struct bpf2socks_udp_header)];
+    memset(message, 0, sizeof(message));
+    message[0] = 1U; /* destination unreachable; the kernel fills the checksum */
+    message[1] = 4U; /* port unreachable */
+    struct ipv6hdr *ip = (struct ipv6hdr *)(message + 8U);
+    ip->version = 6;
+    ip->payload_len = htons((uint16_t)(sizeof(struct bpf2socks_udp_header) + quoted_len));
+    ip->nexthdr = IPPROTO_UDP;
+    ip->hop_limit = 64;
+    memcpy(&ip->saddr, &client.sin6_addr, 16U);
+    memcpy(&ip->daddr, packet->token_addr, 16U);
+    struct bpf2socks_udp_header *udp = (struct bpf2socks_udp_header *)(message + 8U + sizeof(*ip));
+    udp->source = client.sin6_port;
+    udp->dest = htons(config->listen_port);
+    udp->len = htons((uint16_t)(sizeof(*udp) + quoted_len));
+    client.sin6_port = 0;
+    (void)sendto(state->token_notice6_fd, message, sizeof(message), 0,
+        (const struct sockaddr *)&client, sizeof(client));
+}
+
+/*
+ * A local client's socket is gone, so no datagram can carry its tokens any
+ * more: drop them instead of leaving them to crowd live flows out of the LRU.
+ */
+static void delete_closed_client_udp_tokens(
+    const struct bpf2socks_bridge_worker *worker,
+    const struct bpf2socks_udp_client_session *session) {
+    int family = session->client_addr.ss_family;
+    for (const struct bpf2socks_udp_reply_binding *binding = session->bindings;
+         binding != NULL;
+         binding = binding->next) {
+        if (!binding->used || !binding_has_token(binding)) continue;
+        struct bpf2socks_token_key key;
+        fill_client_less_udp_token_key(&key, family, binding->token_addr, worker->config->listen_port);
+        (void)bpf2socks_delete_map(worker->config->token_map_fd, &key);
+    }
 }
 
 static int parse_udp_client_packet_cmsgs(
@@ -3011,7 +3202,11 @@ static int send_dns_response_to_client(
         if (raw_fd >= 0) {
             binding.reply_fd = raw_fd;
             binding.reply_raw = true;
-            return send_dns_response_with_binding(worker, &session, &binding, message);
+            int result = send_dns_response_with_binding(worker, &session, &binding, message);
+            /* The kernel never fragments a header-included raw send, so a
+             * response larger than the route MTU (a hotspot client behind a
+             * 1500 B link) needs a UDP socket that the kernel may fragment. */
+            if (result == 0 || errno != EMSGSIZE) return result;
         }
 
         bool reply_raw = false;
@@ -3178,9 +3373,12 @@ static void handle_udp_client_packets(
         enum bpf2socks_udp_token_lookup_mode preference = existing_session != NULL
             ? existing_session->token_lookup_mode
             : BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN;
-        if (parse_result < 0 || lookup_udp_original(state, worker, &packet, preference, now_ms) < 0) {
+        if (parse_result < 0 ||
+            (lookup_udp_original(state, worker, &packet, preference, now_ms) < 0 &&
+             recover_connected_udp_token(worker, existing_session, &packet) < 0)) {
             ++worker->udp_stats.udp_token_misses;
             BPF2SOCKS_LOG_THROTTLED("missing UDP original destination: errno=%d", errno);
+            if (parse_result == 0) notify_unknown_udp_token(state, worker->config, &packet, now_ms);
             continue;
         }
         if (existing_session != NULL && packet.token_lookup_mode != BPF2SOCKS_UDP_TOKEN_LOOKUP_UNKNOWN) {
@@ -3333,6 +3531,15 @@ static void handle_udp_upstream_packets(
     for (int i = 0; i < received; ++i) {
         ++worker->udp_stats.udp_packets_from_upstream;
         if (skip_unusable_relay_datagram(worker, &messages[i])) continue;
+        if (messages[i].addr.family == AF_UNSPEC) {
+            struct bpf2socks_udp_reply_binding *domain_binding =
+                find_domain_reply_binding(session, messages[i].addr.port);
+            if (domain_binding == NULL) {
+                ++worker->udp_stats.udp_drops_malformed_socks5;
+                continue;
+            }
+            messages[i].addr = domain_binding->original_dst;
+        }
         struct bpf2socks_udp_reply_binding *binding = find_binding(
             state, session, &messages[i].addr, worker);
         if (binding == NULL) {
@@ -3384,6 +3591,14 @@ static void handle_udp_upstream_packets(
                           messages[i].payload_len);
                 if (send_result < 0) {
                     int send_errno = errno;
+                    /* A header-included raw send is never fragmented: drop only
+                     * the datagram larger than the route MTU, not the session. */
+                    if (send_errno == EMSGSIZE) {
+                        ++worker->udp_stats.udp_drops_oversized;
+                        BPF2SOCKS_LOG_THROTTLED("dropping UDP response larger than the client route MTU: len=%zu",
+                            messages[i].payload_len);
+                        continue;
+                    }
                     if (bpf2socks_udp_downlink_classify_send_result(-1, 1U, send_errno) ==
                         BPF2SOCKS_UDP_DOWNLINK_SEND_RETRY) {
                         if (queue_udp_downlink_packet(
@@ -3498,15 +3713,7 @@ static void expire_sessions(struct udp_state *state, const struct bpf2socks_runt
 
 /* A local client reaches the bridge from the loopback address of its own socket. */
 static bool session_client_is_local(const struct bpf2socks_udp_client_session *session) {
-    if (session->client_addr.ss_family == AF_INET) {
-        const struct sockaddr_in *in = (const struct sockaddr_in *)&session->client_addr;
-        return (ntohl(in->sin_addr.s_addr) >> 24U) == 127U;
-    }
-    if (session->client_addr.ss_family == AF_INET6) {
-        const struct in6_addr *addr = &((const struct sockaddr_in6 *)&session->client_addr)->sin6_addr;
-        return IN6_IS_ADDR_LOOPBACK(addr) || (IN6_IS_ADDR_V4MAPPED(addr) && addr->s6_addr[12] == 127U);
-    }
-    return false;
+    return bpf2socks_sockaddr_storage_is_loopback(&session->client_addr);
 }
 
 static uint16_t session_client_port(const struct bpf2socks_udp_client_session *session) {
@@ -3589,6 +3796,7 @@ static void release_closed_client_sessions(
             if (bpf2socks_udp_port_bitmap_has(state->client_port_bitmap, session_client_port(session))) {
                 session->client_open_seen_ms = session->last_seen_ms;
             } else {
+                delete_closed_client_udp_tokens(worker, session);
                 drop_session(state, session);
                 ++worker->udp_stats.udp_closed_client_releases;
             }
@@ -3633,6 +3841,8 @@ static int init_state(struct udp_state *state, struct bpf2socks_bridge_worker *w
     state->epoll_fd = -1;
     state->dns_raw4_fd = -1;
     state->dns_raw6_fd = -1;
+    state->token_notice4_fd = -1;
+    state->token_notice6_fd = -1;
     state->budget_wake_fd = -1;
     state->next_deadline_ms = BPF2SOCKS_NO_DEADLINE;
     state->relay_registry = worker->udp_relay_registry;
@@ -3728,6 +3938,14 @@ static void free_state(struct udp_state *state) {
     if (state->dns_raw6_fd >= 0) {
         close(state->dns_raw6_fd);
         state->dns_raw6_fd = -1;
+    }
+    if (state->token_notice4_fd >= 0) {
+        close(state->token_notice4_fd);
+        state->token_notice4_fd = -1;
+    }
+    if (state->token_notice6_fd >= 0) {
+        close(state->token_notice6_fd);
+        state->token_notice6_fd = -1;
     }
     if (state->budget_wake_fd >= 0) {
         bpf2socks_pending_budget_set_wake_fd(state->pending_budget, state->worker_id, -1);

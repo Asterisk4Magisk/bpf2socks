@@ -19,47 +19,6 @@
 #define BPF2SOCKS_SOCKS5_UDP_HEADER_CAP 22U
 
 static size_t socks5_write_addr(uint8_t *out, const struct bpf2socks_sockaddr *addr);
-static int replace_unspecified_relay_addr(
-    const struct sockaddr *socks_addr,
-    socklen_t socks_addr_len,
-    struct sockaddr_storage *relay_addr,
-    socklen_t *relay_addr_len);
-
-static int write_full(int fd, const void *buf, size_t len) {
-    const uint8_t *ptr = buf;
-    while (len > 0U) {
-        ssize_t res = send(fd, ptr, len, MSG_NOSIGNAL);
-        if (res < 0 && errno == EINTR) continue;
-        if (res <= 0) return -1;
-        ptr += (size_t)res;
-        len -= (size_t)res;
-    }
-    return 0;
-}
-
-static int read_full(int fd, void *buf, size_t len) {
-    uint8_t *ptr = buf;
-    while (len > 0U) {
-        ssize_t res = recv(fd, ptr, len, MSG_WAITALL);
-        if (res < 0 && errno == EINTR) continue;
-        if (res <= 0) return -1;
-        ptr += (size_t)res;
-        len -= (size_t)res;
-    }
-    return 0;
-}
-
-static int connect_tcp_host(const char *host, uint16_t port) {
-    struct sockaddr_storage addr;
-    socklen_t addr_len = 0;
-    if (bpf2socks_resolve_tcp_addr(host, port, &addr, &addr_len) < 0) return -1;
-    int fd = socket(addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    bpf2socks_bridge_tune_tcp_advanced(fd, true);
-    if (connect(fd, (const struct sockaddr *)&addr, addr_len) == 0) return fd;
-    close(fd);
-    return -1;
-}
 
 int bpf2socks_resolve_tcp_addr(const char *host, uint16_t port, struct sockaddr_storage *addr, socklen_t *addr_len) {
     if (host == NULL || addr == NULL || addr_len == NULL) {
@@ -87,21 +46,6 @@ int bpf2socks_resolve_tcp_addr(const char *host, uint16_t port, struct sockaddr_
     freeaddrinfo(result);
     if (rc < 0) errno = ENOENT;
     return rc;
-}
-
-static int connect_tcp_addr(const struct sockaddr *addr, socklen_t addr_len) {
-    if (addr == NULL || addr_len == 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    int fd = socket(addr->sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return -1;
-    bpf2socks_bridge_tune_tcp_advanced(fd, true);
-    if (connect(fd, addr, addr_len) == 0) return fd;
-    int saved = errno;
-    close(fd);
-    errno = saved;
-    return -1;
 }
 
 int bpf2socks_socks5_connect_nonblock(
@@ -229,20 +173,6 @@ int bpf2socks_socks5_parse_bound_addr(
     return -1;
 }
 
-int bpf2socks_socks5_replace_unspecified_relay(
-    const struct sockaddr *socks_addr, socklen_t socks_addr_len,
-    struct sockaddr_storage *relay_addr, socklen_t *relay_addr_len) {
-    return replace_unspecified_relay_addr(socks_addr, socks_addr_len, relay_addr, relay_addr_len);
-}
-
-static int socks5_handshake(int fd) {
-    uint8_t hello[] = {0x05, 0x01, 0x00};
-    uint8_t hello_reply[2];
-    if (write_full(fd, hello, sizeof(hello)) < 0 || read_full(fd, hello_reply, sizeof(hello_reply)) < 0) return -1;
-    return bpf2socks_socks5_parse_hello_reply(hello_reply, sizeof(hello_reply));
-}
-
-
 static size_t socks5_write_addr(uint8_t *out, const struct bpf2socks_sockaddr *addr) {
     size_t len = 0;
     if (addr->family == AF_INET) {
@@ -261,57 +191,7 @@ static size_t socks5_write_addr(uint8_t *out, const struct bpf2socks_sockaddr *a
     return len;
 }
 
-static int socks5_read_bound_addr(int fd, struct sockaddr_storage *bound, socklen_t *bound_len) {
-    uint8_t rep[4 + 255 + 2];
-    if (read_full(fd, rep, 4) < 0 || rep[0] != 0x05 || rep[1] != 0x00) return -1;
-    memset(bound, 0, sizeof(*bound));
-
-    if (rep[3] == 0x01) {
-        if (read_full(fd, rep, 4 + 2) < 0) return -1;
-        struct sockaddr_in *addr = (struct sockaddr_in *)bound;
-        addr->sin_family = AF_INET;
-        memcpy(&addr->sin_addr, rep, 4);
-        memcpy(&addr->sin_port, rep + 4, 2);
-        *bound_len = sizeof(*addr);
-        return 0;
-    }
-    if (rep[3] == 0x04) {
-        if (read_full(fd, rep, 16 + 2) < 0) return -1;
-        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)bound;
-        addr->sin6_family = AF_INET6;
-        memcpy(&addr->sin6_addr, rep, 16);
-        memcpy(&addr->sin6_port, rep + 16, 2);
-        *bound_len = sizeof(*addr);
-        return 0;
-    }
-    if (rep[3] == 0x03) {
-        uint8_t n = 0;
-        if (read_full(fd, &n, 1) < 0 || n == 0U || read_full(fd, rep, (size_t)n + 2U) < 0) return -1;
-        char host[256];
-        memcpy(host, rep, n);
-        host[n] = '\0';
-        char port_buf[8];
-        uint16_t reply_port = ((uint16_t)rep[n] << 8) | rep[n + 1U];
-        snprintf(port_buf, sizeof(port_buf), "%u", reply_port);
-        struct addrinfo hints;
-        struct addrinfo *result = NULL;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_socktype = SOCK_DGRAM;
-        hints.ai_family = AF_UNSPEC;
-        if (getaddrinfo(host, port_buf, &hints, &result) != 0 || result == NULL) return -1;
-        if ((size_t)result->ai_addrlen > sizeof(*bound)) {
-            freeaddrinfo(result);
-            return -1;
-        }
-        memcpy(bound, result->ai_addr, result->ai_addrlen);
-        *bound_len = (socklen_t)result->ai_addrlen;
-        freeaddrinfo(result);
-        return 0;
-    }
-    return -1;
-}
-
-static int replace_unspecified_relay_addr(
+int bpf2socks_socks5_replace_unspecified_relay(
     const struct sockaddr *socks_addr,
     socklen_t socks_addr_len,
     struct sockaddr_storage *relay_addr,
@@ -336,153 +216,6 @@ static int replace_unspecified_relay_addr(
         *relay_addr_len = sizeof(*relay6);
     }
     return 0;
-}
-
-int bpf2socks_socks5_connect(const char *host, uint16_t port, const struct bpf2socks_sockaddr *dst) {
-    if (host == NULL || dst == NULL) return -1;
-    int fd = connect_tcp_host(host, port);
-    if (fd < 0) return -1;
-
-    if (socks5_handshake(fd) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    uint8_t req[4 + 16 + 2];
-    size_t len = 0;
-    req[len++] = 0x05;
-    req[len++] = 0x01;
-    req[len++] = 0x00;
-    size_t addr_len = socks5_write_addr(req + len, dst);
-    if (addr_len == 0U) {
-        close(fd);
-        return -1;
-    }
-    len += addr_len;
-    if (write_full(fd, req, len) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    struct sockaddr_storage ignored;
-    socklen_t ignored_len = 0;
-    if (socks5_read_bound_addr(fd, &ignored, &ignored_len) < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-int bpf2socks_socks5_udp_associate(
-    const char *host,
-    uint16_t port,
-    int *tcp_fd,
-    int *udp_fd,
-    struct sockaddr_storage *relay_addr,
-    socklen_t *relay_addr_len) {
-    if (host == NULL || tcp_fd == NULL || udp_fd == NULL || relay_addr == NULL || relay_addr_len == NULL) return -1;
-    struct sockaddr_storage socks_addr;
-    socklen_t socks_addr_len = 0;
-    if (bpf2socks_resolve_tcp_addr(host, port, &socks_addr, &socks_addr_len) < 0) return -1;
-    return bpf2socks_socks5_udp_associate_addr(
-        (const struct sockaddr *)&socks_addr,
-        socks_addr_len,
-        tcp_fd,
-        udp_fd,
-        relay_addr,
-        relay_addr_len);
-}
-
-int bpf2socks_socks5_udp_associate_addr(
-    const struct sockaddr *socks_addr,
-    socklen_t socks_addr_len,
-    int *tcp_fd,
-    int *udp_fd,
-    struct sockaddr_storage *relay_addr,
-    socklen_t *relay_addr_len) {
-    if (socks_addr == NULL || tcp_fd == NULL || udp_fd == NULL || relay_addr == NULL || relay_addr_len == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-    *tcp_fd = -1;
-    *udp_fd = -1;
-    int fd = connect_tcp_addr(socks_addr, socks_addr_len);
-    if (fd < 0) return -1;
-    if (socks5_handshake(fd) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    struct bpf2socks_sockaddr any_addr;
-    memset(&any_addr, 0, sizeof(any_addr));
-    any_addr.family = AF_INET;
-    any_addr.port = 0;
-    uint8_t req[4 + 16 + 2];
-    size_t len = 0;
-    req[len++] = 0x05;
-    req[len++] = 0x03;
-    req[len++] = 0x00;
-    size_t addr_len = socks5_write_addr(req + len, &any_addr);
-    if (addr_len == 0U) {
-        close(fd);
-        return -1;
-    }
-    len += addr_len;
-    if (write_full(fd, req, len) < 0 ||
-        socks5_read_bound_addr(fd, relay_addr, relay_addr_len) < 0 ||
-        replace_unspecified_relay_addr(socks_addr, socks_addr_len, relay_addr, relay_addr_len) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    int dgram = socket(relay_addr->ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (dgram < 0) {
-        close(fd);
-        return -1;
-    }
-    *tcp_fd = fd;
-    *udp_fd = dgram;
-    return 0;
-}
-
-int bpf2socks_socks5_udp_send(
-    int udp_fd,
-    const struct sockaddr *relay_addr,
-    socklen_t relay_addr_len,
-    const struct bpf2socks_sockaddr *dst,
-    const uint8_t *payload,
-    size_t payload_len) {
-    if (dst == NULL) return -1;
-    struct bpf2socks_udp_msg message = {
-        .addr = *dst,
-        .payload = (uint8_t *)payload,
-        .payload_len = payload_len,
-    };
-    return bpf2socks_socks5_udp_sendmmsg(udp_fd, relay_addr, relay_addr_len, &message, 1U) == 1 ? 0 : -1;
-}
-
-ssize_t bpf2socks_socks5_udp_recv(
-    int udp_fd,
-    struct bpf2socks_sockaddr *src,
-    uint8_t *payload,
-    size_t payload_cap) {
-    if (udp_fd < 0 || src == NULL || payload == NULL || payload_cap == 0U) return -1;
-    uint8_t packet[BPF2SOCKS_SOCKS5_UDP_HEADER_CAP + payload_cap];
-    struct bpf2socks_udp_msg message;
-    memset(&message, 0, sizeof(message));
-    int count = bpf2socks_socks5_udp_recvmmsg(udp_fd, &message, 1U, packet, sizeof(packet));
-    if (count <= 0) return count;
-    if (message.error != 0) {
-        errno = message.error;
-        return -1;
-    }
-    if (message.payload_len > payload_cap) {
-        errno = EMSGSIZE;
-        return -1;
-    }
-    *src = message.addr;
-    memcpy(payload, message.payload, message.payload_len);
-    return (ssize_t)message.payload_len;
 }
 
 int bpf2socks_socks5_udp_sendmmsg(
@@ -543,6 +276,16 @@ static int parse_socks5_udp_datagram(uint8_t *packet, size_t len, struct bpf2soc
         ++pos;
         memcpy(message->addr.addr, packet + pos, 16);
         pos += 16U;
+    } else if (packet[pos] == 0x03) {
+        /*
+         * A server that maps a reply back to a domain destination names the
+         * domain, not the peer. Keep only the port (AF_UNSPEC); the caller
+         * matches it to a binding it already has.
+         */
+        ++pos;
+        if (len < pos + 1U || len < pos + 1U + packet[pos] + 2U) return EPROTO;
+        message->addr.family = AF_UNSPEC;
+        pos += 1U + packet[pos];
     } else {
         return EAFNOSUPPORT;
     }

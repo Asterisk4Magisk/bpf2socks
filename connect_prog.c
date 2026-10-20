@@ -24,6 +24,7 @@
 #define BPF2SOCKS_IKE_PORT 500U
 #define BPF2SOCKS_NAT_T_PORT 4500U
 #define BPF2SOCKS_DNS_TETHER_UID 1052U
+#define BPF2SOCKS_LOOPBACK_IFINDEX 1U
 /* BPF_MAP_TYPE_LRU_HASH. Android NDK headers expose it as an enum, not a preprocessor macro. */
 #define BPF2SOCKS_TOKEN_MAP_TYPE 9U
 
@@ -78,6 +79,7 @@ static void close_fd(int *fd) {
 static void init_runtime(struct bpf2socks_bpf_runtime *runtime) {
     memset(runtime, -1, sizeof(*runtime));
     runtime->interfaces = NULL;
+    runtime->networks = NULL;
     runtime->udp6_recovery_attached = false;
     runtime->udp6_recovery_qdisc_created = false;
 }
@@ -191,6 +193,16 @@ static int create_udp_peer_map(uint32_t max_entries) {
         0U);
 }
 
+/* netId -> present; BPF2SOCKS_DEFAULT_NETWORK_READY_KEY marks the set as known. */
+static int create_default_network_map(void) {
+    return bpf2socks_create_map(
+        BPF_MAP_TYPE_HASH,
+        sizeof(uint32_t),
+        sizeof(uint8_t),
+        BPF2SOCKS_MAX_DEFAULT_NETWORK_MAP_ENTRIES,
+        0U);
+}
+
 static int create_lpm4_map(uint32_t max_entries) {
     return bpf2socks_create_map(
         BPF_MAP_TYPE_LPM_TRIE,
@@ -252,6 +264,72 @@ static void emit_self_bypass_policy(
 
     emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_current_uid_gid));
     emit_self_gid_bypass_check_from_current_uid_gid(builder, policy, bypass_jumps, bypass_jump_count);
+}
+
+/*
+ * Bypass a socket the app bound explicitly to a network other than a default
+ * one (Network.bindSocket, bindProcessToNetwork), so a captive portal login
+ * or a cellular-only service uses the network it chose. Sockets bound to a
+ * default network, as QUIC connection migration does, stay proxied, and so
+ * does everything while userspace has not published the default networks.
+ */
+static void emit_explicit_network_bypass(
+    struct bpf_builder *builder,
+    int default_network_map_fd,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (default_network_map_fd < 0) return;
+    size_t skip[4];
+    size_t skip_count = 0U;
+    emit(builder, BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, sk)));
+    skip[skip_count++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, 0, 0));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_2, offsetof(struct bpf_sock, mark)));
+    emit(builder, BPF_MOV64_REG(BPF_REG_4, BPF_REG_3));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_4, BPF2SOCKS_FWMARK_EXPLICIT));
+    skip[skip_count++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_4, 0, 0));
+    emit(builder, BPF_ALU32_IMM_OP(BPF_AND, BPF_REG_3, 0xffffU));
+    skip[skip_count++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_3, 0, 0));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_3, STACK_IFINDEX_KEY));
+    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_UID_KEY, BPF2SOCKS_DEFAULT_NETWORK_READY_KEY));
+    emit_ld_map_fd(builder, BPF_REG_1, default_network_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_UID_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    skip[skip_count++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    emit_ld_map_fd(builder, BPF_REG_1, default_network_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_IFINDEX_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    bypass_jumps[(*bypass_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    for (size_t i = 0U; i < skip_count; ++i) patch_jump(builder, skip[i], builder->count);
+}
+
+/*
+ * Bypass sockets a token rewrite cannot carry: UDP-Lite, which the UDP
+ * sendmsg hooks also see but the bridge cannot receive, and a socket bound
+ * to a device other than loopback, whose datagrams cannot reach a loopback
+ * token and whose replies arriving on loopback would not match it.
+ */
+static void emit_socket_shape_bypass(
+    struct bpf_builder *builder,
+    enum bpf_attach_type attach_type,
+    int default_network_map_fd,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (attach_type == BPF_CGROUP_UDP4_SENDMSG || attach_type == BPF_CGROUP_UDP6_SENDMSG) {
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, protocol)));
+        bypass_jumps[(*bypass_jump_count)++] =
+            emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, BPF2SOCKS_PROTO_UDP, 0));
+    }
+    emit(builder, BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, sk)));
+    size_t no_sock = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, 0, 0));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_2, offsetof(struct bpf_sock, bound_dev_if)));
+    size_t unbound = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_3, 0, 0));
+    bypass_jumps[(*bypass_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_3, BPF2SOCKS_LOOPBACK_IFINDEX, 0));
+    patch_jump(builder, no_sock, builder->count);
+    patch_jump(builder, unbound, builder->count);
+    emit_explicit_network_bypass(builder, default_network_map_fd, bypass_jumps, bypass_jump_count);
 }
 
 static void emit_uid_policy(
@@ -698,6 +776,96 @@ static void emit_udp_peer_cache_restore_v6(
     patch_jump(builder, no_peer, fallback);
     patch_jump(builder, wrong_family, fallback);
     patch_jump(builder, wrong_proto, fallback);
+}
+
+/*
+ * Remembers a proxied TCP connection's original peer by socket cookie. The
+ * bridge consumes the TCP token on accept, so getpeername() could not map the
+ * token back otherwise. Emitted only on a CONNECT rewrite path, where the
+ * original destination is on the stack; UDP keeps its own peer cache.
+ */
+static void emit_tcp_peer_record(struct bpf_builder *builder, int tcp_peer_map_fd) {
+    if (tcp_peer_map_fd < 0) return;
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, protocol)));
+    size_t not_tcp = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, BPF2SOCKS_PROTO_TCP, 0));
+    emit(builder, BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_socket_cookie));
+    size_t no_cookie = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    /* The key family stays zero: a cookie already names one socket. */
+    emit_zero_region(builder, STACK_UDP_PEER_KEY, sizeof(struct bpf2socks_udp_peer_key));
+    emit_zero_region(builder, STACK_UDP_PEER_VALUE, sizeof(struct bpf2socks_udp_peer_value));
+    emit(builder, BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, STACK_UDP_PEER_KEY + (int)offsetof(struct bpf2socks_udp_peer_key, cookie)));
+    emit(builder, BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_10, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, family)));
+    emit(builder, BPF_STX_MEM(BPF_B, BPF_REG_10, BPF_REG_2, STACK_UDP_PEER_VALUE + (int)offsetof(struct bpf2socks_udp_peer_value, family)));
+    emit(builder, BPF_ST_MEM(BPF_B, BPF_REG_10, STACK_UDP_PEER_VALUE + (int)offsetof(struct bpf2socks_udp_peer_value, protocol), BPF2SOCKS_PROTO_TCP));
+    /* The stack holds the port in host order; keep it in network order for the context. */
+    emit(builder, BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_10, STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, port)));
+    emit(builder, BPF_ENDIAN_OP(BPF_REG_2, 16));
+    emit(builder, BPF_STX_MEM(BPF_H, BPF_REG_10, BPF_REG_2, STACK_UDP_PEER_VALUE + (int)offsetof(struct bpf2socks_udp_peer_value, port)));
+    for (int word = 0; word < 4; ++word) {
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10,
+            STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, addr) + word * 4));
+        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2,
+            STACK_UDP_PEER_VALUE + (int)offsetof(struct bpf2socks_udp_peer_value, addr) + word * 4));
+    }
+    emit_ld_map_fd(builder, BPF_REG_1, tcp_peer_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_UDP_PEER_KEY));
+    emit(builder, BPF_MOV64_REG(BPF_REG_3, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_3, STACK_UDP_PEER_VALUE));
+    emit(builder, BPF_MOV64_IMM(BPF_REG_4, BPF_ANY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_update_elem));
+    patch_jump(builder, not_tcp, builder->count);
+    patch_jump(builder, no_cookie, builder->count);
+}
+
+/*
+ * GETPEERNAME for a stream socket: restore the peer recorded at CONNECT. Jumps
+ * to done when nothing is recorded or after writing the original peer; an
+ * IPv6 socket gets an IPv4 peer back as a v4-mapped address.
+ */
+static void emit_tcp_peer_restore(
+    struct bpf_builder *builder,
+    int tcp_peer_map_fd,
+    bool ipv6,
+    size_t *done_jumps,
+    size_t *done_jump_count) {
+    emit(builder, BPF_MOV64_REG(BPF_REG_1, BPF_REG_6));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_socket_cookie));
+    done_jumps[(*done_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    emit_zero_region(builder, STACK_UDP_PEER_KEY, sizeof(struct bpf2socks_udp_peer_key));
+    emit(builder, BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, STACK_UDP_PEER_KEY + (int)offsetof(struct bpf2socks_udp_peer_key, cookie)));
+    emit_ld_map_fd(builder, BPF_REG_1, tcp_peer_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_UDP_PEER_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    done_jumps[(*done_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    /* emit_ctx_st32() uses R0 as scratch: keep the map value in R7. */
+    emit(builder, BPF_MOV64_REG(BPF_REG_7, BPF_REG_0));
+    emit(builder, BPF_LDX_MEM(BPF_B, BPF_REG_2, BPF_REG_7, offsetof(struct bpf2socks_udp_peer_value, family)));
+    if (!ipv6) {
+        done_jumps[(*done_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, AF_INET, 0));
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_7, offsetof(struct bpf2socks_udp_peer_value, addr)));
+        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_3, offsetof(struct bpf_sock_addr, user_ip4)));
+    } else {
+        size_t mapped = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, AF_INET, 0));
+        done_jumps[(*done_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, AF_INET6, 0));
+        for (int word = 0; word < 4; ++word) {
+            emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_7, offsetof(struct bpf2socks_udp_peer_value, addr) + word * 4));
+            emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_3, offsetof(struct bpf_sock_addr, user_ip6) + word * 4));
+        }
+        size_t port = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
+        patch_jump(builder, mapped, builder->count);
+        emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6), 0);
+        emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 4, 0);
+        emit_ctx_st32(builder, offsetof(struct bpf_sock_addr, user_ip6) + 8, 0xffff0000U);
+        emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_7, offsetof(struct bpf2socks_udp_peer_value, addr)));
+        emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_3, offsetof(struct bpf_sock_addr, user_ip6) + 12));
+        patch_jump(builder, port, builder->count);
+    }
+    emit(builder, BPF_LDX_MEM(BPF_H, BPF_REG_3, BPF_REG_7, offsetof(struct bpf2socks_udp_peer_value, port)));
+    emit(builder, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_3, offsetof(struct bpf_sock_addr, user_port)));
+    done_jumps[(*done_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
 }
 
 static void emit_ipv4_policy_checks_from_regs(
@@ -1467,6 +1635,8 @@ static int build_ipv4_sock_addr_prog(
     int ignored_route_cidr4_map_fd,
     int token_map_fd,
     int udp_peer_map_fd,
+    int tcp_peer_map_fd,
+    int default_network_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
@@ -1483,6 +1653,7 @@ static int build_ipv4_sock_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
+    emit_socket_shape_bypass(&b, attach_type, default_network_map_fd, bypass_jumps, &bypass_jump_count);
     emit_tcp_dns_forced_bypass(&b, policy, uid_map_fd, protocol, protocol_from_context,
         bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     if (attach_type == BPF_CGROUP_UDP4_SENDMSG) {
@@ -1548,6 +1719,9 @@ static int build_ipv4_sock_addr_prog(
         attach_type == BPF_CGROUP_UDP4_SENDMSG && !protocol_from_context,
         drop_jumps,
         &drop_jump_count);
+    if (attach_type == BPF_CGROUP_INET4_CONNECT && protocol_from_context) {
+        emit_tcp_peer_record(&b, tcp_peer_map_fd);
+    }
     size_t allow_label = emit_exit(&b, 1);
     size_t drop_label = emit_exit(&b, 0);
 
@@ -1588,6 +1762,8 @@ static int build_ipv6_sock_addr_prog(
     int ignored_route_cidr6_map_fd,
     int token_map_fd,
     int udp_peer_map_fd,
+    int tcp_peer_map_fd,
+    int default_network_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
@@ -1606,6 +1782,7 @@ static int build_ipv6_sock_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
+    emit_socket_shape_bypass(&b, attach_type, default_network_map_fd, bypass_jumps, &bypass_jump_count);
     emit_tcp_dns_forced_bypass(&b, policy, uid_map_fd, protocol, protocol_from_context,
         bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     if (attach_type == BPF_CGROUP_UDP6_SENDMSG) {
@@ -1738,6 +1915,11 @@ static int build_ipv6_sock_addr_prog(
         attach_type == BPF_CGROUP_UDP6_SENDMSG && !protocol_from_context,
         drop_jumps,
         &drop_jump_count);
+    /* The v4-mapped branch's rewrite joins here too. */
+    size_t rewritten_label = b.count;
+    if (attach_type == BPF_CGROUP_INET6_CONNECT && protocol_from_context) {
+        emit_tcp_peer_record(&b, tcp_peer_map_fd);
+    }
     size_t allow_label = emit_exit(&b, 1);
     size_t drop_label = emit_exit(&b, 0);
 
@@ -1745,7 +1927,7 @@ static int build_ipv6_sock_addr_prog(
         patch_jump(&b, bypass_jumps[i], allow_label);
     }
     for (size_t i = 0; i < allow_jump_count; ++i) {
-        patch_jump(&b, allow_jumps[i], allow_label);
+        patch_jump(&b, allow_jumps[i], rewritten_label);
     }
     for (size_t i = 0; i < drop_jump_count; ++i) {
         patch_jump(&b, drop_jumps[i], drop_label);
@@ -1776,6 +1958,8 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
     int ignored_route_cidr4_map_fd,
     int token_map_fd,
     int udp_peer_map_fd,
+    int tcp_peer_map_fd,
+    int default_network_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t bridge_port,
@@ -1792,6 +1976,7 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit_self_bypass_policy(&b, policy, bypass_jumps, &bypass_jump_count);
+    emit_socket_shape_bypass(&b, attach_type, default_network_map_fd, bypass_jumps, &bypass_jump_count);
     emit_tcp_dns_forced_bypass(&b, policy, uid_map_fd, protocol, protocol_from_context,
         bypass_jumps, &bypass_jump_count, drop_jumps, &drop_jump_count);
     if (attach_type == BPF_CGROUP_UDP6_SENDMSG) {
@@ -1828,13 +2013,19 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
         allow_jumps,
         &allow_jump_count);
     size_t allow_label = emit_exit(&b, 1);
+    /* Only the v4-mapped rewrite reaches the peer record. */
+    size_t rewritten_label = b.count;
+    if (attach_type == BPF_CGROUP_INET6_CONNECT && protocol_from_context) {
+        emit_tcp_peer_record(&b, tcp_peer_map_fd);
+    }
+    (void)emit_exit(&b, 1);
     size_t drop_label = emit_exit(&b, 0);
 
     for (size_t i = 0; i < bypass_jump_count; ++i) {
         patch_jump(&b, bypass_jumps[i], allow_label);
     }
     for (size_t i = 0; i < allow_jump_count; ++i) {
-        patch_jump(&b, allow_jumps[i], allow_label);
+        patch_jump(&b, allow_jumps[i], rewritten_label);
     }
     for (size_t i = 0; i < drop_jump_count; ++i) {
         patch_jump(&b, drop_jumps[i], drop_label);
@@ -1856,6 +2047,7 @@ static int build_ipv4_mapped_ipv6_sock_addr_prog(
 static int build_udp4_reverse_addr_prog(
     const struct bpf2socks_runtime_config *config,
     int token_map_fd,
+    int tcp_peer_map_fd,
     enum bpf_attach_type attach_type,
     const char *name,
     bool log_error) {
@@ -1865,6 +2057,13 @@ static int build_udp4_reverse_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
+    size_t tcp_done_jumps[8];
+    size_t tcp_done_jump_count = 0;
+    if (tcp_peer_map_fd >= 0) {
+        size_t not_stream = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_STREAM, 0));
+        emit_tcp_peer_restore(&b, tcp_peer_map_fd, false, tcp_done_jumps, &tcp_done_jump_count);
+        patch_jump(&b, not_stream, b.count);
+    }
     size_t non_udp = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip4)));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
@@ -1900,6 +2099,9 @@ static int build_udp4_reverse_addr_prog(
 
     size_t allow_label = emit_exit(&b, 1);
     patch_jump(&b, non_udp, allow_label);
+    for (size_t i = 0; i < tcp_done_jump_count; ++i) {
+        patch_jump(&b, tcp_done_jumps[i], allow_label);
+    }
     for (size_t i = 0; i < bypass_jump_count; ++i) {
         patch_jump(&b, bypass_jumps[i], allow_label);
     }
@@ -1920,6 +2122,7 @@ static int build_udp4_reverse_addr_prog(
 static int build_udp6_reverse_addr_prog(
     const struct bpf2socks_runtime_config *config,
     int token_map_fd,
+    int tcp_peer_map_fd,
     enum bpf_attach_type attach_type,
     const char *name,
     bool log_error) {
@@ -1929,6 +2132,13 @@ static int build_udp6_reverse_addr_prog(
 
     emit(&b, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsetof(struct bpf_sock_addr, type)));
+    size_t tcp_done_jumps[8];
+    size_t tcp_done_jump_count = 0;
+    if (tcp_peer_map_fd >= 0) {
+        size_t not_stream = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_STREAM, 0));
+        emit_tcp_peer_restore(&b, tcp_peer_map_fd, true, tcp_done_jumps, &tcp_done_jump_count);
+        patch_jump(&b, not_stream, b.count);
+    }
     size_t non_udp = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JNE, BPF_REG_2, SOCK_DGRAM, 0));
 
     emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6)));
@@ -2011,6 +2221,9 @@ static int build_udp6_reverse_addr_prog(
 
     size_t allow_label = emit_exit(&b, 1);
     patch_jump(&b, non_udp, allow_label);
+    for (size_t i = 0; i < tcp_done_jump_count; ++i) {
+        patch_jump(&b, tcp_done_jumps[i], allow_label);
+    }
     for (size_t i = 0; i < bypass_jump_count; ++i) {
         patch_jump(&b, bypass_jumps[i], allow_label);
     }
@@ -2046,9 +2259,10 @@ static int load_noop_sock_addr_prog(enum bpf_attach_type attach_type, const char
 /* GETPEERNAME hooks arrived after UDP SENDMSG/RECVMSG. Keep older kernels
  * usable, but only treat an unsupported no-op hook as optional: a failure in
  * our real program on a supported hook must still fail startup/probing. */
-static int attach_udp_getpeername_prog(
+static int attach_getpeername_prog(
     const struct bpf2socks_runtime_config *config,
     int token_map_fd,
+    int tcp_peer_map_fd,
     int cgroup_fd,
     bool ipv6,
     int *prog_fd,
@@ -2077,8 +2291,8 @@ static int attach_udp_getpeername_prog(
         return 0;
     }
     *prog_fd = ipv6
-        ? build_udp6_reverse_addr_prog(config, token_map_fd, type, "b2s_upeer6", log_error)
-        : build_udp4_reverse_addr_prog(config, token_map_fd, type, "b2s_upeer4", log_error);
+        ? build_udp6_reverse_addr_prog(config, token_map_fd, tcp_peer_map_fd, type, "b2s_upeer6", log_error)
+        : build_udp4_reverse_addr_prog(config, token_map_fd, tcp_peer_map_fd, type, "b2s_upeer4", log_error);
     if (*prog_fd < 0) return -1;
     if (log_error && asterisk_cgroup_pin(*prog_fd, config->pinned_object_dir) != 0) return -1;
     return bpf2socks_attach_prog(cgroup_fd, *prog_fd, type);
@@ -2170,6 +2384,8 @@ int bpf2socks_bpf_probe(
         : -1;
     int token_fd = create_token_map(16U);
     int udp_peer_fd = create_udp_peer_map(16U);
+    int tcp_peer_fd = create_udp_peer_map(16U);
+    int default_network_fd = create_default_network_map();
     int proxy_cidr6_fd = need_proxy_cidr6_map
         ? create_lpm6_map(16U)
         : -1;
@@ -2217,6 +2433,8 @@ int bpf2socks_bpf_probe(
         (need_direct_cidr4_map && direct_cidr4_fd < 0) ||
         token_fd < 0 ||
         udp_peer_fd < 0 ||
+        tcp_peer_fd < 0 ||
+        default_network_fd < 0 ||
         (need_proxy_cidr6_map && proxy_cidr6_fd < 0) ||
         (need_bypass_private_cidr6_map && bypass_private_cidr6_fd < 0) ||
         (need_local_interface_cidr6_map && local_interface_cidr6_fd < 0) ||
@@ -2240,6 +2458,8 @@ int bpf2socks_bpf_probe(
         ignored_route_cidr4_fd,
         token_fd,
         udp_peer_fd,
+        tcp_peer_fd,
+        default_network_fd,
         BPF2SOCKS_PROTO_TCP,
         true,
         bridge_port,
@@ -2262,6 +2482,8 @@ int bpf2socks_bpf_probe(
         ignored_route_cidr4_fd,
         token_fd,
         udp_peer_fd,
+        tcp_peer_fd,
+        default_network_fd,
         BPF2SOCKS_PROTO_UDP,
         false,
         bridge_port,
@@ -2272,7 +2494,7 @@ int bpf2socks_bpf_probe(
         snprintf(message, message_size, "cgroup udp4 sendmsg program cannot be loaded: errno=%d", errno);
         goto done;
     }
-    udp4_recv_fd = build_udp4_reverse_addr_prog(config, token_fd, BPF_CGROUP_UDP4_RECVMSG, "b2s_urcv4", false);
+    udp4_recv_fd = build_udp4_reverse_addr_prog(config, token_fd, -1, BPF_CGROUP_UDP4_RECVMSG, "b2s_urcv4", false);
     if (udp4_recv_fd < 0) {
         snprintf(message, message_size, "cgroup udp4 recvmsg program cannot be loaded: errno=%d", errno);
         goto done;
@@ -2295,6 +2517,8 @@ int bpf2socks_bpf_probe(
             ignored_route_cidr6_fd,
             token_fd,
             udp_peer_fd,
+        tcp_peer_fd,
+        default_network_fd,
             BPF2SOCKS_PROTO_TCP,
             true,
             bridge_port,
@@ -2318,13 +2542,15 @@ int bpf2socks_bpf_probe(
             ignored_route_cidr6_fd,
             token_fd,
             udp_peer_fd,
+        tcp_peer_fd,
+        default_network_fd,
             BPF2SOCKS_PROTO_UDP,
             false,
             bridge_port,
             BPF_CGROUP_UDP6_SENDMSG,
             "b2s_udp6",
             false);
-        udp6_recv_fd = build_udp6_reverse_addr_prog(config, token_fd, BPF_CGROUP_UDP6_RECVMSG, "b2s_urcv6", false);
+        udp6_recv_fd = build_udp6_reverse_addr_prog(config, token_fd, -1, BPF_CGROUP_UDP6_RECVMSG, "b2s_urcv6", false);
         if (connect6_fd < 0 || udp6_fd < 0 || udp6_recv_fd < 0) {
             snprintf(message, message_size, "cgroup IPv6 programs cannot be loaded: errno=%d", errno);
             goto done;
@@ -2342,6 +2568,8 @@ int bpf2socks_bpf_probe(
             ignored_route_cidr4_fd,
             token_fd,
             udp_peer_fd,
+        tcp_peer_fd,
+        default_network_fd,
             BPF2SOCKS_PROTO_TCP,
             true,
             bridge_port,
@@ -2364,13 +2592,15 @@ int bpf2socks_bpf_probe(
             ignored_route_cidr4_fd,
             token_fd,
             udp_peer_fd,
+        tcp_peer_fd,
+        default_network_fd,
             BPF2SOCKS_PROTO_UDP,
             false,
             bridge_port,
             BPF_CGROUP_UDP6_SENDMSG,
             "b2s_u6v4m",
             false);
-        udp6_recv_fd = build_udp6_reverse_addr_prog(config, token_fd, BPF_CGROUP_UDP6_RECVMSG, "b2s_ur6v4m", false);
+        udp6_recv_fd = build_udp6_reverse_addr_prog(config, token_fd, -1, BPF_CGROUP_UDP6_RECVMSG, "b2s_ur6v4m", false);
         if (udp6_fd < 0 || udp6_recv_fd < 0) {
             snprintf(message, message_size, "cgroup IPv4-mapped udp6 programs cannot be loaded: errno=%d", errno);
             goto done;
@@ -2433,8 +2663,9 @@ int bpf2socks_bpf_probe(
         }
         cleanup_probe_attachment(cgroup_fd, udp6_recv_fd, BPF_CGROUP_UDP6_RECVMSG);
     }
-    if (attach_udp_getpeername_prog(config, token_fd, cgroup_fd, false, &udp4_peer_fd, false) < 0 ||
-        (need_udp6_attach && attach_udp_getpeername_prog(config, token_fd, cgroup_fd, true, &udp6_peer_fd, false) < 0)) {
+    if (attach_getpeername_prog(config, token_fd, tcp_peer_fd, cgroup_fd, false, &udp4_peer_fd, false) < 0 ||
+        (need_udp6_attach &&
+            attach_getpeername_prog(config, token_fd, tcp_peer_fd, cgroup_fd, true, &udp6_peer_fd, false) < 0)) {
         snprintf(message, message_size, "cgroup udp getpeername program unavailable: errno=%d", errno);
         goto done;
     }
@@ -2486,6 +2717,8 @@ done:
     close_fd(&bypass_private_cidr6_fd);
     close_fd(&proxy_cidr6_fd);
     close_fd(&udp_peer_fd);
+    close_fd(&tcp_peer_fd);
+    close_fd(&default_network_fd);
     close_fd(&token_fd);
     close_fd(&direct_cidr4_fd);
     close_fd(&local_interface_cidr4_fd);
@@ -2561,6 +2794,12 @@ int bpf2socks_bpf_start(
     stage = "create udp peer map";
     runtime->udp_peer_map_fd = create_udp_peer_map(BPF2SOCKS_MAX_UDP_PEER_MAP_ENTRIES);
     if (runtime->udp_peer_map_fd < 0) goto fail;
+    stage = "create tcp peer map";
+    runtime->tcp_peer_map_fd = create_udp_peer_map(BPF2SOCKS_MAX_TCP_PEER_MAP_ENTRIES);
+    if (runtime->tcp_peer_map_fd < 0) goto fail;
+    stage = "create default network map";
+    runtime->default_network_map_fd = create_default_network_map();
+    if (runtime->default_network_map_fd < 0) goto fail;
     stage = "create TC runtime control map";
     runtime->tc_runtime_control_map_fd = bpf2socks_create_map(
         BPF_MAP_TYPE_ARRAY,
@@ -2593,6 +2832,14 @@ int bpf2socks_bpf_start(
         1U,
         0U);
     if (runtime->tc_scratch_map_fd < 0) goto fail;
+    stage = "create TC fragment map";
+    runtime->tc_fragment_map_fd = bpf2socks_create_map(
+        BPF_MAP_TYPE_LRU_HASH,
+        sizeof(struct bpf2socks_tc_fragment_key),
+        sizeof(struct bpf2socks_tc_fragment_value),
+        BPF2SOCKS_TC_FRAGMENT_MAP_ENTRIES,
+        0U);
+    if (runtime->tc_fragment_map_fd < 0) goto fail;
     stage = "create reuseport maps";
     runtime->reuseport_tcp4_map_fd = bpf2socks_create_map(
         BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
@@ -2745,6 +2992,8 @@ int bpf2socks_bpf_start(
         runtime->ignored_route_cidr4_map_fd,
         runtime->token_map_fd,
         runtime->udp_peer_map_fd,
+        runtime->tcp_peer_map_fd,
+        runtime->default_network_map_fd,
         BPF2SOCKS_PROTO_TCP,
         true,
         config->listen_port,
@@ -2763,6 +3012,8 @@ int bpf2socks_bpf_start(
         runtime->ignored_route_cidr4_map_fd,
         runtime->token_map_fd,
         runtime->udp_peer_map_fd,
+        runtime->tcp_peer_map_fd,
+        runtime->default_network_map_fd,
         BPF2SOCKS_PROTO_UDP,
         false,
         config->listen_port,
@@ -2772,6 +3023,7 @@ int bpf2socks_bpf_start(
     runtime->udp4_recvmsg_prog_fd = build_udp4_reverse_addr_prog(
         config,
         runtime->token_map_fd,
+        -1,
         BPF_CGROUP_UDP4_RECVMSG,
         "b2s_urcv4",
         true);
@@ -2797,6 +3049,8 @@ int bpf2socks_bpf_start(
             runtime->ignored_route_cidr6_map_fd,
             runtime->token_map_fd,
             runtime->udp_peer_map_fd,
+            runtime->tcp_peer_map_fd,
+            runtime->default_network_map_fd,
             BPF2SOCKS_PROTO_TCP,
             true,
             config->listen_port,
@@ -2820,6 +3074,8 @@ int bpf2socks_bpf_start(
             runtime->ignored_route_cidr6_map_fd,
             runtime->token_map_fd,
             runtime->udp_peer_map_fd,
+            runtime->tcp_peer_map_fd,
+            runtime->default_network_map_fd,
             BPF2SOCKS_PROTO_UDP,
             false,
             config->listen_port,
@@ -2829,6 +3085,7 @@ int bpf2socks_bpf_start(
         runtime->udp6_recvmsg_prog_fd = build_udp6_reverse_addr_prog(
             config,
             runtime->token_map_fd,
+            -1,
             BPF_CGROUP_UDP6_RECVMSG,
             "b2s_urcv6",
             true);
@@ -2851,6 +3108,8 @@ int bpf2socks_bpf_start(
             runtime->ignored_route_cidr4_map_fd,
             runtime->token_map_fd,
             runtime->udp_peer_map_fd,
+            runtime->tcp_peer_map_fd,
+            runtime->default_network_map_fd,
             BPF2SOCKS_PROTO_TCP,
             true,
             config->listen_port,
@@ -2873,6 +3132,8 @@ int bpf2socks_bpf_start(
             runtime->ignored_route_cidr4_map_fd,
             runtime->token_map_fd,
             runtime->udp_peer_map_fd,
+            runtime->tcp_peer_map_fd,
+            runtime->default_network_map_fd,
             BPF2SOCKS_PROTO_UDP,
             false,
             config->listen_port,
@@ -2882,6 +3143,7 @@ int bpf2socks_bpf_start(
         runtime->udp6_v4mapped_recvmsg_prog_fd = build_udp6_reverse_addr_prog(
             config,
             runtime->token_map_fd,
+            -1,
             BPF_CGROUP_UDP6_RECVMSG,
             "b2s_ur6v4m",
             true);
@@ -2898,6 +3160,10 @@ int bpf2socks_bpf_start(
     if (bpf2socks_interface_policy_start(policy, runtime) < 0) {
         stage = "start interface policy";
         goto fail;
+    }
+    /* Without the watcher the default network set stays unknown and nothing extra is bypassed. */
+    if (bpf2socks_network_selection_start(runtime) < 0) {
+        fprintf(stderr, "default network watcher unavailable; explicitly bound sockets stay proxied: errno=%d\n", errno);
     }
     stage = "pin cgroup program identity";
     if (runtime->connect4_prog_fd >= 0 && asterisk_cgroup_pin(runtime->connect4_prog_fd, config->pinned_object_dir) != 0) goto fail;
@@ -2958,10 +3224,10 @@ int bpf2socks_bpf_start(
         }
     }
     stage = "attach udp getpeername";
-    if (attach_udp_getpeername_prog(config, runtime->token_map_fd, runtime->cgroup_fd,
-            false, &runtime->udp4_getpeername_prog_fd, true) < 0 ||
-        attach_udp_getpeername_prog(config, runtime->token_map_fd, runtime->cgroup_fd,
-            true, &runtime->udp6_getpeername_prog_fd, true) < 0) goto fail;
+    if (attach_getpeername_prog(config, runtime->token_map_fd, runtime->tcp_peer_map_fd,
+            runtime->cgroup_fd, false, &runtime->udp4_getpeername_prog_fd, true) < 0 ||
+        attach_getpeername_prog(config, runtime->token_map_fd, runtime->tcp_peer_map_fd,
+            runtime->cgroup_fd, true, &runtime->udp6_getpeername_prog_fd, true) < 0) goto fail;
     return 0;
 
 fail:
@@ -2973,6 +3239,7 @@ fail:
 void bpf2socks_bpf_stop(struct bpf2socks_bpf_runtime *runtime) {
     if (runtime == NULL) return;
     bpf2socks_interface_policy_stop(runtime);
+    bpf2socks_network_selection_stop(runtime);
     bpf2socks_udp6_recovery_stop(runtime);
     close_fd(&runtime->udp6_record_prog_fd);
     close_fd(&runtime->udp6_recover_prog_fd);
@@ -3020,6 +3287,7 @@ void bpf2socks_bpf_stop(struct bpf2socks_bpf_runtime *runtime) {
     close_fd(&runtime->reuseport_tcp6_map_fd);
     close_fd(&runtime->reuseport_udp4_map_fd);
     close_fd(&runtime->reuseport_tcp4_map_fd);
+    close_fd(&runtime->tc_fragment_map_fd);
     close_fd(&runtime->tc_scratch_map_fd);
     close_fd(&runtime->tc_token_to_original_map_fd);
     close_fd(&runtime->tc_original_to_token_map_fd);
@@ -3036,6 +3304,8 @@ void bpf2socks_bpf_stop(struct bpf2socks_bpf_runtime *runtime) {
     close_fd(&runtime->connect6_prog_fd);
     close_fd(&runtime->connect4_prog_fd);
     close_fd(&runtime->udp_peer_map_fd);
+    close_fd(&runtime->tcp_peer_map_fd);
+    close_fd(&runtime->default_network_map_fd);
     close_fd(&runtime->token_map_fd);
     close_fd(&runtime->direct_cidr6_map_fd);
     close_fd(&runtime->local_interface_cidr6_map_fd);

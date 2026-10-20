@@ -93,6 +93,7 @@ static int resolve_map_fd(
         MAP_BINDING(reuseport_tcp6_map_fd, "reuseport_tcp6"),
         MAP_BINDING(reuseport_udp6_map_fd, "reuseport_udp6"),
         MAP_BINDING(tc_scratch_map_fd, "tc_scratch"),
+        MAP_BINDING(tc_fragment_map_fd, "tc_fragment_map"),
         MAP_BINDING(udp6_recovery_map_fd, "udp6_recovery_peers"),
     };
 #undef MAP_BINDING

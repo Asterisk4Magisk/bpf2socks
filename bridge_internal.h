@@ -16,7 +16,6 @@
 #include <sys/socket.h>
 #include <time.h>
 
-#define BPF2SOCKS_RELAY_BUFFER_SIZE 16384U
 #define BPF2SOCKS_UDP_BUFFER_SIZE 65535U
 #define BPF2SOCKS_SESSION_HASH_BUCKETS 4096U
 #define BPF2SOCKS_MAX_SOCKS5_UDP_HEADER 22U
@@ -176,9 +175,6 @@ int bpf2socks_udp_worker_wait_timeout(
     bool debug_stats);
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker);
 void bpf2socks_bridge_publish_udp_stats(struct bpf2socks_bridge_worker *worker);
-void bpf2socks_bridge_copy_stats_snapshot(
-    struct bpf2socks_bridge_worker *worker,
-    struct bpf2socks_bridge_stats *out);
 uint32_t bpf2socks_udp_effective_idle_timeout(
     uint32_t configured_timeout,
     uint32_t default_timeout);
@@ -192,7 +188,6 @@ void bpf2socks_pending_budget_set_wake_fd(
     uint32_t worker_id,
     int fd);
 void bpf2socks_pending_budget_wait(struct bpf2socks_udp_pending_budget *budget, uint32_t worker_id);
-uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback);
 void bpf2socks_bridge_tune_socket_buffers(int fd, uint32_t recv_size, uint32_t send_size);
 void bpf2socks_bridge_tune_tcp_buffers(int fd, const struct bpf2socks_runtime_config *config);
 void bpf2socks_bridge_tune_tcp_advanced(int fd, bool upstream);
@@ -201,5 +196,7 @@ int bpf2socks_bridge_connect(int fd, const struct sockaddr *addr, socklen_t addr
 int bpf2socks_bridge_accept4(int fd, struct sockaddr *peer, socklen_t *peer_len, int flags);
 int bpf2socks_bridge_udp_worker_run(struct bpf2socks_bridge_worker *worker);
 int bpf2socks_bridge_tcp_worker_run(struct bpf2socks_bridge_worker *worker);
+
+bool bpf2socks_sockaddr_storage_is_loopback(const struct sockaddr_storage *addr);
 
 #endif

@@ -31,6 +31,12 @@
 #define BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP 1U
 #define BPF2SOCKS_MAX_TOKEN_MAP_ENTRIES 65536U
 #define BPF2SOCKS_MAX_UDP_PEER_MAP_ENTRIES 65536U
+#define BPF2SOCKS_MAX_TCP_PEER_MAP_ENTRIES 65536U
+#define BPF2SOCKS_MAX_DEFAULT_NETWORK_MAP_ENTRIES 64U
+/* Android fwmark bit set on sockets an app bound to a network explicitly. */
+#define BPF2SOCKS_FWMARK_EXPLICIT 0x10000U
+/* netId 0 is never a network: its key marks the default network set as known. */
+#define BPF2SOCKS_DEFAULT_NETWORK_READY_KEY 0U
 #define BPF2SOCKS_DEFAULT_CGROUP_PATH "/sys/fs/cgroup"
 #define BPF2SOCKS_DEFAULT_WORKER_COUNT 2U
 /* Idle relay pipe pairs each TCP worker may keep open (4 fds per pair). */
@@ -43,7 +49,8 @@
 #define BPF2SOCKS_DEFAULT_CONNECT_TIMEOUT_MILLISECONDS 10000U
 #define BPF2SOCKS_MIN_CONNECT_TIMEOUT_MILLISECONDS 1000U
 #define BPF2SOCKS_MAX_CONNECT_TIMEOUT_MILLISECONDS 60000U
-#define BPF2SOCKS_DEFAULT_TCP_IDLE_TIMEOUT_MILLISECONDS 300000U
+/* Zero leaves idle relayed TCP open, as the proxy cores do; dead hotspot peers are found by keepalive. */
+#define BPF2SOCKS_DEFAULT_TCP_IDLE_TIMEOUT_MILLISECONDS 0U
 #define BPF2SOCKS_MIN_TCP_IDLE_TIMEOUT_MILLISECONDS 1000U
 #define BPF2SOCKS_MAX_TCP_IDLE_TIMEOUT_MILLISECONDS 3600000U
 #define BPF2SOCKS_DEFAULT_UDP_SOCKET_BUFFER_SIZE 524288U
@@ -67,7 +74,6 @@
 #define BPF2SOCKS_TOKEN_IPV4_PREFIX_BITS 9U
 #define BPF2SOCKS_DEFAULT_TOKEN_IPV6_PREFIX "fd7a:7374:6572:6973::/64"
 #define BPF2SOCKS_TOKEN_IPV6_PREFIX_BITS 64U
-#define BPF2SOCKS_TC_SCRATCH_SIZE 224U
 
 #define BPF2SOCKS_MODE_BLACKLIST 0U
 #define BPF2SOCKS_MODE_WHITELIST 1U
@@ -251,6 +257,7 @@ struct bpf2socks_bridge_stats {
 int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_stats *out);
 
 struct bpf2socks_interface_runtime;
+struct bpf2socks_network_runtime;
 
 struct bpf2socks_bpf_runtime {
     int cgroup_fd;
@@ -268,10 +275,13 @@ struct bpf2socks_bpf_runtime {
     int ignored_route_cidr6_map_fd;
     int token_map_fd;
     int udp_peer_map_fd;
+    int tcp_peer_map_fd;
+    int default_network_map_fd;
     int tc_runtime_control_map_fd;
     int tc_original_to_token_map_fd;
     int tc_token_to_original_map_fd;
     int tc_scratch_map_fd;
+    int tc_fragment_map_fd;
     int udp6_recovery_map_fd;
     int udp6_record_prog_fd;
     int udp6_recover_prog_fd;
@@ -296,6 +306,7 @@ struct bpf2socks_bpf_runtime {
     int udp6_recvmsg_prog_fd;
     int udp6_v4mapped_recvmsg_prog_fd;
     struct bpf2socks_interface_runtime *interfaces;
+    struct bpf2socks_network_runtime *networks;
 };
 
 int bpf2socks_udp6_recovery_start(struct bpf2socks_bpf_runtime *runtime);
@@ -316,7 +327,6 @@ int bpf2socks_original_from_cmsg(
     uint8_t protocol,
     struct bpf2socks_original_dst *original);
 
-long bpf2socks_bpf_sys(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size);
 int bpf2socks_create_map(enum bpf_map_type type, uint32_t key_size, uint32_t value_size, uint32_t max_entries, uint32_t flags);
 int bpf2socks_update_map(int map_fd, const void *key, const void *value);
 int bpf2socks_lookup_map(int map_fd, const void *key, void *value);
@@ -361,21 +371,6 @@ bool bpf2socks_ipv6_matches_token_prefix(
     uint32_t prefix_bits);
 uint32_t bpf2socks_ipv6_token_word(const uint8_t prefix[16], size_t offset);
 int bpf2socks_resolve_tcp_addr(const char *host, uint16_t port, struct sockaddr_storage *addr, socklen_t *addr_len);
-int bpf2socks_socks5_connect(const char *host, uint16_t port, const struct bpf2socks_sockaddr *dst);
-int bpf2socks_socks5_udp_associate(
-    const char *host,
-    uint16_t port,
-    int *tcp_fd,
-    int *udp_fd,
-    struct sockaddr_storage *relay_addr,
-    socklen_t *relay_addr_len);
-int bpf2socks_socks5_udp_associate_addr(
-    const struct sockaddr *socks_addr,
-    socklen_t socks_addr_len,
-    int *tcp_fd,
-    int *udp_fd,
-    struct sockaddr_storage *relay_addr,
-    socklen_t *relay_addr_len);
 
 // Non-blocking SOCKS5 helpers for DNS channel state machine.
 // Returns fd with non-blocking connect; errno=EINPROGRESS means pending.
@@ -396,18 +391,6 @@ int bpf2socks_socks5_parse_bound_addr(
 int bpf2socks_socks5_replace_unspecified_relay(
     const struct sockaddr *socks_addr, socklen_t socks_addr_len,
     struct sockaddr_storage *relay_addr, socklen_t *relay_addr_len);
-int bpf2socks_socks5_udp_send(
-    int udp_fd,
-    const struct sockaddr *relay_addr,
-    socklen_t relay_addr_len,
-    const struct bpf2socks_sockaddr *dst,
-    const uint8_t *payload,
-    size_t payload_len);
-ssize_t bpf2socks_socks5_udp_recv(
-    int udp_fd,
-    struct bpf2socks_sockaddr *src,
-    uint8_t *payload,
-    size_t payload_cap);
 int bpf2socks_socks5_udp_sendmmsg(
     int udp_fd,
     const struct sockaddr *relay_addr,
@@ -463,6 +446,8 @@ int bpf2socks_interface_policy_start(
     const struct bpf2socks_policy_config *policy,
     struct bpf2socks_bpf_runtime *runtime);
 void bpf2socks_interface_policy_stop(struct bpf2socks_bpf_runtime *runtime);
+int bpf2socks_network_selection_start(struct bpf2socks_bpf_runtime *runtime);
+void bpf2socks_network_selection_stop(struct bpf2socks_bpf_runtime *runtime);
 
 int bpf2socks_bpf_probe(
     const struct bpf2socks_runtime_config *config,

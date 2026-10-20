@@ -519,6 +519,17 @@ static int init_connection_splice_pipes(struct tcp_connection *connection) {
     return 0;
 }
 
+/*
+ * Makes the next close() send an RST, so the peer reads a failure
+ * (ECONNRESET) instead of an orderly EOF it could mistake for a complete
+ * stream or a server that simply closed.
+ */
+static void reset_on_close(int fd) {
+    if (fd < 0) return;
+    struct linger linger = {.l_onoff = 1, .l_linger = 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+}
+
 static void free_connection(struct tcp_connection *connection) {
     if (connection == NULL) return;
     close_fd_if_open(&connection->client_fd);
@@ -558,6 +569,16 @@ static void close_connection(struct tcp_worker_state *state, struct tcp_connecti
         connection->upstream_fd = -1;
     }
     closed_add(state, connection);
+}
+
+/* One side failed or was reset: close it and reset the other side's peer. */
+static void reset_connection(
+    struct tcp_worker_state *state,
+    struct tcp_connection *connection,
+    enum tcp_side failed_side) {
+    if (connection == NULL || connection->closing) return;
+    reset_on_close(failed_side == TCP_SIDE_CLIENT ? connection->upstream_fd : connection->client_fd);
+    close_connection(state, connection);
 }
 
 static void close_all_active(struct tcp_worker_state *state) {
@@ -605,10 +626,12 @@ static void expire_tcp_connections(struct tcp_worker_state *state, uint64_t now_
                 config->tcp_idle_timeout_milliseconds)) {
             if (relay_established) {
                 ++state->worker->tcp_stats.tcp_idle_timeouts;
+                close_connection(state, connection);
             } else {
+                /* The upstream never became usable: fail the client's connection. */
                 ++state->worker->tcp_stats.tcp_connect_timeouts;
+                reset_connection(state, connection, TCP_SIDE_UPSTREAM);
             }
-            close_connection(state, connection);
         } else {
             note_connection_deadline(state, connection);
         }
@@ -672,6 +695,24 @@ static void tune_tcp_socket(int fd, const struct bpf2socks_runtime_config *confi
 static void tune_upstream_tcp_socket(int fd, const struct bpf2socks_runtime_config *config) {
     bpf2socks_bridge_tune_tcp_buffers(fd, config);
     bpf2socks_bridge_tune_tcp_advanced(fd, true);
+}
+
+/*
+ * A hotspot client can leave without closing its connections, and idle
+ * connections are not timed out by default. Keepalive probes find such a
+ * peer instead: after 60 s of silence, six unanswered probes 10 s apart reset
+ * the connection. Local clients close with their process and need none.
+ */
+static void enable_remote_client_keepalive(int fd, const struct sockaddr_storage *peer) {
+    if (bpf2socks_sockaddr_storage_is_loopback(peer)) return;
+    int on = 1;
+    int idle_seconds = 60;
+    int interval_seconds = 10;
+    int probes = 6;
+    (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds, sizeof(interval_seconds));
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes));
 }
 
 static int connect_nonblocking_addr(
@@ -1099,6 +1140,7 @@ static struct tcp_connection *create_connection(
         &connection->stage);
     if (connection->upstream_fd < 0) {
         int saved = errno;
+        reset_on_close(connection->client_fd);
         free_connection(connection);
         errno = saved;
         return NULL;
@@ -1108,6 +1150,7 @@ static struct tcp_connection *create_connection(
         /* Connected (or TFO-deferred) already: write the handshake now. */
         if (start_hello_write(connection) < 0 || flush_handshake(connection) < 0) {
             int saved = errno;
+            reset_on_close(connection->client_fd);
             free_connection(connection);
             errno = saved;
             return NULL;
@@ -1158,15 +1201,18 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
         }
         ++state->worker->tcp_stats.tcp_accepts;
         tune_tcp_socket(client, state->worker->config);
+        enable_remote_client_keepalive(client, &peer);
 
         struct bpf2socks_sockaddr dst;
         if (client_original_dst(client, &peer, state->worker, &dst) < 0) {
             BPF2SOCKS_LOG_THROTTLED("missing TCP original destination: errno=%d", errno);
+            reset_on_close(client);
             close(client);
             continue;
         }
         if (!reserve_tcp_session(state->worker)) {
             ++state->worker->tcp_stats.tcp_drops_capacity;
+            reset_on_close(client);
             close(client);
             continue;
         }
@@ -1300,12 +1346,14 @@ static bool relay_complete(const struct tcp_connection *connection) {
         splice_pipe_complete(&connection->upstream_to_client);
 }
 
-static int flush_relay_pipes(struct tcp_connection *connection) {
+/* On failure, *failed_side names the socket that could not be written. */
+static int flush_relay_pipes(struct tcp_connection *connection, enum tcp_side *failed_side) {
     if (splice_pipe_to_socket(
             connection,
             connection->upstream_fd,
             &connection->client_to_upstream,
             &connection->worker->tcp_stats.tcp_bytes_client_to_upstream) < 0) {
+        *failed_side = TCP_SIDE_UPSTREAM;
         return -1;
     }
     if (splice_pipe_to_socket(
@@ -1313,13 +1361,16 @@ static int flush_relay_pipes(struct tcp_connection *connection) {
             connection->client_fd,
             &connection->upstream_to_client,
             &connection->worker->tcp_stats.tcp_bytes_upstream_to_client) < 0) {
+        *failed_side = TCP_SIDE_CLIENT;
         return -1;
     }
     return 0;
 }
 
 static void handle_client_event(struct tcp_worker_state *state, struct tcp_connection *connection, uint32_t events) {
-    if ((events & BPF2SOCKS_TCP_HANDSHAKE_CLIENT_EVENTS) != 0) {
+    if ((events & EPOLLERR) != 0) {
+        reset_connection(state, connection, TCP_SIDE_CLIENT);
+    } else if ((events & BPF2SOCKS_TCP_HANDSHAKE_CLIENT_EVENTS) != 0) {
         close_connection(state, connection);
     }
 }
@@ -1329,7 +1380,7 @@ static void handle_upstream_handshake(
     struct tcp_connection *connection,
     uint32_t events) {
     if ((events & EPOLLERR) != 0) {
-        close_connection(state, connection);
+        reset_connection(state, connection, TCP_SIDE_UPSTREAM);
         return;
     }
     /*
@@ -1364,8 +1415,9 @@ static void handle_upstream_handshake(
         result = -1;
     }
     if (result < 0) {
+        /* The SOCKS5 server refused or dropped the connection before relaying. */
         ++state->worker->tcp_stats.tcp_connect_failures;
-        close_connection(state, connection);
+        reset_connection(state, connection, TCP_SIDE_UPSTREAM);
     }
 }
 
@@ -1374,27 +1426,29 @@ static void handle_splice_relay(
     struct tcp_connection *connection,
     enum tcp_side side,
     uint32_t events) {
+    /* A reset or error on one side resets the other instead of ending it with a FIN. */
     if ((events & EPOLLERR) != 0) {
-        close_connection(state, connection);
+        reset_connection(state, connection, side);
         return;
     }
 
     if (side == TCP_SIDE_CLIENT) {
         if ((events & EPOLLIN) != 0 &&
             splice_socket_to_pipe(connection, connection->client_fd, &connection->client_to_upstream) < 0) {
-            close_connection(state, connection);
+            reset_connection(state, connection, TCP_SIDE_CLIENT);
             return;
         }
     } else if (side == TCP_SIDE_UPSTREAM) {
         if ((events & EPOLLIN) != 0 &&
             splice_socket_to_pipe(connection, connection->upstream_fd, &connection->upstream_to_client) < 0) {
-            close_connection(state, connection);
+            reset_connection(state, connection, TCP_SIDE_UPSTREAM);
             return;
         }
     }
 
-    if (flush_relay_pipes(connection) < 0) {
-        close_connection(state, connection);
+    enum tcp_side failed_side = TCP_SIDE_CLIENT;
+    if (flush_relay_pipes(connection, &failed_side) < 0) {
+        reset_connection(state, connection, failed_side);
         return;
     }
     if (relay_complete(connection)) {

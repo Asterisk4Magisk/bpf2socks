@@ -80,7 +80,7 @@ Per-packet and per-connection failures are logged on the 1st, 2nd, 4th, 8th... o
   "tcpBufferSize": 0,
   "maxTcpSessions": 4096,
   "connectTimeoutMilliseconds": 10000,
-  "tcpIdleTimeoutMilliseconds": 300000,
+  "tcpIdleTimeoutMilliseconds": 0,
   "udpSocketBufferSize": 524288,
   "udpBatchSize": 32,
   "maxUdpSessions": 4096,
@@ -133,7 +133,7 @@ A present field must be well formed: numbers are unsigned decimals within their 
 | `tcpBufferSize` | `0`, which leaves TCP socket buffers to kernel autotuning. A non-zero value fixes both buffers of every bridge TCP socket, clamped to 4096–4194304 bytes; fixed buffers disable autotuning and cap throughput on high-latency hotspot links. |
 | `maxTcpSessions` | 4096; zero resets to the default, maximum 8192. |
 | `connectTimeoutMilliseconds` | 10000; normalized to 1000–60000. Bounds connecting to the SOCKS5 server and completing its handshake, for TCP relays and for the UDP ASSOCIATE of a new UDP session. |
-| `tcpIdleTimeoutMilliseconds` | 300000; non-zero values normalized to 1000–3600000. Zero disables the idle timeout. |
+| `tcpIdleTimeoutMilliseconds` | 0, which keeps idle relayed connections open as the proxy cores do; non-zero values are normalized to 1000–3600000. Hotspot client connections use TCP keepalive (60 s idle, six probes 10 s apart) to drop clients that left. |
 | `udpSocketBufferSize` | 524288 bytes; zero resets to the default. |
 | `udpBatchSize` | 32; zero resets to the default; capped at 64 datagrams per system call. |
 | `maxUdpSessions` | 4096; zero resets to the default. |
@@ -168,6 +168,27 @@ Cgroup hooks prefer multi-program attachment. If an exclusive attachment blocks 
 Original program file descriptors remain open for restoration during probe cleanup, failed startup, and graceful shutdown. Restoration attempts to reinstate the original program ID and exclusive flags, and refuses to overwrite an observed external change. Exclusive attachment has no atomic compare-and-replace operation on the supported older kernels, so concurrent external attachment changes cannot be fully excluded. Restoration is best-effort: failures produce warnings and cleanup continues. They do not invalidate a successful capability probe or replace an earlier startup failure. Final cleanup retries pending restoration once and releases saved references even if it fails. Process termination without cleanup cannot restore the original attachment.
 
 Each UDP session or DNS channel owns its UDP ASSOCIATE relay port among all workers. Some servers (Xray) bind every association's relay socket to port 0 with `SO_REUSEPORT`, which can return a port another live association still holds; datagrams then reach the wrong association. An association answered with a port that is in use is replaced (up to three retries for a session; a DNS channel is rebuilt). A relay port equal to the SOCKS5 server port is a shared relay and is not checked.
+
+Hotspot datagrams that the IP layer fragmented follow the verdict of their first fragment, which carries the ports. A later fragment that arrives without its first fragment's verdict is dropped rather than forwarded past the proxy. Fragments of other protocols pass unchanged. DNS responses larger than a hotspot client's route MTU fall back from the raw reply socket to a UDP socket so that the kernel can fragment them.
+
+A local datagram whose token the bridge no longer knows is answered with an ICMP port unreachable. This happens when the token was evicted from the shared LRU token map, or when the datagram was sent to an instance that has since restarted. A connected socket then fails with `ECONNREFUSED`, and its application can reconnect instead of waiting on a silent drop. While the client's session still holds the connected binding, the bridge restores and republishes the token instead. Tokens of local sessions whose socket is found closed are deleted. A SOCKS5 UDP reply addressed by domain (ATYP 3) is matched to the session's most recently used binding with the same port.
+
+For TCP, `getpeername()` on a proxied socket returns the original destination: the CONNECT hook records it by socket cookie, since the bridge consumes the TCP token on accept. A reset or error on either side of a relayed connection resets the other side, and a connection whose SOCKS5 handshake fails or times out is reset, so applications read `ECONNRESET` rather than an orderly EOF. Proxy cores answer CONNECT before dialing, so a refused destination still appears as a connection that the core then closes.
+
+Sockets that an Android app explicitly bound to a network (`Network.bindSocket`, `bindProcessToNetwork`) are bypassed when that network is not a default network, so captive portal logins and cellular-only services use the network they chose. The bridge derives the default networks from the policy routing rules and refreshes them when the rules change. Sockets bound to a default network, as QUIC connection migration binds them, stay proxied, and so does every socket while the default networks are unknown.
+
+Known UDP limitations:
+
+- Sockets bound to a non-loopback device (`SO_BINDTODEVICE`, TCP included) and UDP-Lite datagrams are bypassed.
+- A per-datagram `IP_PKTINFO` interface cannot be honored, and such datagrams are not delivered.
+- Replies to peers that contacted a local socket directly are proxied like any other datagram, so server-role UDP (inbound P2P, a listening WireGuard port) does not work.
+- With DNS hijacking enabled, port-53 traffic to private and LAN resolvers is proxied too.
+
+Known TCP limitations:
+
+- `getsockname()` on a proxied socket returns a loopback address, so protocols that announce the local address (FTP active mode, SIP) carry the wrong one.
+- Application TCP keepalive and `TCP_USER_TIMEOUT` only probe the local bridge, not the remote path.
+- Urgent data (`MSG_OOB`) is not relayed. MPTCP and SCTP sockets are bypassed.
 
 The configuration controls pinned objects, cgroup attachment, PID signaling, and traffic interception. Generate it from trusted application state and use an application-specific `pinnedObjectDir`.
 

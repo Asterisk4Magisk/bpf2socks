@@ -62,7 +62,7 @@ struct bridge_stats_thread_args {
     char stats_path[BPF2SOCKS_MAX_PATH_LEN];
 };
 
-uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback) {
+static uint32_t bpf2socks_bridge_clamp_socket_buffer(uint32_t requested, uint32_t fallback) {
     uint32_t value = requested == 0U ? fallback : requested;
     if (value < 4096U) value = 4096U;
     if (value > 4194304U) value = 4194304U;
@@ -370,7 +370,7 @@ void bpf2socks_bridge_publish_udp_stats(struct bpf2socks_bridge_worker *worker) 
     (void)pthread_mutex_unlock(&worker->stats_snapshot_mutex);
 }
 
-void bpf2socks_bridge_copy_stats_snapshot(
+static void bpf2socks_bridge_copy_stats_snapshot(
     struct bpf2socks_bridge_worker *worker,
     struct bpf2socks_bridge_stats *out) {
     if (out == NULL) return;

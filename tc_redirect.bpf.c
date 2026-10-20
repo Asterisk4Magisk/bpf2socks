@@ -11,7 +11,6 @@
 
 #define SEC(name) __attribute__((section(name), used))
 #define INLINE static __attribute__((always_inline))
-#define ARRAY_SIZE(value) (sizeof(value) / sizeof((value)[0]))
 
 #define ETH_P_IP 0x0800U
 #define ETH_P_IPV6 0x86ddU
@@ -22,6 +21,9 @@
 #define AF_INET_VALUE 2U
 #define AF_INET6_VALUE 10U
 #define IP_FRAGMENT_MASK 0x3fffU
+#define IP_OFFSET_MASK 0x1fffU
+#define IPV6_FRAGMENT_HEADER 44U
+#define IPV6_FRAGMENT_OFFSET_MASK 0xfff8U
 #define SK_PASS_VALUE 1
 
 struct bpf_map_def {
@@ -95,6 +97,13 @@ struct ipv6_header {
     __u8 destination[16];
 };
 
+struct ipv6_fragment_header {
+    __u8 next_header;
+    __u8 reserved;
+    __be16 offset_flags;
+    __be32 id;
+};
+
 struct transport_ports {
     __be16 source;
     __be16 destination;
@@ -135,6 +144,8 @@ EXTERNAL_MAP(reuseport_tcp4, __u32, __u64, 8U);
 EXTERNAL_MAP(reuseport_udp4, __u32, __u64, 8U);
 EXTERNAL_MAP(reuseport_tcp6, __u32, __u64, 8U);
 EXTERNAL_MAP(reuseport_udp6, __u32, __u64, 8U);
+EXTERNAL_MAP(tc_fragment_map, struct bpf2socks_tc_fragment_key, struct bpf2socks_tc_fragment_value,
+    BPF2SOCKS_TC_FRAGMENT_MAP_ENTRIES);
 struct bpf_map_def SEC("maps") tc_scratch = {
     .type = BPF_MAP_TYPE_PERCPU_ARRAY,
     .key_size = sizeof(__u32),
@@ -429,6 +440,88 @@ INLINE int rewrite_ipv4(
     return TC_ACT_OK;
 }
 
+INLINE void fill_fragment_key(
+    struct bpf2socks_tc_fragment_key *key,
+    __u32 ifindex,
+    __u8 family,
+    __u8 protocol,
+    __u32 id,
+    const __u8 *source,
+    const __u8 *destination,
+    __u32 address_size) {
+    __builtin_memset(key, 0, sizeof(*key));
+    key->ifindex = ifindex;
+    key->family = family;
+    key->protocol = protocol;
+    key->id = id;
+    copy_bytes(key->source, source, address_size);
+    copy_bytes(key->destination, destination, address_size);
+}
+
+/*
+ * Records a first fragment's verdict for the later fragments of its datagram.
+ * The key is built here from the header fields rather than carried on the
+ * stack from an earlier branch: older verifiers (GKI 5.10) cannot tie the two
+ * "is a first fragment" branches together and reject the possibly
+ * uninitialized key.
+ */
+INLINE void remember_fragment(
+    __u32 ifindex,
+    __u8 family,
+    __u8 protocol,
+    __u32 id,
+    const __u8 *source,
+    const __u8 *destination,
+    __u32 address_size,
+    const __u8 *token_addr,
+    __u32 verdict,
+    __u32 generation) {
+    struct bpf2socks_tc_fragment_key key;
+    fill_fragment_key(&key, ifindex, family, protocol, id, source, destination, address_size);
+    struct bpf2socks_tc_fragment_value value;
+    __builtin_memset(&value, 0, sizeof(value));
+    if (token_addr != 0) copy_bytes(value.token_addr, token_addr, 16U);
+    value.generation = generation;
+    value.verdict = verdict;
+    (void)map_update(&tc_fragment_map, &key, &value, BPF_ANY);
+}
+
+/*
+ * Later fragments carry no ports. They follow the verdict of their first
+ * fragment; without one the datagram is dropped rather than forwarded past
+ * the proxy. Only the destination address changes, and the transport
+ * checksum lives in the first fragment.
+ */
+INLINE int ingress4_later_fragment(
+    struct __sk_buff *skb,
+    struct ipv4_header *ip,
+    const struct bpf2socks_tc_runtime_control *control) {
+    if (ip->protocol != IPPROTO_TCP_VALUE && ip->protocol != IPPROTO_UDP_VALUE) return TC_ACT_PIPE;
+    struct bpf2socks_tc_fragment_key key;
+    fill_fragment_key(&key, skb->ifindex, AF_INET_VALUE, ip->protocol, ip->id,
+        (const __u8 *)&ip->source, (const __u8 *)&ip->destination, 4U);
+    struct bpf2socks_tc_fragment_value *fragment = map_lookup(&tc_fragment_map, &key);
+    if (fragment == 0 || fragment->generation != control->generation) return TC_ACT_SHOT;
+    if (fragment->verdict != BPF2SOCKS_TC_FRAGMENT_REWRITE) return TC_ACT_PIPE;
+    __be32 token_address;
+    __builtin_memcpy(&token_address, fragment->token_addr, 4U);
+    if (l3_csum_replace(
+            skb,
+            sizeof(struct ethernet_header) + __builtin_offsetof(struct ipv4_header, checksum),
+            ip->destination,
+            token_address,
+            4U) != 0 ||
+        skb_store_bytes(
+            skb,
+            sizeof(struct ethernet_header) + __builtin_offsetof(struct ipv4_header, destination),
+            &token_address,
+            sizeof(token_address),
+            0U) != 0) {
+        return TC_ACT_SHOT;
+    }
+    return TC_ACT_OK;
+}
+
 INLINE int ingress4(
     struct __sk_buff *skb,
     struct ipv4_header *ip,
@@ -436,10 +529,13 @@ INLINE int ingress4(
     const struct bpf2socks_tc_runtime_control *control) {
     if (ip->version != 4U || ip->ihl < 5U) return TC_ACT_SHOT;
     __u32 header_length = (__u32)ip->ihl * 4U;
+    __u16 fragment_bits = swap16(ip->fragment_offset) & IP_FRAGMENT_MASK;
+    if ((fragment_bits & IP_OFFSET_MASK) != 0U) return ingress4_later_fragment(skb, ip, control);
     if ((void *)ip + header_length + sizeof(struct transport_ports) > data_end) return TC_ACT_SHOT;
-    if ((swap16(ip->fragment_offset) & IP_FRAGMENT_MASK) != 0U) return TC_ACT_PIPE;
     if (ip->protocol != IPPROTO_TCP_VALUE && ip->protocol != IPPROTO_UDP_VALUE) return TC_ACT_PIPE;
     if ((swap32(ip->destination) & 0xff000000U) == 0x7f000000U) return TC_ACT_SHOT;
+    /* More-fragments with offset zero: the first fragment, which carries the ports. */
+    bool first_fragment = fragment_bits != 0U;
     struct transport_ports *ports = (void *)ip + header_length;
     __u16 destination_port = swap16(ports->destination);
     bool tcp_syn = ip->protocol == IPPROTO_TCP_VALUE && is_tcp_syn(ports, data_end);
@@ -458,10 +554,22 @@ INLINE int ingress4(
     copy_bytes(original->original_addr, (__u8 *)&ip->destination, 4U);
     /* An existing token means policy already admitted this flow; skip the LPM lookups. */
     if (!find_reserved_token(original, control, scratch)) {
-        if (!policy4_proxy(ip->destination, ip->protocol, destination_port, control->flags)) return TC_ACT_PIPE;
-        if (!allocate_token(original, control, scratch)) return TC_ACT_PIPE;
+        if (!policy4_proxy(ip->destination, ip->protocol, destination_port, control->flags) ||
+            !allocate_token(original, control, scratch)) {
+            if (first_fragment) {
+                remember_fragment(skb->ifindex, AF_INET_VALUE, ip->protocol, ip->id,
+                    (const __u8 *)&ip->source, (const __u8 *)&ip->destination, 4U,
+                    0, BPF2SOCKS_TC_FRAGMENT_PASS, control->generation);
+            }
+            return TC_ACT_PIPE;
+        }
     } else if (tcp_syn && !republish_bridge_token(original, scratch)) {
         return TC_ACT_PIPE;
+    }
+    if (first_fragment) {
+        remember_fragment(skb->ifindex, AF_INET_VALUE, ip->protocol, ip->id,
+            (const __u8 *)&ip->source, (const __u8 *)&ip->destination, 4U,
+            scratch->token.token_addr, BPF2SOCKS_TC_FRAGMENT_REWRITE, control->generation);
     }
 
     __be32 token_address;
@@ -570,20 +678,68 @@ INLINE int rewrite_ipv6(
     return TC_ACT_OK;
 }
 
+INLINE int ingress6_later_fragment(
+    struct __sk_buff *skb,
+    const struct bpf2socks_tc_fragment_key *key,
+    const struct bpf2socks_tc_runtime_control *control) {
+    struct bpf2socks_tc_fragment_value *fragment = map_lookup(&tc_fragment_map, key);
+    if (fragment == 0 || fragment->generation != control->generation) {
+        /* With IPv6 proxying off only port 53 is redirected; leave other datagrams alone. */
+        return (control->flags & BPF2SOCKS_TC_RUNTIME_IPV6) != 0U ? TC_ACT_SHOT : TC_ACT_PIPE;
+    }
+    if (fragment->verdict != BPF2SOCKS_TC_FRAGMENT_REWRITE) return TC_ACT_PIPE;
+    if (skb_store_bytes(
+            skb,
+            sizeof(struct ethernet_header) + __builtin_offsetof(struct ipv6_header, destination),
+            fragment->token_addr,
+            16U,
+            0U) != 0) {
+        return TC_ACT_SHOT;
+    }
+    return TC_ACT_OK;
+}
+
 INLINE int ingress6(
     struct __sk_buff *skb,
     struct ipv6_header *ip,
     void *data_end,
     const struct bpf2socks_tc_runtime_control *control) {
     if ((swap32(ip->version_flow) >> 28U) != 6U) return TC_ACT_SHOT;
-    if (ip->next_header != IPPROTO_TCP_VALUE && ip->next_header != IPPROTO_UDP_VALUE) return TC_ACT_PIPE;
-    if ((void *)(ip + 1) + sizeof(struct transport_ports) > data_end) return TC_ACT_SHOT;
+    __u8 protocol = ip->next_header;
+    void *l4 = (void *)(ip + 1);
+    __u32 l4_offset = sizeof(struct ethernet_header) + sizeof(struct ipv6_header);
+    bool first_fragment = false;
+    __u32 fragment_id = 0U;
+    if (protocol == IPV6_FRAGMENT_HEADER) {
+        struct ipv6_fragment_header *fragment = l4;
+        if ((void *)(fragment + 1) > data_end) return TC_ACT_SHOT;
+        protocol = fragment->next_header;
+        if (protocol != IPPROTO_TCP_VALUE && protocol != IPPROTO_UDP_VALUE) return TC_ACT_PIPE;
+        fragment_id = fragment->id;
+        if ((swap16(fragment->offset_flags) & IPV6_FRAGMENT_OFFSET_MASK) != 0U) {
+            struct bpf2socks_tc_fragment_key key;
+            fill_fragment_key(&key, skb->ifindex, AF_INET6_VALUE, protocol, fragment_id,
+                ip->source, ip->destination, 16U);
+            return ingress6_later_fragment(skb, &key, control);
+        }
+        first_fragment = true;
+        l4 = (void *)(fragment + 1);
+        l4_offset += sizeof(struct ipv6_fragment_header);
+    }
+    if (protocol != IPPROTO_TCP_VALUE && protocol != IPPROTO_UDP_VALUE) return TC_ACT_PIPE;
+    if (l4 + sizeof(struct transport_ports) > data_end) return TC_ACT_SHOT;
     if (ipv6_in_token_prefix(ip->destination, control->token_ipv6_prefix)) return TC_ACT_SHOT;
-    struct transport_ports *ports = (void *)(ip + 1);
+    struct transport_ports *ports = l4;
     __u16 destination_port = swap16(ports->destination);
-    bool tcp_syn = ip->next_header == IPPROTO_TCP_VALUE && is_tcp_syn(ports, data_end);
+    bool tcp_syn = protocol == IPPROTO_TCP_VALUE && is_tcp_syn(ports, data_end);
     if ((control->flags & BPF2SOCKS_TC_RUNTIME_IPV6) == 0U &&
-        ((control->flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) == 0U || destination_port != 53U)) return TC_ACT_PIPE;
+        ((control->flags & BPF2SOCKS_TC_RUNTIME_DNS_HIJACK) == 0U || destination_port != 53U)) {
+        if (first_fragment) {
+            remember_fragment(skb->ifindex, AF_INET6_VALUE, protocol, fragment_id,
+                ip->source, ip->destination, 16U, 0, BPF2SOCKS_TC_FRAGMENT_PASS, control->generation);
+        }
+        return TC_ACT_PIPE;
+    }
 
     __u32 zero = 0U;
     struct bpf2socks_tc_scratch *scratch = map_lookup(&tc_scratch, &zero);
@@ -592,21 +748,31 @@ INLINE int ingress6(
     __builtin_memset(original, 0, sizeof(*original));
     original->ifindex = skb->ifindex;
     original->family = AF_INET6_VALUE;
-    original->protocol = ip->next_header;
+    original->protocol = protocol;
     original->client_port = swap16(ports->source);
     original->original_port = destination_port;
     copy_bytes(original->client_addr, ip->source, 16U);
     copy_bytes(original->original_addr, ip->destination, 16U);
     /* An existing token means policy already admitted this flow; skip the LPM lookups. */
     if (!find_reserved_token(original, control, scratch)) {
-        if (!policy6_proxy(ip->destination, ip->next_header, destination_port, control->flags)) return TC_ACT_PIPE;
-        if (!allocate_token(original, control, scratch)) return TC_ACT_PIPE;
+        if (!policy6_proxy(ip->destination, protocol, destination_port, control->flags) ||
+            !allocate_token(original, control, scratch)) {
+            if (first_fragment) {
+                remember_fragment(skb->ifindex, AF_INET6_VALUE, protocol, fragment_id,
+                    ip->source, ip->destination, 16U, 0, BPF2SOCKS_TC_FRAGMENT_PASS, control->generation);
+            }
+            return TC_ACT_PIPE;
+        }
     } else if (tcp_syn && !republish_bridge_token(original, scratch)) {
         return TC_ACT_PIPE;
     }
-    __u32 l4_offset = sizeof(struct ethernet_header) + sizeof(struct ipv6_header);
+    if (first_fragment) {
+        remember_fragment(skb->ifindex, AF_INET6_VALUE, protocol, fragment_id,
+            ip->source, ip->destination, 16U,
+            scratch->token.token_addr, BPF2SOCKS_TC_FRAGMENT_REWRITE, control->generation);
+    }
     __u32 checksum_offset = l4_offset +
-        (ip->next_header == IPPROTO_TCP_VALUE
+        (protocol == IPPROTO_TCP_VALUE
             ? __builtin_offsetof(struct tcp_header_min, checksum)
             : __builtin_offsetof(struct udp_header_min, checksum));
     return rewrite_ipv6(

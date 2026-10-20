@@ -19,10 +19,6 @@
 
 #define BPF2SOCKS_LOG_BUF_SIZE 65536U
 
-#ifndef BPF_F_NO_PREALLOC
-#define BPF_F_NO_PREALLOC 1U
-#endif
-
 #ifndef __NR_bpf
 #if defined(__aarch64__)
 #define __NR_bpf 280
@@ -35,7 +31,7 @@
 #endif
 #endif
 
-long bpf2socks_bpf_sys(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size) {
+static long bpf2socks_bpf_sys(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size) {
     return syscall(__NR_bpf, cmd, attr, size);
 }
 
