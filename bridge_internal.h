@@ -124,8 +124,8 @@ struct bpf2socks_udp_client_session {
     uint16_t relay_port;
     bool relay_port_claimed;
     uint8_t associate_retries;
-    /* last_seen_ms when the client socket was last found open; equal means no recheck. */
-    uint64_t client_open_seen_ms;
+    /* When to re-check a closed client still receiving replies; 0 means not pending. */
+    uint64_t release_retry_ms;
     uint8_t associate_write_buf[32];
     size_t associate_write_len;
     size_t associate_write_offset;

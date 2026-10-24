@@ -138,7 +138,7 @@ A present field must be well formed: numbers are unsigned decimals within their 
 | `udpBatchSize` | 32; zero resets to the default; capped at 64 datagrams per system call. |
 | `maxUdpSessions` | 4096; zero resets to the default. |
 | `maxUdpBindings` | 16384; raised to at least `maxUdpSessions`. |
-| `udpIdleTimeoutSeconds` | 60; zero resets to the default. A session of a local client whose UDP socket is gone is released after about 0.5 s idle instead (found with a `sock_diag` dump; disabled for the run if the dump fails). TC hotspot sessions keep the full timeout. |
+| `udpIdleTimeoutSeconds` | 60; zero resets to the default. A local client's session is released as soon as its UDP socket is destroyed (reported by the `sock_diag` UDP destroy notifications and confirmed per port, so a port another socket still holds keeps its session). TC hotspot sessions keep the full timeout. |
 | `maxUdpPendingBytes` | 67108864; normalized to 131072–134217728. |
 | `dnsTransactionTimeoutMilliseconds` | 60000; normalized to 1000–600000. |
 
@@ -161,7 +161,7 @@ The bridge automatically bypasses its own effective GID so its SOCKS connections
 
 ## Platform requirements and safety
 
-Run as root with a mounted BPF filesystem, a usable cgroup hierarchy, the required BPF program/map/link types, and sufficient file-descriptor limits. The program attempts to raise `RLIMIT_NOFILE` to 65535 and further reduces configured capacities when the available limit is lower.
+Run as root with a mounted BPF filesystem, a usable cgroup hierarchy, the required BPF program/map/link types, the `sock_diag` UDP destroy multicast groups (checked by `--probe`), and sufficient file-descriptor limits. The program attempts to raise `RLIMIT_NOFILE` to 65535 and further reduces configured capacities when the available limit is lower.
 
 Cgroup hooks prefer multi-program attachment. If an exclusive attachment blocks it, the six connect/sendmsg/recvmsg hooks may temporarily replace an existing program only when its translated instructions are exactly `r0 = 1; exit`. Unknown programs, unreadable instructions, and other attachment modes remain conflicts. This behavior applies with or without DNS enhancement.
 

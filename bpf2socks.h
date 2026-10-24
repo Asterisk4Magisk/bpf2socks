@@ -58,11 +58,16 @@
 #define BPF2SOCKS_DEFAULT_MAX_UDP_SESSIONS 4096U
 #define BPF2SOCKS_DEFAULT_MAX_UDP_BINDINGS 16384U
 #define BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_SECONDS 60U
-/* Local UDP sessions idle this long are checked against the live socket list. */
-#define BPF2SOCKS_UDP_CLIENT_SWEEP_MIN_IDLE_MILLISECONDS 500U
-#define BPF2SOCKS_UDP_CLIENT_SWEEP_INTERVAL_MILLISECONDS 500U
-/* A pass waits at least this many times its socket-dump duration before the next. */
-#define BPF2SOCKS_UDP_CLIENT_SWEEP_COST_FACTOR 100U
+/* A closed client's session still delivering replies is checked again after this. */
+#define BPF2SOCKS_UDP_RELEASE_RETRY_MILLISECONDS 100U
+/*
+ * A datagram still queued when its client closed can create a session after
+ * the destroy notification was handled; new sessions on a port destroyed this
+ * recently, or while notifications were lost, are checked once.
+ */
+#define BPF2SOCKS_UDP_RELEASE_RECENT_MILLISECONDS 2000U
+/* Receive queue of each worker's UDP destroy notification socket. */
+#define BPF2SOCKS_UDP_DESTROY_EVENTS_RCVBUF (1024U * 1024U)
 #define BPF2SOCKS_MIN_UDP_PENDING_BYTES (128U * 1024U)
 #define BPF2SOCKS_DEFAULT_MAX_UDP_PENDING_BYTES (64U * 1024U * 1024U)
 #define BPF2SOCKS_MAX_UDP_PENDING_BYTES (128U * 1024U * 1024U)
@@ -252,6 +257,9 @@ struct bpf2socks_bridge_stats {
     uint64_t udp_associate_timeouts;
     uint64_t udp_closed_client_releases;
     uint64_t udp_relay_port_collisions;
+    uint64_t udp_release_events;
+    uint64_t udp_release_confirm_queries;
+    uint64_t udp_release_events_lost;
 };
 
 int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_stats *out);

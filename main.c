@@ -4,6 +4,7 @@
 #include "bpf2socks.h"
 #include "bpf_cgroup_owned.h"
 #include "json_util.h"
+#include "udp_destroy_events.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -424,6 +425,12 @@ static int probe_with_config(const char *path) {
         print_probe_json(false, message, true, false, false, hotspot_policy);
         return 1;
     }
+    char detail[192];
+    if (bpf2socks_udp_destroy_events_probe(detail, sizeof(detail)) < 0) {
+        snprintf(message, sizeof(message), "UDP socket destroy notifications are unavailable: %s", detail);
+        print_probe_json(false, message, true, true, false, hotspot_policy);
+        return 1;
+    }
     if (bpf2socks_raise_memlock_limit() < 0) {
         snprintf(message, sizeof(message), "failed to raise memlock limit: errno=%d", errno);
         print_probe_json(false, message, true, true, false, hotspot_policy);
@@ -551,6 +558,10 @@ static int start_with_config_unlocked(const char *path, const char *pid_path) {
     }
     if (bpf2socks_advanced_socket_probe(message, sizeof(message)) < 0) {
         fprintf(stderr, "bpf2socks advanced socket path is unavailable: %s\n", message);
+        return 1;
+    }
+    if (bpf2socks_udp_destroy_events_probe(message, sizeof(message)) < 0) {
+        fprintf(stderr, "bpf2socks UDP socket destroy notifications are unavailable: %s\n", message);
         return 1;
     }
 
@@ -718,7 +729,10 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         "\"udpDropsSendBusy\":%" PRIu64 ","
         "\"udpAssociateTimeouts\":%" PRIu64 ","
         "\"udpClosedClientReleases\":%" PRIu64 ","
-        "\"udpRelayPortCollisions\":%" PRIu64
+        "\"udpRelayPortCollisions\":%" PRIu64 ","
+        "\"udpReleaseEvents\":%" PRIu64 ","
+        "\"udpReleaseConfirmQueries\":%" PRIu64 ","
+        "\"udpReleaseEventsLost\":%" PRIu64
         "}\n",
         stats->tcp_accepts,
         stats->tcp_connect_failures,
@@ -764,7 +778,10 @@ static void print_bridge_stats_json(const struct bpf2socks_bridge_stats *stats) 
         stats->udp_drops_send_busy,
         stats->udp_associate_timeouts,
         stats->udp_closed_client_releases,
-        stats->udp_relay_port_collisions);
+        stats->udp_relay_port_collisions,
+        stats->udp_release_events,
+        stats->udp_release_confirm_queries,
+        stats->udp_release_events_lost);
 }
 
 static int stats_with_pid(const char *pid_path) {

@@ -348,6 +348,9 @@ static void copy_udp_stats(
     destination->udp_associate_timeouts = source->udp_associate_timeouts;
     destination->udp_closed_client_releases = source->udp_closed_client_releases;
     destination->udp_relay_port_collisions = source->udp_relay_port_collisions;
+    destination->udp_release_events = source->udp_release_events;
+    destination->udp_release_confirm_queries = source->udp_release_confirm_queries;
+    destination->udp_release_events_lost = source->udp_release_events_lost;
 }
 
 void bpf2socks_bridge_publish_tcp_stats(struct bpf2socks_bridge_worker *worker) {
@@ -426,6 +429,9 @@ static void add_worker_stats(struct bpf2socks_bridge_stats *total, const struct 
     total->udp_associate_timeouts += stats->udp_associate_timeouts;
     total->udp_closed_client_releases += stats->udp_closed_client_releases;
     total->udp_relay_port_collisions += stats->udp_relay_port_collisions;
+    total->udp_release_events += stats->udp_release_events;
+    total->udp_release_confirm_queries += stats->udp_release_confirm_queries;
+    total->udp_release_events_lost += stats->udp_release_events_lost;
 }
 
 static int stats_path_from_pid_path(const char *pid_path, char *out, size_t out_size) {
@@ -733,9 +739,13 @@ int bpf2socks_bridge_stats_dump(const char *pid_path, struct bpf2socks_bridge_st
     size_t pre_closed_client_size = offsetof(
         struct bpf2socks_bridge_stats,
         udp_closed_client_releases);
+    size_t pre_release_events_size = offsetof(
+        struct bpf2socks_bridge_stats,
+        udp_release_events);
     if ((bytes != legacy_size && bytes != previous_size && bytes != prior_full_size &&
          bytes != pre_send_busy_size && bytes != pre_associate_timeout_size &&
-         bytes != pre_closed_client_size && bytes != sizeof(*out)) ||
+         bytes != pre_closed_client_size && bytes != pre_release_events_size &&
+         bytes != sizeof(*out)) ||
         extra != EOF || read_error != 0 || close_result != 0) {
         memset(out, 0, sizeof(*out));
         errno = EIO;
