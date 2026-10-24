@@ -1,16 +1,17 @@
 .DEFAULT_GOAL := linux
 
 override BUILD_DIR := build
-# *.bpf.c is kernel code: it is compiled for the BPF target and embedded below.
-SOURCES := $(sort $(filter-out %.bpf.c,$(wildcard *.c)))
+# Userspace sources live in the root and one level of module directories.
+# kern/*.bpf.c is kernel code: it is compiled for the BPF target and embedded below.
+SOURCES := $(sort $(filter-out %.bpf.c,$(wildcard *.c */*.c)))
 
-BPF_SOURCE := tc_redirect.bpf.c
+BPF_SOURCE := kern/tc_redirect.bpf.c
 BPF_DIR := $(BUILD_DIR)/bpf
 BPF_OBJECT := $(BPF_DIR)/tc_redirect.bpf.o
 EMBEDDED_BPF_SOURCE := $(BPF_DIR)/embedded_bpf_object.c
 BPF_REQUIRED_CFLAGS := -target bpfel -ffreestanding -std=c17 -O2 -Wall -Wextra -Werror -I.
 
-COMMON_REQUIRED_CFLAGS := -O3 -Wall -Wextra -Werror -fPIE
+COMMON_REQUIRED_CFLAGS := -O3 -Wall -Wextra -Werror -fPIE -I.
 DEPENDENCY_FLAGS := -MMD -MP
 
 SUPPORTED_ANDROID_ABIS := arm64-v8a armeabi-v7a x86 x86_64

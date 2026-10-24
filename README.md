@@ -2,7 +2,20 @@
 
 `bpf2socks` is a root Android/Linux traffic bridge. It uses cgroup and socket eBPF programs to retain original destinations, then forwards TCP and UDP through a SOCKS5 upstream. It supports UID policy, private/direct CIDR policy, interface policy, DNS transaction tracking, connected UDP, full-cone UDP reply bindings, worker sharding, and runtime statistics.
 
-The source root includes a standalone GNU Make build for Linux and Android. A parent Android project may still compile all top-level `.c` files together as a PIE executable, commonly packaged as `libbpf2socks.so`.
+The source root includes a standalone GNU Make build for Linux and Android. A parent Android project may instead compile every userspace `.c` file (the root and its module directories, excluding `*.bpf.c`) together as a PIE executable with the source root on the include path (`-I<root>`), commonly packaged as `libbpf2socks.so`.
+
+## Source layout
+
+| Path | Responsibility |
+| --- | --- |
+| `main.c`, `bpf2socks.h` | CLI entry point (`--probe`, `--start`, `--stop`, `--stats`); shared limits, config and wire types |
+| `core/` | Config parsing, JSON, logging, stop event, resource limits, capability probes, socket helpers, token and original-destination helpers |
+| `bridge/` | The relay: worker threads (`bridge.c`), statistics, TCP splice relay (`tcp.c`), UDP worker (`udp*.c`), DNS fast path, SOCKS5 encoding |
+| `bpf/` | Userspace BPF: syscalls, the embedded object loader, cgroup program generation (`cgroup_prog.c`), runtime lifecycle (`runtime.c`), policy maps and watchers |
+| `kern/` | Kernel programs (`tc_redirect.bpf.c`, embedded into the executable) and the ABI headers they share with userspace |
+| `shared/` | Contracts kept byte-identical with the `asteriskd` supervisor |
+
+Every project include names its header from the source root, for example `#include "bridge/socks5.h"`. Functions and types with external linkage use the `bpf2socks_` prefix, followed by their module (`bpf2socks_udp_session_drop`, `bpf2socks_bpf_map_update`); file-local helpers carry no prefix. Every diagnostic is a single stderr line prefixed with `bpf2socks: `.
 
 ## Standalone build
 
@@ -18,7 +31,7 @@ make linux
 
 The output is `build/linux/bpf2socks`. Override standard Make variables such as `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, and `LDLIBS` when needed.
 
-`tc_redirect.bpf.c` is compiled for the BPF target and embedded into the executable. Linux builds need a BPF-capable Clang (`BPF_CLANG`, default `clang`) and the host UAPI headers (`BPF_INCLUDE_FLAGS`); Android builds use the NDK Clang and sysroot.
+`kern/tc_redirect.bpf.c` is compiled for the BPF target and embedded into the executable. Linux builds need a BPF-capable Clang (`BPF_CLANG`, default `clang`) and the host UAPI headers (`BPF_INCLUDE_FLAGS`); Android builds use the NDK Clang and sysroot.
 
 ### Android
 
