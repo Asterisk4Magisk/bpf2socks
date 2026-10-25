@@ -379,6 +379,7 @@ static void handle_udp_upstream_packets(
                 uint64_t now_ms = bpf2socks_now_ms();
                 session->last_seen_ms = now_ms;
                 binding->last_seen_ms = now_ms;
+                bpf2socks_udp_lru_touch(state, session);
                 ++worker->udp_stats.udp_packets_to_client;
                 ++worker->udp_stats.udp_copy_sends;
             } else {

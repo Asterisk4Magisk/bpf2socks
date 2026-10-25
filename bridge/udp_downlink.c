@@ -753,6 +753,7 @@ int bpf2socks_udp_downlink_flush_channel(
         uint64_t now_ms = bpf2socks_now_ms();
         session->last_seen_ms = now_ms;
         packet->binding->last_seen_ms = now_ms;
+        bpf2socks_udp_lru_touch(state, session);
         ++worker->udp_stats.udp_packets_to_client;
         ++worker->udp_stats.udp_copy_sends;
         (void)bpf2socks_udp_downlink_queue_pop(&channel->queue);
@@ -804,6 +805,8 @@ int bpf2socks_udp_downlink_batch_flush(
 
     uint64_t now_ms = bpf2socks_now_ms();
     batch->session->last_seen_ms = now_ms;
+    /* Expiry walks the LRU oldest first, so it must follow last_seen_ms. */
+    if (state != NULL) bpf2socks_udp_lru_touch(state, batch->session);
     int accepted = sent > 0 ? sent : 0;
     for (int i = 0; i < accepted; ++i) {
         batch->bindings[i]->last_seen_ms = now_ms;
