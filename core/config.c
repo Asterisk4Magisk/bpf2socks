@@ -45,7 +45,7 @@ static void init_runtime_config_defaults(struct bpf2socks_runtime_config *config
     config->udp_batch_size = BPF2SOCKS_DEFAULT_UDP_BATCH_SIZE;
     config->max_udp_sessions = BPF2SOCKS_DEFAULT_MAX_UDP_SESSIONS;
     config->max_udp_bindings = BPF2SOCKS_DEFAULT_MAX_UDP_BINDINGS;
-    config->udp_idle_timeout_seconds = BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_SECONDS;
+    config->udp_idle_timeout_milliseconds = BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_MILLISECONDS;
     config->max_udp_pending_bytes = BPF2SOCKS_DEFAULT_MAX_UDP_PENDING_BYTES;
     config->dns_transaction_timeout_milliseconds = BPF2SOCKS_DEFAULT_DNS_TRANSACTION_TIMEOUT_MILLISECONDS;
 }
@@ -95,8 +95,14 @@ static void normalize_runtime_tunables(struct bpf2socks_runtime_config *config) 
     if (config->max_udp_bindings < config->max_udp_sessions) {
         config->max_udp_bindings = config->max_udp_sessions;
     }
-    if (config->udp_idle_timeout_seconds == 0U) {
-        config->udp_idle_timeout_seconds = BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_SECONDS;
+    if (config->udp_idle_timeout_milliseconds == 0U) {
+        config->udp_idle_timeout_milliseconds = BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_MILLISECONDS;
+    }
+    if (config->udp_idle_timeout_milliseconds < BPF2SOCKS_MIN_UDP_IDLE_TIMEOUT_MILLISECONDS) {
+        config->udp_idle_timeout_milliseconds = BPF2SOCKS_MIN_UDP_IDLE_TIMEOUT_MILLISECONDS;
+    }
+    if (config->udp_idle_timeout_milliseconds > BPF2SOCKS_MAX_UDP_IDLE_TIMEOUT_MILLISECONDS) {
+        config->udp_idle_timeout_milliseconds = BPF2SOCKS_MAX_UDP_IDLE_TIMEOUT_MILLISECONDS;
     }
     if (config->max_udp_pending_bytes == 0U) {
         config->max_udp_pending_bytes = BPF2SOCKS_DEFAULT_MAX_UDP_PENDING_BYTES;
@@ -206,7 +212,7 @@ int bpf2socks_config_load(
     ok = read_uint_field(json, "udpBatchSize", UINT32_MAX, &config->udp_batch_size) && ok;
     ok = read_uint_field(json, "maxUdpSessions", UINT32_MAX, &config->max_udp_sessions) && ok;
     ok = read_uint_field(json, "maxUdpBindings", UINT32_MAX, &config->max_udp_bindings) && ok;
-    ok = read_uint_field(json, "udpIdleTimeoutSeconds", UINT32_MAX, &config->udp_idle_timeout_seconds) && ok;
+    ok = read_uint_field(json, "udpIdleTimeoutMilliseconds", UINT32_MAX, &config->udp_idle_timeout_milliseconds) && ok;
     ok = read_uint_field(json, "maxUdpPendingBytes", UINT32_MAX, &config->max_udp_pending_bytes) && ok;
     ok = read_uint_field(
         json,
@@ -255,16 +261,22 @@ int bpf2socks_config_load(
             BPF2SOCKS_MAX_UIDS),
         "bypassUids") && ok;
     /* Hotspot TC filters are attached by the supervisor; only their presence matters here. */
-    char hotspot_interface_prefixes[BPF2SOCKS_MAX_INTERFACES][BPF2SOCKS_MAX_INTERFACE_NAME_LEN];
+    char hotspot_interfaces[BPF2SOCKS_MAX_INTERFACES][BPF2SOCKS_MAX_INTERFACE_NAME_LEN];
     ok = check_field(
         bpf2socks_json_string_array(
             json,
-            "hotspotInterfacePrefixes",
-            (char *)hotspot_interface_prefixes,
+            "hotspotInterfaces",
+            (char *)hotspot_interfaces,
             BPF2SOCKS_MAX_INTERFACE_NAME_LEN,
-            &policy->hotspot_interface_prefix_count,
+            &policy->hotspot_interface_count,
             BPF2SOCKS_MAX_INTERFACES),
-        "hotspotInterfacePrefixes") && ok;
+        "hotspotInterfaces") && ok;
+    for (size_t index = 0U; index < policy->hotspot_interface_count; ++index) {
+        if (!bpf2socks_interface_selector_valid(hotspot_interfaces[index])) {
+            bpf2socks_log("invalid hotspot interface selector: %s", hotspot_interfaces[index]);
+            ok = false;
+        }
+    }
     ok = check_field(
         bpf2socks_json_string_array(
             json,

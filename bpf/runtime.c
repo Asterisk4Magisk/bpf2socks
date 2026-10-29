@@ -429,7 +429,7 @@ int bpf2socks_bpf_runtime_probe(
         snprintf(message, message_size, "cgroup udp getpeername program unavailable: errno=%d", errno);
         goto done;
     }
-    if (policy->hotspot_interface_prefix_count > 0U) {
+    if (policy->hotspot_interface_count > 0U) {
         tc_probe_fd = bpf2socks_cgroup_prog_load_constant(
             BPF_PROG_TYPE_SCHED_CLS,
             (enum bpf_attach_type)0,

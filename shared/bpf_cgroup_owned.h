@@ -113,6 +113,61 @@ static inline int asterisk_cgroup_has_id(int cgroup, unsigned type, uint32_t id)
     return 0;
 }
 
+/* 1 when id is the only program on an exclusive (flags 0) hook, 0 when not, -1 on error. */
+static inline int asterisk_cgroup_sole_exclusive_id(int cgroup, unsigned type, uint32_t id) {
+    uint32_t ids[ASTERISK_CGROUP_QUERY_MAX];
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.query.target_fd = (uint32_t)cgroup;
+    attr.query.attach_type = type;
+    attr.query.prog_cnt = ASTERISK_CGROUP_QUERY_MAX;
+    attr.query.prog_ids = (uintptr_t)ids;
+    if (asterisk_cgroup_sys(BPF_PROG_QUERY, &attr) != 0) return -1;
+    if (attr.query.prog_cnt > ASTERISK_CGROUP_QUERY_MAX) {
+        errno = E2BIG;
+        return -1;
+    }
+    return attr.query.attach_flags == 0U && attr.query.prog_cnt == 1U && ids[0] == id ? 1 : 0;
+}
+
+/*
+ * bpf2socks replaces the allow-only placeholder Android reserves exclusive
+ * hooks with and puts the original back on a graceful exit. After an abrupt
+ * exit the original reference is gone, so attach an equivalent fresh
+ * allow-only program over the owned one. Exclusive hooks have no compare and
+ * swap; recheck immediately before replacing, as bpf2socks does.
+ */
+static inline int asterisk_cgroup_restore_allow_only(int cgroup, unsigned type, uint32_t id) {
+    const struct bpf_insn allow[] = {
+        {.code = BPF_ALU64 | BPF_MOV | BPF_K, .dst_reg = 0, .imm = 1},
+        {.code = BPF_JMP | BPF_EXIT},
+    };
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.prog_type = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+    attr.expected_attach_type = type;
+    attr.insns = (uintptr_t)allow;
+    attr.insn_cnt = sizeof(allow) / sizeof(allow[0]);
+    attr.license = (uintptr_t)"GPL";
+    memcpy(attr.prog_name, "b2s_allow", sizeof("b2s_allow"));
+    int placeholder = asterisk_cgroup_sys(BPF_PROG_LOAD, &attr);
+    if (placeholder < 0) return -1;
+    int result = asterisk_cgroup_sole_exclusive_id(cgroup, type, id);
+    if (result > 0) {
+        memset(&attr, 0, sizeof(attr));
+        attr.target_fd = (uint32_t)cgroup;
+        attr.attach_bpf_fd = (uint32_t)placeholder;
+        attr.attach_type = type;
+        result = asterisk_cgroup_sys(BPF_PROG_ATTACH, &attr) != 0 ? -1 :
+            asterisk_cgroup_has_id(cgroup, type, id) == 0 ? 0 : -1;
+    } else if (result == 0) {
+        errno = EBUSY;
+        result = -1;
+    }
+    close(placeholder);
+    return result;
+}
+
 /*
  * Only the object opened from the fixed pin is authority. Names alone, program
  * enumeration, saved config and telemetry never grant ownership. Keep every
@@ -153,7 +208,10 @@ static inline int asterisk_cgroup_detach_pins(const char *cgroup_path, const cha
             break;
         }
         int attached = asterisk_cgroup_has_id(cgroup, program->type, info.id);
-        if (attached > 0) {
+        if (attached < 0 && errno == EPERM &&
+            asterisk_cgroup_sole_exclusive_id(cgroup, program->type, info.id) > 0) {
+            attached = asterisk_cgroup_restore_allow_only(cgroup, program->type, info.id);
+        } else if (attached > 0) {
             memset(&attr, 0, sizeof(attr));
             attr.target_fd = (uint32_t)cgroup;
             attr.attach_bpf_fd = (uint32_t)fd;

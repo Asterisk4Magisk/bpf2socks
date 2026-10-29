@@ -123,7 +123,7 @@ static int probe_with_config(const char *path) {
         config.listen_port = 65532U;
     }
 
-    bool hotspot_policy = policy.hotspot_interface_prefix_count > 0U;
+    bool hotspot_policy = policy.hotspot_interface_count > 0U;
     if (bpf2socks_probe_splice(message, sizeof(message)) < 0) {
         print_probe_json(false, message, false, false, false, hotspot_policy);
         return 1;

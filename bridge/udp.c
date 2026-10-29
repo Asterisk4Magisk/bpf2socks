@@ -453,7 +453,7 @@ static int init_state(struct bpf2socks_udp_state *state, struct bpf2socks_bridge
     state->batch_size = worker->config->udp_batch_size < BPF2SOCKS_UDP_MAX_BATCH
         ? worker->config->udp_batch_size
         : BPF2SOCKS_UDP_MAX_BATCH;
-    state->idle_timeout_ms = (uint64_t)worker->config->udp_idle_timeout_seconds * 1000ULL;
+    state->idle_timeout_ms = (uint64_t)worker->config->udp_idle_timeout_milliseconds;
     state->released_ports = calloc(1U, BPF2SOCKS_UDP_PORT_BITMAP_BYTES);
     state->port_destroyed_ms = calloc(65536U, sizeof(*state->port_destroyed_ms));
     size_t max_sessions = worker->udp_session_cap;

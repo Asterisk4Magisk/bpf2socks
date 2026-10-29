@@ -98,10 +98,10 @@ Per-packet and per-connection failures are logged on the 1st, 2nd, 4th, 8th... o
   "udpBatchSize": 32,
   "maxUdpSessions": 4096,
   "maxUdpBindings": 16384,
-  "udpIdleTimeoutSeconds": 60,
+  "udpIdleTimeoutMilliseconds": 60000,
   "maxUdpPendingBytes": 67108864,
   "dnsTransactionTimeoutMilliseconds": 60000,
-  "hotspotInterfacePrefixes": ["wlan+"],
+  "hotspotInterfaces": ["wlan+"],
   "ignoredInterfaces": ["lo", "wlan0", "wlan+"],
   "proxyPrivateCidrsV4": ["10.0.0.0/8"],
   "bypassPrivateCidrsV4": ["192.168.0.0/16"],
@@ -151,7 +151,7 @@ A present field must be well formed: numbers are unsigned decimals within their 
 | `udpBatchSize` | 32; zero resets to the default; capped at 64 datagrams per system call. |
 | `maxUdpSessions` | 4096; zero resets to the default. |
 | `maxUdpBindings` | 16384; raised to at least `maxUdpSessions`. |
-| `udpIdleTimeoutSeconds` | 60; zero resets to the default. A local client's session is released as soon as its UDP socket is destroyed (reported by the `sock_diag` UDP destroy notifications and confirmed per port, so a port another socket still holds keeps its session). TC hotspot sessions keep the full timeout. |
+| `udpIdleTimeoutMilliseconds` | 60000; zero resets to the default; normalized to 1000–86400000. A local client's session is released as soon as its UDP socket is destroyed (reported by the `sock_diag` UDP destroy notifications and confirmed per port, so a port another socket still holds keeps its session). TC hotspot sessions keep the full timeout. |
 | `maxUdpPendingBytes` | 67108864; normalized to 131072–134217728. |
 | `dnsTransactionTimeoutMilliseconds` | 60000; normalized to 1000–600000. |
 
@@ -165,7 +165,7 @@ A present field must be well formed: numbers are unsigned decimals within their 
 | `policy.bypassDirectCidrs` | Load direct CIDR files and bypass matches. |
 | `policy.directCidrPathV4` | IPv4 CIDR file used when direct bypass is enabled. |
 | `policy.directCidrPathV6` | IPv6 CIDR file used when direct bypass and IPv6 are enabled. |
-| `hotspotInterfacePrefixes` | Hotspot interface selectors, up to 64 entries. |
+| `hotspotInterfaces` | Hotspot interface selectors, up to 64 entries, in the same form as `ignoredInterfaces`: an exact name such as `ap0` or a prefix selector ending in `+` such as `wlan+`. |
 | `ignoredInterfaces` | Exact interface names (for example, `wlan0`) or case-sensitive prefix selectors ending in `+` (for example, `wlan+`), up to 64 entries. Each selector is 1–15 total ASCII characters: letters, digits, `_`, `.`, and `-`, with `+` allowed only as the final character after a non-empty prefix. |
 | `proxyPrivateCidrsV4` / `proxyPrivateCidrsV6` | Private CIDRs explicitly proxied, up to 512 per family. |
 | `bypassPrivateCidrsV4` / `bypassPrivateCidrsV6` | Private CIDRs explicitly bypassed, up to 512 per family. |

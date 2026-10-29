@@ -56,7 +56,9 @@
 #define BPF2SOCKS_DEFAULT_UDP_BATCH_SIZE 32U
 #define BPF2SOCKS_DEFAULT_MAX_UDP_SESSIONS 4096U
 #define BPF2SOCKS_DEFAULT_MAX_UDP_BINDINGS 16384U
-#define BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_SECONDS 60U
+#define BPF2SOCKS_DEFAULT_UDP_IDLE_TIMEOUT_MILLISECONDS 60000U
+#define BPF2SOCKS_MIN_UDP_IDLE_TIMEOUT_MILLISECONDS 1000U
+#define BPF2SOCKS_MAX_UDP_IDLE_TIMEOUT_MILLISECONDS 86400000U
 /* A closed client's session still delivering replies is checked again after this. */
 #define BPF2SOCKS_UDP_RELEASE_RETRY_MILLISECONDS 100U
 /*
@@ -110,7 +112,7 @@ struct bpf2socks_policy_config {
     size_t bypass_uid_count;
     bool self_bypass_gid_enabled;
     uint32_t self_bypass_gid;
-    size_t hotspot_interface_prefix_count;
+    size_t hotspot_interface_count;
     char ignored_interfaces[BPF2SOCKS_MAX_INTERFACES][BPF2SOCKS_MAX_INTERFACE_NAME_LEN];
     size_t ignored_interface_count;
     char proxy_private_cidrs_v4[BPF2SOCKS_MAX_POLICY_CIDRS][BPF2SOCKS_MAX_CIDR_TEXT_LEN];
@@ -192,7 +194,7 @@ struct bpf2socks_runtime_config {
     uint32_t udp_batch_size;
     uint32_t max_udp_sessions;
     uint32_t max_udp_bindings;
-    uint32_t udp_idle_timeout_seconds;
+    uint32_t udp_idle_timeout_milliseconds;
     uint32_t max_udp_pending_bytes;
     uint32_t dns_transaction_timeout_milliseconds;
     int token_map_fd;
