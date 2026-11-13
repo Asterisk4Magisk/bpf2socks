@@ -155,6 +155,7 @@ enum bpf2socks_udp_fd_kind {
 struct bpf2socks_udp_fd_ref {
     enum bpf2socks_udp_fd_kind kind;
     int fd;
+    uint64_t generation;
     struct bpf2socks_udp_client_session *session;
     struct bpf2socks_udp_downlink_channel *downlink;
     uint32_t dns_channel_index;
@@ -258,6 +259,8 @@ struct bpf2socks_udp_state {
     struct bpf2socks_udp_reply_binding *free_bindings;
     struct bpf2socks_udp_session_fd_refs *session_refs;
     struct epoll_event *events;
+    uint64_t *event_generations;
+    uint64_t next_event_generation;
     struct bpf2socks_udp_client_session **session_buckets;
     struct bpf2socks_udp_client_session *lru_head;
     struct bpf2socks_udp_client_session *lru_tail;

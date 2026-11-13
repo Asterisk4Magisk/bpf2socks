@@ -67,6 +67,31 @@ bool bpf2socks_udp_relay_skip_unusable(
     return true;
 }
 
+static void flush_udp_outgoing(
+    struct bpf2socks_udp_state *state,
+    struct bpf2socks_bridge_worker *worker,
+    struct bpf2socks_udp_client_session **sessions,
+    const struct bpf2socks_udp_msg *messages,
+    unsigned int count) {
+    for (unsigned int i = 0U; i < count; ++i) {
+        struct bpf2socks_udp_client_session *session = sessions[i];
+        if (session == NULL) continue;
+        struct bpf2socks_udp_send_batch send_batch;
+        memset(&send_batch, 0, sizeof(send_batch));
+        send_batch.session = session;
+        for (unsigned int j = i; j < count; ++j) {
+            if (sessions[j] != session) continue;
+            send_batch.messages[send_batch.count++] = messages[j];
+            sessions[j] = NULL;
+        }
+        if (bpf2socks_udp_relay_send_batch(worker, session, send_batch.messages, send_batch.count) < 0) {
+            ++worker->udp_stats.udp_send_errors;
+            BPF2SOCKS_LOG_THROTTLED("SOCKS5 UDP send failed: errno=%d", errno);
+            bpf2socks_udp_session_drop(state, session);
+        }
+    }
+}
+
 static void handle_udp_client_packets(
     struct bpf2socks_udp_state *state,
     struct bpf2socks_bridge_worker *worker,
@@ -171,6 +196,11 @@ static void handle_udp_client_packets(
             }
         }
 
+        /* Send borrowed session pointers before an allocation can evict them. */
+        if (existing_session == NULL && state->free_sessions == NULL && outgoing_count > 0U) {
+            flush_udp_outgoing(state, worker, outgoing_sessions, outgoing_messages, outgoing_count);
+            outgoing_count = 0U;
+        }
         struct bpf2socks_udp_client_session *session = bpf2socks_udp_session_get(state, &packet, worker, existing_session);
         if (session == NULL) {
             BPF2SOCKS_LOG_THROTTLED("SOCKS5 UDP ASSOCIATE failed: errno=%d", errno);
@@ -232,23 +262,7 @@ static void handle_udp_client_packets(
 
     bpf2socks_udp_dns_flush_outgoing(state, worker, dns_transactions, dns_channel_indices, dns_messages, dns_count);
 
-    for (unsigned int i = 0U; i < outgoing_count; ++i) {
-        struct bpf2socks_udp_client_session *session = outgoing_sessions[i];
-        if (session == NULL) continue;
-        struct bpf2socks_udp_send_batch send_batch;
-        memset(&send_batch, 0, sizeof(send_batch));
-        send_batch.session = session;
-        for (unsigned int j = i; j < outgoing_count; ++j) {
-            if (outgoing_sessions[j] != session) continue;
-            send_batch.messages[send_batch.count++] = outgoing_messages[j];
-            outgoing_sessions[j] = NULL;
-        }
-        if (bpf2socks_udp_relay_send_batch(worker, session, send_batch.messages, send_batch.count) < 0) {
-            ++worker->udp_stats.udp_send_errors;
-            BPF2SOCKS_LOG_THROTTLED("SOCKS5 UDP send failed: errno=%d", errno);
-            bpf2socks_udp_session_drop(state, session);
-        }
-    }
+    flush_udp_outgoing(state, worker, outgoing_sessions, outgoing_messages, outgoing_count);
 }
 
 static void handle_udp_upstream_packets(
@@ -467,13 +481,15 @@ static int init_state(struct bpf2socks_udp_state *state, struct bpf2socks_bridge
     state->event_cap = max_sessions * 3U + state->binding_cap + 2U +
         BPF2SOCKS_DNS_CHANNELS_PER_WORKER * 2U;
     state->events = calloc(state->event_cap, sizeof(*state->events));
+    state->event_generations = calloc(state->event_cap, sizeof(*state->event_generations));
     state->session_buckets = calloc(BPF2SOCKS_SESSION_HASH_BUCKETS, sizeof(*state->session_buckets));
     if (state->sessions == NULL || state->bindings == NULL || state->session_refs == NULL ||
-        state->events == NULL || state->session_buckets == NULL) {
+        state->events == NULL || state->event_generations == NULL || state->session_buckets == NULL) {
         free(state->sessions);
         free(state->bindings);
         free(state->session_refs);
         free(state->events);
+        free(state->event_generations);
         free(state->session_buckets);
         memset(state, 0, sizeof(*state));
         return -1;
@@ -481,6 +497,7 @@ static int init_state(struct bpf2socks_udp_state *state, struct bpf2socks_bridge
     if (bpf2socks_udp_binding_index_init(&state->binding_index, state->binding_cap) != 0) {
         free(state->session_buckets);
         free(state->events);
+        free(state->event_generations);
         free(state->session_refs);
         free(state->bindings);
         free(state->sessions);
@@ -526,6 +543,7 @@ static int init_state(struct bpf2socks_udp_state *state, struct bpf2socks_bridge
         bpf2socks_udp_binding_index_free(&state->binding_index);
         free(state->session_buckets);
         free(state->events);
+        free(state->event_generations);
         free(state->session_refs);
         free(state->bindings);
         free(state->sessions);
@@ -576,6 +594,7 @@ static void free_state(struct bpf2socks_udp_state *state) {
     bpf2socks_udp_downlink_free_retired(state);
     free(state->session_buckets);
     free(state->events);
+    free(state->event_generations);
     free(state->session_refs);
     bpf2socks_udp_binding_index_free(&state->binding_index);
     free(state->bindings);
@@ -771,9 +790,14 @@ int bpf2socks_bridge_udp_run(struct bpf2socks_bridge_worker *worker) {
             udp_run_maintenance(&state, worker, &next_stats_publish_ms);
             continue;
         }
+        /* Earlier events may recycle a session or DNS channel referenced later. */
         for (int i = 0; i < ready; ++i) {
             struct bpf2socks_udp_fd_ref *ref = state.events[i].data.ptr;
-            if (ref == NULL) continue;
+            state.event_generations[i] = ref == NULL ? 0U : ref->generation;
+        }
+        for (int i = 0; i < ready; ++i) {
+            struct bpf2socks_udp_fd_ref *ref = state.events[i].data.ptr;
+            if (ref == NULL || ref->generation != state.event_generations[i]) continue;
             uint32_t events = state.events[i].events;
             if (ref->kind == BPF2SOCKS_UDP_FD_BUDGET_WAKE) {
                 uint64_t wakeups = 0U;

@@ -312,6 +312,7 @@ int bpf2socks_udp_epoll_add_events(struct bpf2socks_udp_state *state, int fd, st
     struct epoll_event event;
     memset(&event, 0, sizeof(event));
     event.events = events | EPOLLERR | EPOLLHUP;
+    ref->generation = ++state->next_event_generation;
     event.data.ptr = ref;
     return epoll_ctl(state->epoll_fd, EPOLL_CTL_ADD, fd, &event);
 }
