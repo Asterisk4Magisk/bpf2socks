@@ -164,6 +164,13 @@ int bpf2socks_config_load(
 
     bool ok = true;
     ok = read_string_field(json, "socksHost", true, config->socks_host, sizeof(config->socks_host)) && ok;
+    ok = read_string_field(json, "flowMetadataToken", false, config->flow_metadata_token,
+             sizeof(config->flow_metadata_token)) &&
+        ok;
+    if (config->flow_metadata_token[0] &&
+        (strlen(config->flow_metadata_token) != 32 ||
+            strspn(config->flow_metadata_token, "0123456789abcdef") != 32))
+        ok = false;
     uint32_t socks_port = 0U;
     ok = read_uint_field(json, "socksPort", UINT16_MAX, &socks_port) && ok;
     config->socks_port = (uint16_t)socks_port;

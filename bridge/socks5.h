@@ -61,4 +61,9 @@ int bpf2socks_socks5_udp_recvmmsg(
     uint8_t *packet_buffer,
     size_t packet_stride);
 
+int bpf2socks_bridge_udp_sendmmsg(int fd, const struct sockaddr *relay, socklen_t relay_len,
+    const struct bpf2socks_udp_msg *messages, unsigned int count, const char *token);
+int bpf2socks_bridge_udp_recvmmsg(int fd, struct bpf2socks_udp_msg *messages, unsigned int count,
+    uint8_t *buffer, size_t stride, const char *token);
+int bpf2socks_flow_sockaddr(const struct bpf2socks_sockaddr *address, struct sockaddr_storage *out);
 #endif

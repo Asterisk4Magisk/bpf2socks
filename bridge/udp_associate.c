@@ -213,15 +213,22 @@ int bpf2socks_udp_relay_send_batch(
     struct bpf2socks_udp_client_session *session,
     const struct bpf2socks_udp_msg *messages,
     unsigned int count) {
+    struct bpf2socks_udp_msg flow_messages[count];
+    if (worker->config->flow_metadata_token[0]) {
+        memcpy(flow_messages, messages, sizeof(flow_messages));
+        for (unsigned int i = 0; i < count; ++i) {
+            flow_messages[i].source = session->client_addr;
+            flow_messages[i].owner_uid = session->owner_uid;
+        }
+        messages = flow_messages;
+    }
     unsigned int sent_total = 0U;
     unsigned int oversized = 0U;
     while (sent_total < count) {
-        int sent = bpf2socks_socks5_udp_sendmmsg(
-            session->udp_fd,
+        int sent = bpf2socks_bridge_udp_sendmmsg(session->udp_fd,
             bpf2socks_udp_relay_destination(&session->relay_addr, session->relay_connected),
-            session->relay_addr_len,
-            messages + sent_total,
-            count - sent_total);
+            session->relay_addr_len, messages + sent_total, count - sent_total,
+            worker->config->flow_metadata_token);
         if (sent > 0) {
             sent_total += (unsigned int)sent;
             continue;
@@ -374,5 +381,22 @@ int bpf2socks_udp_associate_advance(
         if (result < 0) return -1;
         if (result > 0) return complete_udp_associate(state, worker, session);
     }
+    return 0;
+}
+
+int bpf2socks_udp_flow_open(struct bpf2socks_udp_state *state,
+    struct bpf2socks_bridge_worker *worker, struct bpf2socks_udp_client_session *session) {
+    session->relay_addr = worker->socks_addr;
+    session->relay_addr_len = worker->socks_addr_len;
+    session->udp_fd =
+        socket(session->relay_addr.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (session->udp_fd < 0) return -1;
+    bpf2socks_socket_tune_buffers(session->udp_fd, worker->config->udp_socket_buffer_size,
+        worker->config->udp_socket_buffer_size);
+    session->relay_connected =
+        bpf2socks_udp_relay_connect(session->udp_fd, &session->relay_addr, session->relay_addr_len);
+    if (bpf2socks_udp_epoll_switch_session_to_relay(state, session) < 0) return -1;
+    session->stage = BPF2SOCKS_UDP_SESSION_READY;
+    ++worker->udp_stats.udp_associate_creates;
     return 0;
 }

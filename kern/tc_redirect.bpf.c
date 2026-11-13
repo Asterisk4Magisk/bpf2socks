@@ -61,6 +61,7 @@ struct bpf2socks_original_dst_bpf {
     __u8 addr[16];
     __u8 flags;
     __u8 reserved[3];
+    __u32 uid;
 };
 
 struct ethernet_header {
@@ -296,6 +297,7 @@ INLINE void fill_bridge_value(
     struct bpf2socks_original_dst_bpf *value,
     const struct bpf2socks_tc_original_key *original) {
     __builtin_memset(value, 0, sizeof(*value));
+    value->uid = 0xffffffffU; /* Forwarded hotspot traffic has no local owner. */
     value->family = original->family;
     value->protocol = original->protocol;
     value->port = original->original_port;

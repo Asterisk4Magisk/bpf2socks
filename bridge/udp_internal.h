@@ -62,6 +62,7 @@ struct bpf2socks_udp_client_session {
     enum bpf2socks_token_lookup_mode token_lookup_mode;
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
+    uint32_t owner_uid;
     int tcp_fd;
     int udp_fd;
     struct sockaddr_storage relay_addr;
@@ -125,6 +126,7 @@ struct bpf2socks_udp_header {
 struct bpf2socks_udp_client_packet {
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
+    uint32_t owner_uid;
     int token_family;
     uint8_t token_addr[16];
     bool has_original_dst;
@@ -459,6 +461,8 @@ void bpf2socks_udp_session_expire_idle(struct bpf2socks_udp_state *state);
 void bpf2socks_udp_binding_expire_idle(struct bpf2socks_udp_state *state, struct bpf2socks_bridge_worker *worker);
 
 /* bridge/udp_associate.c */
+int bpf2socks_udp_flow_open(struct bpf2socks_udp_state *state,
+    struct bpf2socks_bridge_worker *worker, struct bpf2socks_udp_client_session *session);
 int bpf2socks_udp_associate_build_request(struct bpf2socks_udp_client_session *session);
 int bpf2socks_udp_associate_open(
     const struct sockaddr *socks_addr,

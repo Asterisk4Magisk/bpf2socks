@@ -18,7 +18,7 @@
 
 #define BPF2SOCKS_UDP_BUFFER_SIZE 65535U
 #define BPF2SOCKS_SESSION_HASH_BUCKETS 4096U
-#define BPF2SOCKS_MAX_SOCKS5_UDP_HEADER 22U
+#define BPF2SOCKS_MAX_SOCKS5_UDP_HEADER 92U
 /* Wait cap used only while debug statistics are published. */
 #define BPF2SOCKS_WORKER_TIMED_WAIT_MILLISECONDS 1000
 /* Fallback retry while descriptors held by other processes keep accept() failing. */

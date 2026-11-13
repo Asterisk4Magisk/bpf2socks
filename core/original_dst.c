@@ -40,6 +40,7 @@ static int sockaddr_in_to_original(
     }
 
     memset(original, 0, sizeof(*original));
+    original->uid = UINT32_MAX;
     original->family = AF_INET;
     original->protocol = protocol;
     original->port = ntohs(addr->sin_port);
@@ -65,6 +66,7 @@ static int sockaddr_in6_to_original(
     }
 
     memset(original, 0, sizeof(*original));
+    original->uid = UINT32_MAX;
     original->family = AF_INET6;
     original->protocol = protocol;
     original->port = ntohs(addr->sin6_port);

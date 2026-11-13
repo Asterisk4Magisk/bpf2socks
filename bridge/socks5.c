@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 
+#include "core/flow_metadata.h"
 #include "bridge/socks5.h"
 #include "bpf2socks.h"
 #include "core/socket_util.h"
@@ -360,6 +361,102 @@ int bpf2socks_socks5_udp_recvmmsg(
             packet_buffer + packet_stride * (size_t)i,
             vec[i].msg_len,
             &messages[i]);
+    }
+    return received;
+}
+
+/* The internal bridge uses authenticated PROXY v2, without a SOCKS handshake. */
+int bpf2socks_flow_sockaddr(const struct bpf2socks_sockaddr *a, struct sockaddr_storage *out) {
+    memset(out, 0, sizeof(*out));
+    if (a->family == AF_INET) {
+        struct sockaddr_in *v = (void *)out;
+        v->sin_family = AF_INET;
+        v->sin_port = htons(a->port);
+        memcpy(&v->sin_addr, a->addr, 4);
+    } else if (a->family == AF_INET6) {
+        struct sockaddr_in6 *v = (void *)out;
+        v->sin6_family = AF_INET6;
+        v->sin6_port = htons(a->port);
+        memcpy(&v->sin6_addr, a->addr, 16);
+    } else {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    return 0;
+}
+
+int bpf2socks_bridge_udp_sendmmsg(int fd, const struct sockaddr *relay, socklen_t relay_len,
+    const struct bpf2socks_udp_msg *messages, unsigned int count, const char *token) {
+    if (!token[0]) return bpf2socks_socks5_udp_sendmmsg(fd, relay, relay_len, messages, count);
+    if (!count) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct mmsghdr vec[count];
+    struct iovec iov[count * 2];
+    uint8_t headers[count][FLOW_METADATA_MAX_HEADER];
+    memset(vec, 0, sizeof(vec));
+    for (unsigned int i = 0; i < count; ++i) {
+        struct sockaddr_storage destination;
+        if (bpf2socks_flow_sockaddr(&messages[i].addr, &destination)) return -1;
+        size_t n =
+            flow_metadata_encode(headers[i], sizeof(headers[i]), (const void *)&messages[i].source,
+                (const void *)&destination, 1, messages[i].owner_uid, token);
+        if (!n) {
+            errno = EINVAL;
+            return -1;
+        }
+        iov[2 * i] = (struct iovec){headers[i], n};
+        iov[2 * i + 1] = (struct iovec){messages[i].payload, messages[i].payload_len};
+        vec[i].msg_hdr = (struct msghdr){.msg_name = (void *)relay,
+            .msg_namelen = relay ? relay_len : 0,
+            .msg_iov = &iov[2 * i],
+            .msg_iovlen = 2};
+    }
+    return sendmmsg(fd, vec, count, MSG_NOSIGNAL);
+}
+
+int bpf2socks_bridge_udp_recvmmsg(int fd, struct bpf2socks_udp_msg *messages, unsigned int count,
+    uint8_t *buffer, size_t stride, const char *token) {
+    if (!token[0]) return bpf2socks_socks5_udp_recvmmsg(fd, messages, count, buffer, stride);
+    if (!count) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct mmsghdr vec[count];
+    struct iovec iov[count];
+    memset(vec, 0, sizeof(vec));
+    for (unsigned int i = 0; i < count; ++i) {
+        iov[i] = (struct iovec){buffer + stride * i, stride};
+        vec[i].msg_hdr = (struct msghdr){.msg_iov = &iov[i], .msg_iovlen = 1};
+    }
+    int received = recvmmsg(fd, vec, count, MSG_DONTWAIT, NULL);
+    for (int i = 0; i < received; ++i) {
+        struct bpf2socks_udp_msg *m = &messages[i];
+        memset(m, 0, sizeof(*m));
+        if (vec[i].msg_hdr.msg_flags & MSG_TRUNC) {
+            m->error = EMSGSIZE;
+            continue;
+        }
+        struct sockaddr_storage source, destination;
+        size_t n =
+            flow_metadata_decode(buffer + stride * i, vec[i].msg_len, &source, &destination, token);
+        if (!n) {
+            m->error = EPROTO;
+            continue;
+        }
+        m->addr.family = source.ss_family;
+        if (source.ss_family == AF_INET) {
+            struct sockaddr_in *v = (void *)&source;
+            m->addr.port = ntohs(v->sin_port);
+            memcpy(m->addr.addr, &v->sin_addr, 4);
+        } else {
+            struct sockaddr_in6 *v = (void *)&source;
+            m->addr.port = ntohs(v->sin6_port);
+            memcpy(m->addr.addr, &v->sin6_addr, 16);
+        }
+        m->payload = buffer + stride * i + n;
+        m->payload_len = vec[i].msg_len - n;
     }
     return received;
 }

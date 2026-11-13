@@ -133,6 +133,8 @@ struct bpf2socks_sockaddr {
 
 struct bpf2socks_udp_msg {
     struct bpf2socks_sockaddr addr;
+    struct sockaddr_storage source;
+    uint32_t owner_uid;
     uint8_t *payload;
     size_t payload_len;
     /* Receive only: errno-style reason this datagram is unusable, or 0. */
@@ -156,6 +158,7 @@ struct bpf2socks_original_dst {
     uint8_t addr[16];
     uint8_t flags;
     uint8_t reserved[3];
+    uint32_t uid;
 };
 
 struct bpf2socks_udp_peer_key {
@@ -172,6 +175,7 @@ struct bpf2socks_udp_peer_value {
 };
 
 struct bpf2socks_runtime_config {
+    char flow_metadata_token[33];
     char socks_host[128];
     uint16_t socks_port;
     char listen_host[64];

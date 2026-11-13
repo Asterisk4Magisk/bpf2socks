@@ -75,6 +75,7 @@ int bpf2socks_udp_token_lookup_original(
         packet->token_lookup_mode = cached->mode;
         packet->connected_udp_token =
             (cached->original.flags & BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP) != 0U;
+        packet->owner_uid = cached->original.uid;
         return bpf2socks_original_dst_to_sockaddr(&cached->original, &packet->original_dst);
     }
     struct bpf2socks_token_lookup_trace trace;
@@ -110,6 +111,7 @@ int bpf2socks_udp_token_lookup_original(
         cached->mode = trace.matched_mode;
         cached->expires_ms = now_ms + BPF2SOCKS_UDP_TOKEN_CACHE_TTL_MILLISECONDS;
     }
+    packet->owner_uid = original.uid;
     return bpf2socks_original_dst_to_sockaddr(&original, &packet->original_dst);
 }
 
@@ -157,6 +159,8 @@ int bpf2socks_udp_token_recover_connected(
         original.port = binding->original_dst.port;
         memcpy(original.addr, binding->original_dst.addr, sizeof(original.addr));
         original.flags = BPF2SOCKS_ORIGINAL_DST_FLAG_CONNECTED_UDP;
+        original.uid = session->owner_uid;
+        packet->owner_uid = session->owner_uid;
         if (bpf2socks_bpf_map_update(worker->config->token_map_fd, &key, &original) != 0) {
             BPF2SOCKS_LOG_THROTTLED("failed to republish connected UDP token: errno=%d", errno);
         }
@@ -268,6 +272,7 @@ int bpf2socks_udp_token_parse_cmsgs(
     struct msghdr *msg,
     const struct bpf2socks_runtime_config *config,
     struct bpf2socks_udp_client_packet *packet) {
+    packet->owner_uid = UINT32_MAX;
     bool has_pktinfo = false;
     for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg); cmsg != NULL; cmsg = CMSG_NXTHDR(msg, cmsg)) {
         if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {

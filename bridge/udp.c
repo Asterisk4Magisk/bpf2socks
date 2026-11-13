@@ -270,7 +270,8 @@ static void handle_udp_upstream_packets(
     size_t stride = BPF2SOCKS_UDP_BUFFER_SIZE + BPF2SOCKS_MAX_SOCKS5_UDP_HEADER;
 
     struct bpf2socks_udp_msg messages[batch];
-    int received = bpf2socks_socks5_udp_recvmmsg(session->udp_fd, messages, batch, upstream_packets, stride);
+    int received = bpf2socks_bridge_udp_recvmmsg(session->udp_fd, messages, batch, upstream_packets,
+        stride, worker->config->flow_metadata_token);
     if (received <= 0) {
         int receive_errno = errno;
         bpf2socks_udp_downlink_release_reservation(state);

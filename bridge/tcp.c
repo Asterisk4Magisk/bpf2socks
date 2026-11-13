@@ -32,7 +32,8 @@
 #include <unistd.h>
 
 #define BPF2SOCKS_TCP_EVENTS 256
-#define BPF2SOCKS_TCP_HANDSHAKE_CAP 32U
+#define BPF2SOCKS_TCP_HANDSHAKE_CAP 92U
+#include "core/flow_metadata.h"
 /* Method reply (2) plus the largest CONNECT reply (4 + 1 + 255 + 2). */
 #define BPF2SOCKS_TCP_RESPONSE_CAP 264U
 #define BPF2SOCKS_TCP_SPLICE_CHUNK 65536U
@@ -100,6 +101,7 @@ struct tcp_connection {
     struct tcp_splice_pipe client_to_upstream;
     struct tcp_splice_pipe upstream_to_client;
     struct bpf2socks_sockaddr target;
+    uint32_t owner_uid;
     uint8_t handshake[BPF2SOCKS_TCP_HANDSHAKE_CAP];
     size_t handshake_length;
     size_t handshake_offset;
@@ -708,6 +710,24 @@ static void update_connection_events(struct tcp_worker_state *state, struct tcp_
 }
 
 static int start_handshake(struct tcp_connection *connection) {
+    const char *token = connection->worker->config->flow_metadata_token;
+    if (token[0]) {
+        struct sockaddr_storage source, destination;
+        socklen_t source_len = sizeof(source);
+        if (getpeername(connection->client_fd, (void *)&source, &source_len) ||
+            bpf2socks_flow_sockaddr(&connection->target, &destination))
+            return -1;
+        connection->handshake_length =
+            flow_metadata_encode(connection->handshake, sizeof(connection->handshake),
+                (void *)&source, (void *)&destination, 0, connection->owner_uid, token);
+        if (!connection->handshake_length) {
+            errno = EINVAL;
+            return -1;
+        }
+        connection->handshake_offset = 0;
+        connection->stage = TCP_STAGE_REQUEST_WRITE;
+        return 0;
+    }
     size_t length = bpf2socks_socks5_build_hello(connection->handshake, sizeof(connection->handshake));
     size_t request_length = bpf2socks_socks5_build_connect_request(
         connection->handshake + length,
@@ -735,6 +755,11 @@ static int flush_handshake(struct tcp_connection *connection) {
         connection_touch(connection);
     }
     connection->response_length = 0U;
+    if (connection->worker->config->flow_metadata_token[0]) {
+        if (init_connection_splice_pipes(connection) < 0) return -1;
+        connection->stage = TCP_STAGE_RELAY;
+        return 0;
+    }
     connection->stage = TCP_STAGE_REPLY_READ;
     return 0;
 }
@@ -802,10 +827,8 @@ static int finish_pipelined_replies(struct tcp_connection *connection) {
     return 0;
 }
 
-static struct tcp_connection *create_connection(
-    struct tcp_worker_state *state,
-    int client_fd,
-    const struct bpf2socks_sockaddr *dst) {
+static struct tcp_connection *create_connection(struct tcp_worker_state *state, int client_fd,
+    const struct bpf2socks_sockaddr *dst, uint32_t uid) {
     struct tcp_connection *connection = calloc(1U, sizeof(*connection));
     if (connection == NULL) {
         int saved = errno;
@@ -827,6 +850,7 @@ static struct tcp_connection *create_connection(
     connection->upstream_ref.connection = connection;
     connection->upstream_ref.side = TCP_SIDE_UPSTREAM;
     connection->target = *dst;
+    connection->owner_uid = uid;
 
     connection->upstream_fd = connect_nonblocking_addr(
         state->worker,
@@ -854,11 +878,8 @@ static struct tcp_connection *create_connection(
     return connection;
 }
 
-static int client_original_dst(
-    int client_fd,
-    const struct sockaddr_storage *peer,
-    struct bpf2socks_bridge_worker *worker,
-    struct bpf2socks_sockaddr *dst) {
+static int client_original_dst(int client_fd, const struct sockaddr_storage *peer,
+    struct bpf2socks_bridge_worker *worker, struct bpf2socks_sockaddr *dst, uint32_t *uid) {
     const struct bpf2socks_runtime_config *config = worker->config;
     struct bpf2socks_token_key key;
     struct bpf2socks_original_dst original;
@@ -871,6 +892,7 @@ static int client_original_dst(
         lookup_tcp_original_from_socket(client_fd, config, &original) < 0) {
         return -1;
     }
+    *uid = original.uid;
     return bpf2socks_original_dst_to_sockaddr(&original, dst);
 }
 
@@ -899,7 +921,8 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
         enable_remote_client_keepalive(client, &peer);
 
         struct bpf2socks_sockaddr dst;
-        if (client_original_dst(client, &peer, state->worker, &dst) < 0) {
+        uint32_t uid = UINT32_MAX;
+        if (client_original_dst(client, &peer, state->worker, &dst, &uid) < 0) {
             BPF2SOCKS_LOG_THROTTLED("missing TCP original destination: errno=%d", errno);
             reset_on_close(client);
             close(client);
@@ -912,7 +935,7 @@ static void accept_ready_clients(struct tcp_worker_state *state, int listener_fd
             continue;
         }
 
-        struct tcp_connection *connection = create_connection(state, client, &dst);
+        struct tcp_connection *connection = create_connection(state, client, &dst, uid);
         if (connection == NULL) {
             int saved = errno;
             release_tcp_session_budget(state->worker);

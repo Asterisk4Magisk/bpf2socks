@@ -1001,6 +1001,10 @@ static void emit_publish_token(
     uint32_t token_host_mask,
     size_t *drop_jumps,
     size_t *drop_jump_count) {
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_get_current_uid_gid));
+    emit(builder,
+        BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0,
+            STACK_ORIGINAL_DST + (int)offsetof(struct bpf2socks_original_dst, uid)));
     size_t done_jumps[2];
     size_t done_jump_count = 0U;
     size_t collision_jumps[8];

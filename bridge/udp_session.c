@@ -367,11 +367,8 @@ int bpf2socks_udp_epoll_switch_session_to_relay(struct bpf2socks_udp_state *stat
         return -1;
     }
     struct bpf2socks_udp_fd_ref *control_ref = &state->session_refs[index].control;
-    if (bpf2socks_udp_epoll_modify(
-            state,
-            session->tcp_fd,
-            control_ref,
-            EPOLLIN | EPOLLRDHUP) < 0) {
+    if (session->tcp_fd >= 0 &&
+        bpf2socks_udp_epoll_modify(state, session->tcp_fd, control_ref, EPOLLIN | EPOLLRDHUP) < 0) {
         return -1;
     }
     return add_session_udp_epoll_fd(state, session);
@@ -721,19 +718,21 @@ struct bpf2socks_udp_client_session *bpf2socks_udp_session_get(
     session->used = true;
     session->client_addr = packet->client_addr;
     session->client_addr_len = packet->client_addr_len;
+    session->owner_uid = packet->owner_uid;
     session->token_lookup_mode = packet->token_lookup_mode;
     session->last_seen_ms = bpf2socks_now_ms();
-    if (bpf2socks_udp_associate_build_request(session) < 0) {
+    bool flow = worker->config->flow_metadata_token[0] != 0;
+    if (!flow && bpf2socks_udp_associate_build_request(session) < 0) {
         bpf2socks_udp_session_close(state, session);
         session->free_next = state->free_sessions;
         state->free_sessions = session;
         return NULL;
     }
-    session->tcp_fd = bpf2socks_udp_associate_open(
-        (const struct sockaddr *)&worker->socks_addr,
-        worker->socks_addr_len,
-        &session->stage);
-    if (session->tcp_fd < 0) {
+    if (!flow)
+        session->tcp_fd = bpf2socks_udp_associate_open(
+            (const struct sockaddr *)&worker->socks_addr, worker->socks_addr_len, &session->stage);
+    if ((!flow && session->tcp_fd < 0) ||
+        (flow && bpf2socks_udp_flow_open(state, worker, session) < 0)) {
         bpf2socks_udp_session_close(state, session);
         session->free_next = state->free_sessions;
         state->free_sessions = session;
@@ -743,10 +742,10 @@ struct bpf2socks_udp_client_session *bpf2socks_udp_session_get(
     session->next = state->session_buckets[bucket];
     state->session_buckets[bucket] = session;
     lru_add_tail(state, session);
-    bpf2socks_udp_handshake_add_tail(state, session, session->last_seen_ms);
+    if (!flow) bpf2socks_udp_handshake_add_tail(state, session, session->last_seen_ms);
     ++state->session_count;
     if (local) ++state->local_session_count;
-    if (bpf2socks_udp_epoll_add_session_control(state, session, EPOLLIN | EPOLLOUT) < 0) {
+    if (!flow && bpf2socks_udp_epoll_add_session_control(state, session, EPOLLIN | EPOLLOUT) < 0) {
         bpf2socks_udp_session_drop(state, session);
         return NULL;
     }

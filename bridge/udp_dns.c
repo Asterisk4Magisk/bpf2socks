@@ -163,6 +163,35 @@ static int open_dns_channel(
     }
 
     reset_dns_channel_fds(state, channel);
+    if (worker->config->flow_metadata_token[0]) {
+        channel->relay_addr = worker->socks_addr;
+        channel->relay_addr_len = worker->socks_addr_len;
+        int udp_fd =
+            socket(channel->relay_addr.ss_family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (udp_fd < 0) return -1;
+        bpf2socks_socket_tune_buffers(
+            udp_fd, worker->config->udp_socket_buffer_size, worker->config->udp_socket_buffer_size);
+        channel->udp_fd = udp_fd;
+        channel->relay_connected =
+            bpf2socks_udp_relay_connect(udp_fd, &channel->relay_addr, channel->relay_addr_len);
+        channel->relay_ref.kind = BPF2SOCKS_UDP_FD_DNS_RELAY;
+        channel->relay_ref.fd = udp_fd;
+        channel->relay_ref.session = NULL;
+        channel->relay_ref.dns_channel_index = channel->index;
+        if (bpf2socks_udp_epoll_add(state, udp_fd, &channel->relay_ref) < 0) {
+            int saved = errno;
+            close(udp_fd);
+            channel->udp_fd = -1;
+            errno = saved;
+            return -1;
+        }
+        channel->stage = BPF2SOCKS_UDP_DNS_READY;
+        channel->available = true;
+        channel->next_rebuild_ms = 0U;
+        channel->stage_started_ms = 0U;
+        ++worker->udp_stats.udp_associate_creates;
+        return 0;
+    }
     int tcp_fd = bpf2socks_socks5_connect_nonblock(
         (const struct sockaddr *)&worker->socks_addr,
         worker->socks_addr_len);
@@ -401,11 +430,9 @@ static int ensure_dns_channel(
     struct bpf2socks_bridge_worker *worker,
     struct bpf2socks_udp_dns_channel *channel,
     uint64_t now_ms) {
-    if (channel != NULL &&
-        channel->available &&
-        channel->tcp_fd >= 0 &&
-        channel->udp_fd >= 0 &&
-        bpf2socks_udp_control_fd_is_healthy(channel->tcp_fd)) {
+    if (channel != NULL && channel->available && channel->udp_fd >= 0 &&
+        (worker->config->flow_metadata_token[0] ||
+            (channel->tcp_fd >= 0 && bpf2socks_udp_control_fd_is_healthy(channel->tcp_fd)))) {
         ++worker->udp_stats.udp_associate_reuses;
         return 0;
     }
@@ -488,6 +515,8 @@ int bpf2socks_udp_dns_prepare_query(
     *out_channel_index = tx->channel_index;
     *out_message = (struct bpf2socks_udp_msg){
         .addr = packet->original_dst,
+        .source = packet->client_addr,
+        .owner_uid = packet->owner_uid,
         .payload = packet->payload,
         .payload_len = packet->payload_len,
     };
@@ -527,12 +556,10 @@ void bpf2socks_udp_dns_flush_outgoing(
             bpf2socks_udp_dns_close_channel(state, channel, bpf2socks_now_ms());
             continue;
         }
-        int sent = bpf2socks_socks5_udp_sendmmsg(
-            channel->udp_fd,
+        int sent = bpf2socks_bridge_udp_sendmmsg(channel->udp_fd,
             bpf2socks_udp_relay_destination(&channel->relay_addr, channel->relay_connected),
-            channel->relay_addr_len,
-            send_messages,
-            send_count);
+            channel->relay_addr_len, send_messages, send_count,
+            worker->config->flow_metadata_token);
         if (sent <= 0) {
             ++worker->udp_stats.udp_send_errors;
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
@@ -691,7 +718,8 @@ void bpf2socks_udp_dns_handle_upstream(
 
     struct bpf2socks_udp_msg messages[batch];
     memset(messages, 0, sizeof(messages));
-    int received = bpf2socks_socks5_udp_recvmmsg(channel->udp_fd, messages, batch, upstream_packets, stride);
+    int received = bpf2socks_bridge_udp_recvmmsg(channel->udp_fd, messages, batch, upstream_packets,
+        stride, worker->config->flow_metadata_token);
     if (received <= 0) {
         if (state->pending_budget != NULL) bpf2socks_udp_downlink_release_reservation(state);
         if (received < 0 && errno == EMSGSIZE) {
